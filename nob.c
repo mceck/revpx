@@ -29,7 +29,7 @@ int main(int argc, char **argv) {
     }
 
     // BUILD
-    cmd_append(&cmd, "cc", "-o", "revpx", "revpx.c", "-lssl", "-lcrypto");
+    cmd_append(&cmd, "cc", "-o", "revpx", "revpx.c", "-lssl", "-lcrypto", "-O2");
 #if __APPLE__
     cmd_append(&cmd, "-I/opt/homebrew/include/", "-L/opt/homebrew/lib/");
 #endif
