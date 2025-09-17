@@ -403,12 +403,20 @@ static void init_revpx() {
 static void free_revpx() {
     da_foreach(&DOMAIN_MAP, item) {
         if (item->ctx) SSL_CTX_free(item->ctx);
+        if (item->domain) free((void *)item->domain);
+        if (item->port) free((void *)item->port);
+        if (item->cert_file) free((void *)item->cert_file);
+        if (item->key_file) free((void *)item->key_file);
     }
     da_free(&DOMAIN_MAP);
 }
 
 void add_domain(const char *domain, const char *port, const char *cert_file, const char *key_file) {
-    da_append(&DOMAIN_MAP, ((domain_map_t){.domain = domain, .port = port, .ctx = NULL, .cert_file = cert_file, .key_file = key_file}));
+    char *d = domain ? strdup(domain) : NULL;
+    char *p = port ? strdup(port) : NULL;
+    char *c = cert_file ? strdup(cert_file) : NULL;
+    char *k = key_file ? strdup(key_file) : NULL;
+    da_append(&DOMAIN_MAP, ((domain_map_t){.domain = d, .port = p, .ctx = NULL, .cert_file = c, .key_file = k}));
     log_debug("domain map: %s -> %s (cert=%s, key=%s)\n", domain, port, cert_file, key_file);
 }
 
