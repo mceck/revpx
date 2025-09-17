@@ -19,11 +19,15 @@ int main(int argc, char **argv) {
     NOB_GO_REBUILD_URSELF(argc, argv);
     Cmd cmd = {0};
     Procs procs = {0};
+
+    // UPDATE
     if (argc > 1 && (strcmp(argv[1], "update") == 0)) {
         download_github_dep(&procs, "mceck/c-stb", "main/ds.h", "ds.h");
         download_github_dep(&procs, "tsoding/nob.h", "main/nob.h", "nob.h");
         return !procs_flush(&procs);
     }
+
+    // BUILD
     cmd_append(&cmd, "cc", "-o", "revpx", "revpx.c", "-lssl", "-lcrypto");
 #if __APPLE__
     cmd_append(&cmd, "-I/opt/homebrew/include/", "-L/opt/homebrew/lib/");
@@ -33,6 +37,16 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // INSTALL
+    if (argc > 1 && (strcmp(argv[1], "install") == 0)) {
+        cmd_append(&cmd, "sudo", "cp", "revpx", "/usr/local/bin/revpx");
+        if (!cmd_run(&cmd)) {
+            nob_log(NOB_ERROR, "Install failed");
+            return 1;
+        }
+    }
+
+    // RUN
     if (argc > 1 && (strcmp(argv[1], "run") == 0)) {
         cmd_append(&cmd, "mkcert", "example.localhost");
         if (!cmd_run(&cmd)) {
