@@ -2,6 +2,7 @@
 #include "revpx.h"
 #include "argparse.h"
 #define DEFAULT_PORT "443"
+#define DEFAULT_PORT_PLAIN "80"
 
 void print_help() {
     printf("revpx - Reverse Proxy\n");
@@ -13,11 +14,14 @@ void print_help() {
     printf("  revpx example.localhost 8080 example.localhost.pem example.localhost-key.pem\n");
     printf("\nEnvironment Variables:\n");
     printf("  REVPX_PORT: Port for revpx to listen on (default: 443)\n");
+    printf("  REVPX_PORT_PLAIN: Port for revpx to listen on (default: 80)\n");
 }
 
 int main(int argc, char **argv) {
-    char *port = getenv("REVPX_PORT");
-    if (!port) port = DEFAULT_PORT;
+    char *sec_port = getenv("REVPX_PORT");
+    if (!sec_port) sec_port = DEFAULT_PORT;
+    char *plain_port = getenv("REVPX_PORT_PLAIN");
+    if (!plain_port) plain_port = DEFAULT_PORT_PLAIN;
     // -h, --help
     if (argc == 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
         print_help();
@@ -36,7 +40,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    run_revpx_server(port);
+    run_revpx_server(plain_port, sec_port);
 
     return 0;
 }

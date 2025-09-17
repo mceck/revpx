@@ -30,6 +30,7 @@
 typedef enum {
     ST_SSL_HANDSHAKE,
     ST_READ_CLIENT_HEADER,
+    ST_READ_PLAIN_HEADER,
     ST_BACKEND_CONNECTING,
     ST_PROXYING,
 } conn_state_e;
@@ -394,6 +395,30 @@ static void send_http_error_and_close(int epfd, conn_t *client, int status, cons
     close_and_cleanup_fd(epfd, client->fd);
 }
 
+static void send_http_redirect_and_close(int epfd, conn_t *client, const char *host, const char *target, const char *sec_port) {
+    if (!client) return;
+    if (!host) host = "";
+    if (!target || target[0] == '\0') target = "/";
+
+    char location[1024];
+    if (sec_port && strcmp(sec_port, "443") != 0) {
+        snprintf(location, sizeof(location), "https://%s:%s%s", host, sec_port, target);
+    } else {
+        snprintf(location, sizeof(location), "https://%s%s", host, target);
+    }
+
+    char header[1024];
+    int header_len = snprintf(header, sizeof(header),
+                              "HTTP/1.1 301 Moved Permanently\r\n"
+                              "Location: %s\r\n"
+                              "Content-Length: 0\r\n"
+                              "Connection: close\r\n"
+                              "\r\n",
+                              location);
+    if (header_len > 0) (void)do_write(client, header, (size_t)header_len);
+    close_and_cleanup_fd(epfd, client->fd);
+}
+
 static void init_revpx() {
     signal(SIGPIPE, SIG_IGN);
     SSL_library_init();
@@ -420,12 +445,20 @@ void add_domain(const char *domain, const char *port, const char *cert_file, con
     log_debug("domain map: %s -> %s (cert=%s, key=%s)\n", domain, port, cert_file, key_file);
 }
 
-void run_revpx_server(const char *port) {
+void run_revpx_server(const char *port, const char *sec_port) {
     init_revpx();
-    int listen_fd = create_and_bind(port);
-    set_nonblock(listen_fd);
-    listen(listen_fd, 512);
-    log_info("revpx listening on port %s\n", port);
+    int listen_fd_tls = create_and_bind(sec_port);
+    set_nonblock(listen_fd_tls);
+    listen(listen_fd_tls, 512);
+    log_info("revpx TLS listening on port %s\n", sec_port);
+
+    int listen_fd_plain = -1;
+    if (port && *port) {
+        listen_fd_plain = create_and_bind(port);
+        set_nonblock(listen_fd_plain);
+        listen(listen_fd_plain, 512);
+        log_info("revpx plain HTTP listening on port %s (redirecting to %s)\n", port, sec_port);
+    }
 
     int epfd = epoll_create1(0);
     memset(fd_map, 0, sizeof(fd_map));
@@ -434,7 +467,8 @@ void run_revpx_server(const char *port) {
     SSL_CTX_set_tlsext_servername_callback(ctx, sni_servername_cb);
     SSL_CTX_set_tlsext_servername_arg(ctx, NULL);
 
-    add_epoll(epfd, listen_fd, EPOLLIN | EPOLLET);
+    add_epoll(epfd, listen_fd_tls, EPOLLIN | EPOLLET);
+    if (listen_fd_plain >= 0) add_epoll(epfd, listen_fd_plain, EPOLLIN | EPOLLET);
     struct epoll_event events[MAX_EVENTS];
 
     while (1) {
@@ -449,9 +483,9 @@ void run_revpx_server(const char *port) {
             int fd = events[i].data.fd;
             uint32_t ev = events[i].events;
 
-            if (fd == listen_fd) {
+            if (fd == listen_fd_tls) {
                 while (1) {
-                    int cfd = accept(listen_fd, NULL, NULL);
+                    int cfd = accept(listen_fd_tls, NULL, NULL);
                     if (cfd < 0) break;
                     set_nonblock(cfd);
                     SSL *ssl = SSL_new(ctx);
@@ -475,6 +509,17 @@ void run_revpx_server(const char *port) {
                         else
                             close_and_cleanup_fd(epfd, cfd);
                     }
+                }
+                continue;
+            } else if (listen_fd_plain >= 0 && fd == listen_fd_plain) {
+                while (1) {
+                    int cfd = accept(listen_fd_plain, NULL, NULL);
+                    if (cfd < 0) break;
+                    set_nonblock(cfd);
+                    conn_t *client = alloc_conn(cfd, NULL, ST_READ_PLAIN_HEADER);
+                    if (!client) continue;
+                    add_epoll(epfd, cfd, EPOLLIN | EPOLLET);
+                    log_debug("accept: plain client fd=%d\n", cfd);
                 }
                 continue;
             }
@@ -508,6 +553,29 @@ void run_revpx_server(const char *port) {
                         mod_epoll(epfd, fd, EPOLLOUT | EPOLLET);
                     else
                         close_and_cleanup_fd(epfd, fd);
+                }
+                break;
+            }
+            case ST_READ_PLAIN_HEADER: {
+                int r = read(c->fd, c->buf + c->buf_len, sizeof(c->buf) - c->buf_len);
+                if (r > 0) {
+                    c->buf_len += r;
+                } else if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+                    close_and_cleanup_fd(epfd, fd);
+                    break;
+                }
+
+                int hdr_end = find_header_end(c->buf, c->buf_len);
+                if (hdr_end > 0) {
+                    char host[256] = {0};
+                    char target[512] = "/";
+                    (void)extract_host(c->buf, hdr_end, host, sizeof(host));
+                    (void)extract_request_target(c->buf, (size_t)hdr_end, target, sizeof(target));
+                    log_info("redirect: http://%s%s -> https://%s:%s%s\n", host, target, host, sec_port, target);
+                    send_http_redirect_and_close(epfd, c, host, target, sec_port);
+                } else if (c->buf_len == sizeof(c->buf)) {
+                    // Malformed or too large; just close
+                    close_and_cleanup_fd(epfd, fd);
                 }
                 break;
             }
@@ -608,7 +676,8 @@ void run_revpx_server(const char *port) {
             }
         }
     }
-    close(listen_fd);
+    close(listen_fd_tls);
+    close(listen_fd_plain);
     SSL_CTX_free(ctx);
     free_revpx();
 }
