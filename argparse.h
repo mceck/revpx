@@ -35,7 +35,7 @@ int parse_config_file(int argc, char **argv) {
             ret = 1;
             goto cleanup;
         }
-        char domain[256], port[16], cert_file[512], key_file[512];
+        char domain[256], host[256], port[16], cert_file[512], key_file[512];
         while (jsp_key(&jsp) == 0) {
             if (strcmp(jsp.string, "domain") == 0) {
                 if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) {
@@ -65,6 +65,10 @@ int parse_config_file(int argc, char **argv) {
                     goto cleanup;
                 }
                 strcpy(key_file, jsp.string);
+            } else if (strcmp(jsp.string, "host") == 0) {
+                if (jsp_value(&jsp) == 0 && jsp.type == JSP_TYPE_STRING) {
+                    strcpy(host, jsp.string);
+                }
             } else {
                 // Unknown key; skip its value
                 if (jsp_skip(&jsp) != 0) {
@@ -79,7 +83,7 @@ int parse_config_file(int argc, char **argv) {
             ret = 1;
             goto cleanup;
         }
-        add_domain(domain, port, cert_file, key_file);
+        add_domain(domain, host, port, cert_file, key_file);
         log_info("Mapping domain %s to port %s\n", domain, port);
     }
     jsp_end_array(&jsp);
@@ -99,7 +103,7 @@ int parse_args(int argc, char **argv) {
         const char *backend_port = argv[i + 1];
         const char *cert_file = argv[i + 2];
         const char *key_file = argv[i + 3];
-        add_domain(domain, backend_port, cert_file, key_file);
+        add_domain(domain, NULL, backend_port, cert_file, key_file);
         log_info("Mapping domain %s to port %s\n", domain, backend_port);
     }
     return 0;

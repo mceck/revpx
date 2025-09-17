@@ -16,7 +16,7 @@
 #include "ds.h"
 #include "ep.h"
 
-#define BACKEND_HOST "127.0.0.1"
+#define DEFAULT_BACKEND_HOST "127.0.0.1"
 #define MAX_EVENTS 1024
 #define BUF_SIZE 16384
 #define MAX_FD 65536
@@ -43,6 +43,7 @@ typedef struct conn {
 
 typedef struct {
     char *domain;
+    char *host;
     char *port;
     char *cert;
     char *key;
@@ -249,13 +250,6 @@ static void extract_target(const unsigned char *buf, size_t len, char *out, size
     out[n] = '\0';
 }
 
-static const char *lookup_port(const char *host) {
-    da_foreach(&domains, d) {
-        if (strcasecmp(d->domain, host) == 0) return d->port;
-    }
-    return NULL;
-}
-
 static SSL_CTX *get_ctx(const char *host) {
     da_foreach(&domains, d) {
         if (strcasecmp(d->domain, host) == 0) {
@@ -425,12 +419,12 @@ static void proxy_data(conn_t *src, uint32_t events) {
     }
 }
 
-static int create_backend(const char *port) {
+static int create_backend(const char *host, const char *port) {
     struct addrinfo hints = {0}, *res;
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
 
-    if (getaddrinfo(BACKEND_HOST, port, &hints, &res) != 0) return -1;
+    if (getaddrinfo(host, port, &hints, &res) != 0) return -1;
 
     int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (fd < 0) {
@@ -524,15 +518,15 @@ static void handle_event(int fd, uint32_t events) {
                 break;
             }
 
-            const char *port = lookup_port(host);
-            if (!port) {
+            domain_t *d = da_find(&domains, strcasecmp(e->domain, host) == 0);
+            if (!d) {
                 send_error(c, 421, "Misdirected Request");
                 break;
             }
 
-            log_info("proxy: %s%s -> %s:%s\n", host, target, BACKEND_HOST, port);
+            log_info("proxy: %s%s -> %s:%s\n", host, target, d->host, d->port);
 
-            int backend = create_backend(port);
+            int backend = create_backend(d->host, d->port);
             if (backend < 0) {
                 send_error(c, 502, "Bad Gateway");
                 break;
@@ -650,9 +644,10 @@ static int create_listener(const char *port) {
     return fd;
 }
 
-void add_domain(const char *domain, const char *port, const char *cert, const char *key) {
+void add_domain(const char *domain, const char *host, const char *port, const char *cert, const char *key) {
     da_append(&domains, ((domain_t){
                             .domain = strdup(domain),
+                            .host = host && host[0] ? strdup(host) : strdup(DEFAULT_BACKEND_HOST),
                             .port = strdup(port),
                             .cert = strdup(cert),
                             .key = strdup(key),
@@ -743,6 +738,7 @@ void free_domains() {
         if (d->port) free(d->port);
         if (d->cert) free(d->cert);
         if (d->key) free(d->key);
+        if (d->host) free(d->host);
     }
     da_free(&domains);
 }
