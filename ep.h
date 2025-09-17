@@ -50,38 +50,34 @@ static inline int epoll_create1(int flags) {
 }
 
 static inline int epoll_ctl(int epfd, int op, int fd, struct epoll_event *ev) {
-    if (op == EPOLL_CTL_ADD || op == EPOLL_CTL_MOD) {
-        // For MOD, emulate by disabling/removing filters not present, then adding requested ones.
-        // Delete READ if not requested
-        if (!(ev && (ev->events & EPOLLIN))) {
-            struct kevent kev;
-            EV_SET(&kev, (uintptr_t)fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-            if (kevent(epfd, &kev, 1, NULL, 0, NULL) == -1 && errno != ENOENT) return -1;
-        }
-        // Delete WRITE if not requested
-        if (!(ev && (ev->events & EPOLLOUT))) {
-            struct kevent kev;
-            EV_SET(&kev, (uintptr_t)fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
-            if (kevent(epfd, &kev, 1, NULL, 0, NULL) == -1 && errno != ENOENT) return -1;
-        }
+    struct kevent changes[2];
+    int nchanges = 0;
+    uint16_t base_flags = EV_ADD; // Use level-triggered semantics
 
-        struct kevent changes[2];
-        int nchanges = 0;
-        uint16_t base_flags = EV_ADD | EV_CLEAR;
+    if (op == EPOLL_CTL_ADD || op == EPOLL_CTL_MOD) {
         if (ev && (ev->events & EPOLLIN)) {
             EV_SET(&changes[nchanges++], (uintptr_t)fd, EVFILT_READ, base_flags, 0, 0, NULL);
+        } else if (op == EPOLL_CTL_MOD) {
+            EV_SET(&changes[nchanges++], (uintptr_t)fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
         }
+
         if (ev && (ev->events & EPOLLOUT)) {
             EV_SET(&changes[nchanges++], (uintptr_t)fd, EVFILT_WRITE, base_flags, 0, 0, NULL);
+        } else if (op == EPOLL_CTL_MOD) {
+            EV_SET(&changes[nchanges++], (uintptr_t)fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
         }
-        if (nchanges == 0) return 0; // nothing to add
-        return kevent(epfd, changes, nchanges, NULL, 0, NULL);
+
+        if (nchanges > 0) {
+            return kevent(epfd, changes, nchanges, NULL, 0, NULL);
+        }
+        return 0;
     } else if (op == EPOLL_CTL_DEL) {
-        struct kevent kev;
-        EV_SET(&kev, (uintptr_t)fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-        if (kevent(epfd, &kev, 1, NULL, 0, NULL) == -1 && errno != ENOENT) return -1;
-        EV_SET(&kev, (uintptr_t)fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
-        if (kevent(epfd, &kev, 1, NULL, 0, NULL) == -1 && errno != ENOENT) return -1;
+        EV_SET(&changes[0], (uintptr_t)fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+        EV_SET(&changes[1], (uintptr_t)fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+        // kevent with EV_DELETE will return 0 if filter is successfully removed,
+        // or -1 with ENOENT if it does not exist. In either case, we can
+        // ignore the return value for a simple DEL operation.
+        (void)kevent(epfd, changes, 2, NULL, 0, NULL);
         return 0;
     } else {
         errno = EINVAL;
@@ -114,10 +110,19 @@ static inline int epoll_wait(int epfd, struct epoll_event *events, int maxevents
         for (int i = 0; i < n; i++) {
             events[i].data.fd = (int)evlist[i].ident;
             uint32_t mask = 0;
-            if (evlist[i].filter == EVFILT_READ) mask |= EPOLLIN;
-            if (evlist[i].filter == EVFILT_WRITE) mask |= EPOLLOUT;
+            if (evlist[i].filter == EVFILT_READ) {
+                mask |= EPOLLIN;
+                if (evlist[i].flags & EV_EOF) {
+                    // Read side reached EOF: signal HUP but allow draining with EPOLLIN
+                    mask |= EPOLLHUP;
+                }
+            }
+            if (evlist[i].filter == EVFILT_WRITE) {
+                mask |= EPOLLOUT;
+                // Do NOT map EV_EOF on write filter to EPOLLHUP; it only means peer won't read more
+                // and will be surfaced as write error (EPIPE) on write attempt.
+            }
             if (evlist[i].flags & EV_ERROR) mask |= EPOLLERR;
-            if (evlist[i].flags & EV_EOF) mask |= EPOLLHUP;
             events[i].events = mask;
         }
     }

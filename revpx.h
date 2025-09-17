@@ -33,6 +33,7 @@ typedef enum {
     ST_READ_PLAIN_HEADER,
     ST_BACKEND_CONNECTING,
     ST_PROXYING,
+    ST_SHUTTING_DOWN,
 } conn_state_e;
 
 typedef struct conn {
@@ -44,6 +45,9 @@ typedef struct conn {
     unsigned char buf[BUF_SIZE];
     size_t buf_len;
     size_t buf_off;
+    int closing_after_flush;  // when set, close the connection once buf is fully drained
+    int write_error_grace;    // allow one retry on next EPOLLOUT before half-close
+    int read_stalled_by_peer; // flag: reading is stalled due to full peer buffer
 } conn_t;
 
 static conn_t *fd_map[MAX_FD_MAP];
@@ -60,12 +64,72 @@ da_declare(DomainMap, domain_map_t);
 
 static DomainMap DOMAIN_MAP = {0};
 
+// Diagnostic helper for SSL errors
+static void log_ssl_diag(conn_t *c, const char *where, int ret, int ssl_err) {
+    unsigned long e = ERR_peek_last_error();
+    const char *reason = e ? ERR_reason_error_string(e) : NULL;
+    int sd = c && c->ssl ? SSL_get_shutdown(c->ssl) : 0;
+    log_debug("tls: %s fd=%d ret=%d ssl_err=%d shutdown=%d errno=%d openssl_reason=%s\n",
+              where, c ? c->fd : -1, ret, ssl_err, sd, errno, reason ? reason : "(none)");
+}
+
+// Buffer helpers for per-connection outgoing buffer (buf_off + buf_len represent valid data)
+static inline size_t conn_buf_tail_room(conn_t *c) {
+    size_t used = c->buf_off + c->buf_len;
+    if (used >= sizeof(c->buf)) return 0;
+    return sizeof(c->buf) - used;
+}
+
+static inline void conn_buf_compact(conn_t *c) {
+    if (c->buf_off > 0 && c->buf_len > 0) {
+        memmove(c->buf, c->buf + c->buf_off, c->buf_len);
+        c->buf_off = 0;
+    } else if (c->buf_len == 0) {
+        c->buf_off = 0;
+    }
+}
+
 static const char *lookup_backend_port(const char *host) {
     if (!host || !*host) return NULL;
     da_foreach(&DOMAIN_MAP, item) {
         if (strcasecmp(item->domain, host) == 0) return item->port;
     }
     return NULL;
+}
+
+static void mod_epoll(int epfd, int fd, uint32_t events);
+static void close_and_cleanup_fd(int epfd, int fd);
+
+static void close_one_side_keep_peer(int epfd, int fd) {
+    if (fd < 0 || fd >= MAX_FD_MAP) return;
+    conn_t *c = fd_map[fd];
+    if (!c) return;
+
+    int peer_fd = c->peer_fd;
+    conn_t *peer = (peer_fd >= 0 && peer_fd < MAX_FD_MAP) ? fd_map[peer_fd] : NULL;
+
+    log_debug("half-close: closing fd=%d keep peer_fd=%d\n", fd, peer_fd);
+    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+    fd_map[fd] = NULL;
+    if (c->ssl) {
+        SSL_shutdown(c->ssl);
+        SSL_free(c->ssl);
+    }
+    close(c->fd);
+    free(c);
+
+    if (peer) {
+        peer->peer_fd = -1;
+        if (peer->buf_len > 0) { // Removed SSL_pending check, not relevant for write-side closing
+            peer->closing_after_flush = 1;
+            mod_epoll(epfd, peer->fd, EPOLLOUT | EPOLLET);
+        } else {
+            log_debug("half-close: initiating shutdown on peer fd=%d\n", peer_fd);
+            peer->state = ST_SHUTTING_DOWN;
+            // SSL_shutdown() can require writes, so start with EPOLLOUT
+            mod_epoll(epfd, peer->fd, EPOLLOUT | EPOLLET);
+        }
+    }
 }
 
 static int find_header_end(const unsigned char *buf, size_t len) {
@@ -191,15 +255,23 @@ static void close_and_cleanup_fd(int epfd, int fd) {
     if (peer_fd >= 0) {
         conn_t *peer = fd_map[peer_fd];
         if (peer) {
-            log_debug("cleanup: also closing peer fd=%d\n", peer_fd);
-            epoll_ctl(epfd, EPOLL_CTL_DEL, peer_fd, NULL);
-            fd_map[peer_fd] = NULL;
-            if (peer->ssl) {
-                SSL_shutdown(peer->ssl);
-                SSL_free(peer->ssl);
+            // If peer has pending buffered data, allow it to flush before closing.
+            if (peer->buf_len > 0 && peer->state == ST_PROXYING) {
+                log_debug("cleanup: detaching peer fd=%d to flush pending=%zu before close\n", peer_fd, peer->buf_len);
+                peer->peer_fd = -1;
+                peer->closing_after_flush = 1;
+                mod_epoll(epfd, peer->fd, EPOLLOUT | EPOLLET);
+            } else {
+                log_debug("cleanup: also closing peer fd=%d (no pending)\n", peer_fd);
+                epoll_ctl(epfd, EPOLL_CTL_DEL, peer_fd, NULL);
+                fd_map[peer_fd] = NULL;
+                if (peer->ssl) {
+                    SSL_shutdown(peer->ssl);
+                    SSL_free(peer->ssl);
+                }
+                close(peer->fd);
+                free(peer);
             }
-            close(peer->fd);
-            free(peer);
         }
     }
 }
@@ -229,6 +301,9 @@ static conn_t *alloc_conn(int fd, SSL *ssl, conn_state_e state) {
     c->ssl = ssl;
     c->peer_fd = -1;
     c->state = state;
+    c->closing_after_flush = 0;
+    c->write_error_grace = 0;
+    c->read_stalled_by_peer = 0;
     fd_map[fd] = c;
     return c;
 }
@@ -244,6 +319,12 @@ static int start_connect_backend(const char *port) {
         sfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (sfd < 0) continue;
         set_nonblock(sfd);
+        // Reduce latency for small writes
+        int one = 1;
+        setsockopt(sfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        // Disable linger to avoid RST-on-close behavior
+        struct linger lin = {.l_onoff = 0, .l_linger = 0};
+        setsockopt(sfd, SOL_SOCKET, SO_LINGER, &lin, sizeof(lin));
         if (connect(sfd, rp->ai_addr, rp->ai_addrlen) == 0 || errno == EINPROGRESS) {
             log_debug("backend: connecting fd=%d to %s:%s (in-progress OK)\n", sfd, BACKEND_HOST, port);
             break;
@@ -265,77 +346,188 @@ static int get_ssl_error(conn_t *c, int ret) {
 }
 
 static void handle_proxy(int epfd, conn_t *c, uint32_t events) {
-    conn_t *peer = fd_map[c->peer_fd];
-    if (!peer) {
+    conn_t *peer = (c->peer_fd >= 0 && c->peer_fd < MAX_FD_MAP) ? fd_map[c->peer_fd] : NULL;
+
+    // If peer is gone, we should only be flushing our buffer.
+    // Any other event (like EPOLLIN) or state is unexpected and we should close.
+    if (!peer && !(c->closing_after_flush && (events & EPOLLOUT))) {
+        log_debug("proxy: closing fd=%d because peer is gone and not flushing (events=%u).\n", c->fd, events);
         close_and_cleanup_fd(epfd, c->fd);
         return;
     }
 
     if (events & EPOLLOUT) {
+        size_t buf_len_before = c->buf_len;
         while (c->buf_len > 0) {
             int n = do_write(c, c->buf + c->buf_off, c->buf_len);
             if (n > 0) {
                 c->buf_off += n;
                 c->buf_len -= n;
+                if (c->write_error_grace) c->write_error_grace = 0;
                 log_debug("proxy: wrote %d bytes to fd=%d (remaining=%zu)\n", n, c->fd, c->buf_len);
             } else {
                 int err = get_ssl_error(c, n);
                 if (err == SSL_ERROR_WANT_WRITE || errno == EAGAIN) break;
+                if (err == SSL_ERROR_WANT_READ) {
+                    mod_epoll(epfd, c->fd, EPOLLIN | EPOLLOUT | EPOLLET);
+                    return;
+                }
+                if (err == SSL_ERROR_ZERO_RETURN || (err == SSL_ERROR_SYSCALL && errno == 0)) {
+                    log_ssl_diag(c, "SSL_write clean shutdown", n, err);
+                    if (peer) close_and_cleanup_fd(epfd, peer->fd);
+                    close_and_cleanup_fd(epfd, c->fd);
+                    return;
+                }
+                if (err == SSL_ERROR_SSL) {
+                    log_ssl_diag(c, "SSL_write fatal", n, err);
+                    if (peer) close_and_cleanup_fd(epfd, peer->fd);
+                    close_and_cleanup_fd(epfd, c->fd);
+                    return;
+                }
+                log_debug("proxy: EPOLLOUT write error fd=%d errno=%d ssl_err=%d buf_len=%zu (grace=%d)\n", c->fd, errno, err, c->buf_len, c->write_error_grace);
+                if (c->write_error_grace == 0) {
+                    c->write_error_grace = 1;
+                    mod_epoll(epfd, c->fd, EPOLLIN | EPOLLOUT | EPOLLET);
+                    return;
+                }
+                log_debug("proxy: repeated write failure (attempts=%d) on fd=%d; closing both ends (peer=%d)\n", c->write_error_grace, c->fd, peer ? peer->fd : -1);
+                if (peer) close_and_cleanup_fd(epfd, peer->fd);
                 close_and_cleanup_fd(epfd, c->fd);
                 return;
             }
         }
+
+        if (c->buf_len < buf_len_before) { // we made space in buffer
+            conn_t *source = (c->peer_fd >= 0 && c->peer_fd < MAX_FD_MAP) ? fd_map[c->peer_fd] : NULL;
+            if (source && source->read_stalled_by_peer) {
+                log_debug("proxy: peer fd=%d buffer drained, unstalling read on fd=%d\n", c->fd, source->fd);
+                source->read_stalled_by_peer = 0;
+                mod_epoll(epfd, source->fd, EPOLLIN | EPOLLOUT | EPOLLET);
+            }
+        }
+
         if (c->buf_len == 0) {
             c->buf_off = 0;
+            if (c->write_error_grace) c->write_error_grace = 0;
+            if (c->closing_after_flush) {
+                log_debug("proxy: flush complete on fd=%d, initiating shutdown.\n", c->fd);
+                c->state = ST_SHUTTING_DOWN;
+                // The shutdown handshake can require writes, so trigger EPOLLOUT.
+                // The ST_SHUTTING_DOWN handler will be called on the next event loop iteration.
+                mod_epoll(epfd, c->fd, EPOLLOUT | EPOLLET);
+                return;
+            }
             mod_epoll(epfd, c->fd, EPOLLIN | EPOLLET);
-            mod_epoll(epfd, peer->fd, EPOLLIN | EPOLLET);
+        } else {
+            mod_epoll(epfd, c->fd, EPOLLIN | EPOLLOUT | EPOLLET);
         }
     }
 
     if (events & EPOLLIN) {
+        if (!peer) {
+            close_and_cleanup_fd(epfd, c->fd);
+            return;
+        }
         unsigned char temp_buf[BUF_SIZE];
         while (1) {
+            peer = (c->peer_fd >= 0 && c->peer_fd < MAX_FD_MAP) ? fd_map[c->peer_fd] : NULL;
+            if (!peer) {
+                close_and_cleanup_fd(epfd, c->fd);
+                return;
+            }
+            size_t read_cap = sizeof(temp_buf);
+            size_t peer_room = conn_buf_tail_room(peer);
+            if (peer_room == 0) {
+                conn_buf_compact(peer);
+                peer_room = conn_buf_tail_room(peer);
+            }
+            if (peer_room == 0) {
+                if (!c->read_stalled_by_peer) {
+                    log_debug("proxy: peer fd=%d buffer full, stalling read on fd=%d\n", peer->fd, c->fd);
+                    c->read_stalled_by_peer = 1;
+                    uint32_t source_events = (c->buf_len > 0) ? (EPOLLOUT | EPOLLET) : 0;
+                    mod_epoll(epfd, c->fd, source_events);
+                }
+                mod_epoll(epfd, peer->fd, EPOLLIN | EPOLLOUT | EPOLLET);
+                break;
+            }
+            if (peer_room < read_cap) read_cap = peer_room;
+            if (read_cap == 0) {
+                mod_epoll(epfd, peer->fd, EPOLLOUT | EPOLLET);
+                break;
+            }
+
             int nread;
             if (c->ssl)
-                nread = SSL_read(c->ssl, temp_buf, sizeof(temp_buf));
+                nread = SSL_read(c->ssl, temp_buf, (int)read_cap);
             else
-                nread = read(c->fd, temp_buf, sizeof(temp_buf));
+                nread = read(c->fd, temp_buf, read_cap);
 
             if (nread > 0) {
                 log_debug("proxy: read %d bytes from fd=%d\n", nread, c->fd);
-                if (peer->buf_len > 0) {
-                    mod_epoll(epfd, c->fd, 0);
-                    mod_epoll(epfd, peer->fd, EPOLLOUT | EPOLLET);
-                    break;
-                }
                 size_t nwritten = 0;
                 while (nwritten < (size_t)nread) {
                     int n = do_write(peer, temp_buf + nwritten, nread - nwritten);
                     if (n > 0) {
                         nwritten += n;
+                        if (peer->write_error_grace) peer->write_error_grace = 0;
                         log_debug("proxy: forwarded %d bytes to peer fd=%d (total=%zu/%d)\n", n, peer->fd, nwritten, nread);
                     } else {
                         int err = get_ssl_error(peer, n);
                         if (err == SSL_ERROR_WANT_WRITE || errno == EAGAIN) break;
-                        close_and_cleanup_fd(epfd, c->fd);
+                        if (err == SSL_ERROR_ZERO_RETURN || (err == SSL_ERROR_SYSCALL && errno == 0)) {
+                            log_ssl_diag(peer, "forward SSL_write clean shutdown", n, err);
+                            close_and_cleanup_fd(epfd, peer->fd);
+                            close_and_cleanup_fd(epfd, c->fd);
+                            return;
+                        }
+                        if (err == SSL_ERROR_SSL) {
+                            log_ssl_diag(peer, "forward SSL_write fatal", n, err);
+                            close_and_cleanup_fd(epfd, peer->fd);
+                            close_and_cleanup_fd(epfd, c->fd);
+                            return;
+                        }
+                        if (peer->write_error_grace == 0) {
+                            peer->write_error_grace = 1;
+                            break;
+                        }
+                        close_one_side_keep_peer(epfd, c->fd);
                         return;
                     }
                 }
                 if (nwritten < (size_t)nread) {
-                    memcpy(peer->buf + peer->buf_len, temp_buf + nwritten, nread - nwritten);
-                    peer->buf_len += (nread - nwritten);
-                    log_debug("proxy: queued %zu bytes to peer fd=%d buffer (buf_len=%zu)\n", (size_t)(nread - nwritten), peer->fd, peer->buf_len);
-                    mod_epoll(epfd, c->fd, 0);
+                    size_t need = (size_t)(nread - nwritten);
+                    if (conn_buf_tail_room(peer) < need) {
+                        conn_buf_compact(peer);
+                    }
+                    memcpy(peer->buf + peer->buf_off + peer->buf_len, temp_buf + nwritten, need);
+                    peer->buf_len += need;
+                    log_debug("proxy: queued %zu bytes to peer fd=%d buffer (buf_len=%zu, peer_fd_of_peer=%d)\n", (size_t)(nread - nwritten), peer->fd, peer->buf_len, peer->peer_fd);
                     mod_epoll(epfd, peer->fd, EPOLLOUT | EPOLLET);
                 }
-            } else if (nread == 0 || (nread < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-                close_and_cleanup_fd(epfd, c->fd);
-                return;
             } else {
-                int err = get_ssl_error(c, nread);
-                if (err == SSL_ERROR_WANT_READ || errno == EAGAIN) break;
-                close_and_cleanup_fd(epfd, c->fd);
-                return;
+                if (c->ssl) {
+                    int err = SSL_get_error(c->ssl, nread);
+                    if (err == SSL_ERROR_WANT_READ) break;
+                    if (err == SSL_ERROR_ZERO_RETURN || (err == SSL_ERROR_SYSCALL && errno == 0)) {
+                        log_ssl_diag(c, "SSL_read clean shutdown", nread, err);
+                        close_one_side_keep_peer(epfd, c->fd);
+                        return;
+                    }
+                    log_ssl_diag(c, "SSL_read fatal", nread, err);
+                    close_one_side_keep_peer(epfd, c->fd);
+                    return;
+                } else {
+                    if (nread == 0) {
+                        log_debug("proxy: source fd=%d EOF, peer fd=%d buf_len=%zu\n", c->fd, peer->fd, peer->buf_len);
+                        close_one_side_keep_peer(epfd, c->fd);
+                        return;
+                    }
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    log_debug("proxy: fatal read error on source fd=%d (errno=%d), peer fd=%d buf_len=%zu\n", c->fd, errno, peer->fd, peer->buf_len);
+                    close_one_side_keep_peer(epfd, c->fd);
+                    return;
+                }
             }
         }
     }
@@ -390,10 +582,21 @@ static void send_http_error_and_close(int epfd, conn_t *client, int status, cons
     if (header_len < 0) header_len = 0;
     if (header_len > (int)sizeof(header)) header_len = (int)sizeof(header);
 
-    if (header_len > 0) (void)do_write(client, header, (size_t)header_len);
-    if (body_len > 0) (void)do_write(client, body, (size_t)body_len);
-
-    close_and_cleanup_fd(epfd, client->fd);
+    // Enqueue header+body into client's buffer and flush via EPOLLOUT, then close
+    size_t needed = (size_t)header_len + (size_t)body_len;
+    if (needed <= sizeof(client->buf)) {
+        memcpy(client->buf, header, (size_t)header_len);
+        if (body_len > 0) memcpy(client->buf + header_len, body, (size_t)body_len);
+        client->buf_len = needed;
+        client->buf_off = 0;
+        client->closing_after_flush = 1;
+        mod_epoll(epfd, client->fd, EPOLLOUT | EPOLLET);
+    } else {
+        // Fallback: write best-effort and close (should not happen with current sizes)
+        if (header_len > 0) (void)do_write(client, header, (size_t)header_len);
+        if (body_len > 0) (void)do_write(client, body, (size_t)body_len);
+        close_and_cleanup_fd(epfd, client->fd);
+    }
 }
 
 static void send_http_redirect_and_close(int epfd, conn_t *client, const char *host, const char *target, const char *sec_port) {
@@ -416,8 +619,18 @@ static void send_http_redirect_and_close(int epfd, conn_t *client, const char *h
                               "Connection: close\r\n"
                               "\r\n",
                               location);
-    if (header_len > 0) (void)do_write(client, header, (size_t)header_len);
-    close_and_cleanup_fd(epfd, client->fd);
+    // Enqueue header (Content-Length: 0) and flush before close to avoid truncation
+    if (header_len > 0 && (size_t)header_len <= sizeof(client->buf)) {
+        memcpy(client->buf, header, (size_t)header_len);
+        client->buf_len = (size_t)header_len;
+        client->buf_off = 0;
+        client->closing_after_flush = 1;
+        mod_epoll(epfd, client->fd, EPOLLOUT | EPOLLET);
+    } else {
+        // Fallback
+        if (header_len > 0) (void)do_write(client, header, (size_t)header_len);
+        close_and_cleanup_fd(epfd, client->fd);
+    }
 }
 
 static void init_revpx() {
@@ -465,6 +678,8 @@ void run_revpx_server(const char *port, const char *sec_port) {
     memset(fd_map, 0, sizeof(fd_map));
 
     SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+    // Ensure default context supports partial writes and moving write buffers like per-domain contexts
+    SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
     SSL_CTX_set_tlsext_servername_callback(ctx, sni_servername_cb);
     SSL_CTX_set_tlsext_servername_arg(ctx, NULL);
 
@@ -489,6 +704,11 @@ void run_revpx_server(const char *port, const char *sec_port) {
                     int cfd = accept(listen_fd_tls, NULL, NULL);
                     if (cfd < 0) break;
                     set_nonblock(cfd);
+                    // Disabling TCP_NODELAY as a test
+                    // int one = 1;
+                    // setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+                    struct linger clin = {.l_onoff = 0, .l_linger = 0};
+                    setsockopt(cfd, SOL_SOCKET, SO_LINGER, &clin, sizeof(clin));
                     SSL *ssl = SSL_new(ctx);
                     SSL_set_fd(ssl, cfd);
                     SSL_set_accept_state(ssl);
@@ -517,6 +737,11 @@ void run_revpx_server(const char *port, const char *sec_port) {
                     int cfd = accept(listen_fd_plain, NULL, NULL);
                     if (cfd < 0) break;
                     set_nonblock(cfd);
+                    // Disabling TCP_NODELAY as a test
+                    // int one = 1;
+                    // setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+                    struct linger plin = {.l_onoff = 0, .l_linger = 0};
+                    setsockopt(cfd, SOL_SOCKET, SO_LINGER, &plin, sizeof(plin));
                     conn_t *client = alloc_conn(cfd, NULL, ST_READ_PLAIN_HEADER);
                     if (!client) continue;
                     add_epoll(epfd, cfd, EPOLLIN | EPOLLET);
@@ -530,22 +755,65 @@ void run_revpx_server(const char *port, const char *sec_port) {
 
             // Handle error/hangup
             if (ev & EPOLLERR) {
+                log_debug("proxy: closing fd=%d due to EPOLLERR (state=%d).\n", fd, c->state);
                 if (c->state == ST_BACKEND_CONNECTING) {
                     conn_t *client = fd_map[c->peer_fd];
-                    if (client && client->ssl) {
+                    if (client) {
                         send_http_error_and_close(epfd, client, 502, "Bad Gateway", "Backend connection failed");
+                        client->peer_fd = -1; // Detach client from us
                     }
+                    c->peer_fd = -1;                // Detach from client
+                    close_and_cleanup_fd(epfd, fd); // Close ourselves
+                } else if (c->state == ST_PROXYING) {
+                    close_one_side_keep_peer(epfd, fd);
+                } else {
+                    close_and_cleanup_fd(epfd, fd);
                 }
-                close_and_cleanup_fd(epfd, fd);
                 continue;
             }
             if (ev & EPOLLHUP) {
-                if (!(ev & EPOLLIN)) {
-                    if (c->buf_len == 0) {
+                // If HUP is received for a proxy connection and there's also data to be read (EPOLLIN),
+                // we must let the proxy handler read the data before closing the connection.
+                // Otherwise, we would close the socket and lose the pending data.
+                if (c->state == ST_PROXYING && (ev & EPOLLIN)) {
+                    log_debug("proxy: EPOLLHUP on fd=%d with EPOLLIN, letting proxy handler read remaining data (state=%d).\n", fd, c->state);
+                    // Fall through to let handle_proxy() read the last bytes and EOF.
+                } else if (c->state != ST_SHUTTING_DOWN) {
+                    log_debug("proxy: closing fd=%d due to EPOLLHUP (state=%d).\n", fd, c->state);
+                    close_one_side_keep_peer(epfd, fd);
+                    continue;
+                }
+                // If in ST_SHUTTING_DOWN, the HUP is expected. Fall through.
+            }
+
+            // Generic buffered write flush for any non-proxy state (used for error/redirect responses)
+            if ((ev & EPOLLOUT) && c->state != ST_PROXYING && c->buf_len > 0) {
+                while (c->buf_len > 0) {
+                    int n = do_write(c, c->buf + c->buf_off, c->buf_len);
+                    if (n > 0) {
+                        c->buf_off += n;
+                        c->buf_len -= n;
+                        log_debug("flush: wrote %d bytes to fd=%d (remaining=%zu)\n", n, c->fd, c->buf_len);
+                    } else {
+                        int err = get_ssl_error(c, n);
+                        if (err == SSL_ERROR_WANT_WRITE || errno == EAGAIN) break;
+                        if (err == SSL_ERROR_WANT_READ) {
+                            mod_epoll(epfd, fd, EPOLLIN | EPOLLOUT | EPOLLET);
+                            break;
+                        }
                         close_and_cleanup_fd(epfd, fd);
+                        continue; // proceed to next event in the outer loop
+                    }
+                }
+                if (c->buf_len == 0) {
+                    c->buf_off = 0;
+                    if (c->closing_after_flush) {
+                        c->state = ST_SHUTTING_DOWN;
+                        mod_epoll(epfd, fd, EPOLLOUT | EPOLLET);
                         continue;
                     } else {
-                        mod_epoll(epfd, fd, EPOLLOUT | EPOLLET);
+                        // Resume normal interest
+                        mod_epoll(epfd, fd, EPOLLIN | EPOLLET);
                     }
                 }
             }
@@ -638,11 +906,12 @@ void run_revpx_server(const char *port, const char *sec_port) {
                 socklen_t len = sizeof(err);
                 if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
                     conn_t *client = fd_map[c->peer_fd];
-                    if (client && client->ssl) {
+                    if (client) {
                         send_http_error_and_close(epfd, client, 502, "Bad Gateway", "Backend connection failed");
-                    } else {
-                        close_and_cleanup_fd(epfd, fd);
+                        client->peer_fd = -1; // Detach
                     }
+                    c->peer_fd = -1;
+                    close_and_cleanup_fd(epfd, fd);
                     break;
                 }
                 conn_t *client = fd_map[c->peer_fd];
@@ -654,28 +923,35 @@ void run_revpx_server(const char *port, const char *sec_port) {
                 c->state = ST_PROXYING;
                 client->state = ST_PROXYING;
                 log_debug("backend: connected fd=%d <-> client fd=%d -> PROXYING\n", fd, client->fd);
-
+                // Move any buffered client request bytes into the backend's own outgoing buffer
                 if (client->buf_len > 0) {
-                    int n = write(fd, client->buf, client->buf_len);
-                    if (n > 0) {
-                        if ((size_t)n < client->buf_len) {
-                            memmove(client->buf, client->buf + n, client->buf_len - n);
-                            client->buf_len -= n;
-                            mod_epoll(epfd, fd, EPOLLIN | EPOLLOUT | EPOLLET);
+                    conn_buf_compact(c);
+                    size_t room = conn_buf_tail_room(c);
+                    size_t to_copy = client->buf_len <= room ? client->buf_len : room;
+                    if (to_copy > 0) {
+                        memcpy(c->buf + c->buf_off + c->buf_len, client->buf, to_copy);
+                        c->buf_len += to_copy;
+                        // If we couldn't copy everything, move the remainder to the front of the client buffer.
+                        if (to_copy < client->buf_len) {
+                            memmove(client->buf, client->buf + to_copy, client->buf_len - to_copy);
+                            client->buf_len -= to_copy;
+                            client->buf_off = 0;
                         } else {
                             client->buf_len = 0;
-                            mod_epoll(epfd, fd, EPOLLIN | EPOLLET);
-                            mod_epoll(epfd, client->fd, EPOLLIN | EPOLLET);
+                            client->buf_off = 0;
                         }
-                    } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        // Ensure backend will flush its queued bytes
                         mod_epoll(epfd, fd, EPOLLIN | EPOLLOUT | EPOLLET);
+                        // Allow client to start reading backend response while we flush
+                        mod_epoll(epfd, client->fd, EPOLLIN | EPOLLET);
                     } else {
-                        if (client && client->ssl) {
-                            send_http_error_and_close(epfd, client, 502, "Bad Gateway", "Backend write failed");
-                        }
-                        close_and_cleanup_fd(epfd, fd);
+                        // Should be rare (headers > buffer). Fall back to enabling EPOLLOUT so that
+                        // proxying path can progress and close with error if needed.
+                        mod_epoll(epfd, fd, EPOLLIN | EPOLLOUT | EPOLLET);
+                        mod_epoll(epfd, client->fd, EPOLLIN | EPOLLET);
                     }
                 } else {
+                    // Nothing pending from client; begin full-duplex proxying
                     mod_epoll(epfd, fd, EPOLLIN | EPOLLET);
                     mod_epoll(epfd, client->fd, EPOLLIN | EPOLLET);
                 }
@@ -683,6 +959,37 @@ void run_revpx_server(const char *port, const char *sec_port) {
             }
             case ST_PROXYING: {
                 handle_proxy(epfd, c, ev);
+                break;
+            }
+            case ST_SHUTTING_DOWN: {
+                if (!c->ssl) {
+                    // This case is for non-SSL peers, which we don't have, but for completeness:
+                    shutdown(c->fd, SHUT_WR);
+                    close_and_cleanup_fd(epfd, c->fd);
+                    break;
+                }
+
+                int ret = SSL_shutdown(c->ssl);
+                if (ret == 1) {
+                    // SSL shutdown is complete.
+                    log_debug("ssl: shutdown complete for fd=%d\n", c->fd);
+                    close_and_cleanup_fd(epfd, c->fd);
+                } else if (ret == 0) {
+                    // Shutdown initiated, but we must wait for peer's close_notify.
+                    log_debug("ssl: shutdown sent, waiting for peer on fd=%d\n", c->fd);
+                    mod_epoll(epfd, c->fd, EPOLLIN | EPOLLET);
+                } else {
+                    int err = SSL_get_error(c->ssl, ret);
+                    if (err == SSL_ERROR_WANT_READ) {
+                        mod_epoll(epfd, c->fd, EPOLLIN | EPOLLET);
+                    } else if (err == SSL_ERROR_WANT_WRITE) {
+                        mod_epoll(epfd, c->fd, EPOLLOUT | EPOLLET);
+                    } else {
+                        log_debug("proxy: closing fd=%d due to SSL_shutdown error.\n", c->fd);
+                        log_ssl_diag(c, "SSL_shutdown error", ret, err);
+                        close_and_cleanup_fd(epfd, c->fd);
+                    }
+                }
                 break;
             }
             }
