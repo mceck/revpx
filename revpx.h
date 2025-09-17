@@ -365,11 +365,10 @@ static int create_and_bind(const char *port) {
     return sfd;
 }
 
-// Forward declaration
 static int do_write(conn_t *c, const void *buf, size_t len);
 
-// Send a minimal HTTP error response to the client and close the connection
 static void send_http_error_and_close(int epfd, conn_t *client, int status, const char *reason, const char *detail) {
+    log_error("HTTP %d %s: %s\n", status, reason, detail ? detail : "");
     if (!client) return;
     char body[512];
     int body_len = snprintf(body, sizeof(body),
@@ -476,7 +475,6 @@ void run_revpx_server(const char *port) {
             if (!c) continue;
 
             if (ev & (EPOLLERR | EPOLLHUP)) {
-                // If the backend connect fails while in-progress, return an HTTP error to the client
                 if (c->state == ST_BACKEND_CONNECTING) {
                     conn_t *client = fd_map[c->peer_fd];
                     if (client && client->ssl) {
@@ -551,7 +549,6 @@ void run_revpx_server(const char *port) {
                 int err = 0;
                 socklen_t len = sizeof(err);
                 if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
-                    // Backend connection failed; inform client with a simple error page
                     conn_t *client = fd_map[c->peer_fd];
                     if (client && client->ssl) {
                         send_http_error_and_close(epfd, client, 502, "Bad Gateway", "Backend connection failed");
@@ -585,7 +582,6 @@ void run_revpx_server(const char *port) {
                     } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
                         mod_epoll(epfd, fd, EPOLLIN | EPOLLOUT | EPOLLET);
                     } else {
-                        // Backend write failed right after connect: notify client with 502
                         if (client && client->ssl) {
                             send_http_error_and_close(epfd, client, 502, "Bad Gateway", "Backend write failed");
                         }
