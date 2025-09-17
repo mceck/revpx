@@ -1,0 +1,42 @@
+#define NOB_IMPLEMENTATION
+#define NOB_STRIP_PREFIX
+#define NOB_EXPERIMENTAL_DELETE_OLD
+#include "nob.h"
+
+void download_github_dep(Procs *procs, const char *repo, const char *file_path, const char *output_path) {
+    char url[256];
+    snprintf(url, sizeof(url), "https://raw.githubusercontent.com/%s/refs/heads/%s", repo, file_path);
+    Cmd cmd = {0};
+    cmd_append(&cmd, "curl", "-L", "-o", output_path, url);
+    if (!cmd_run(&cmd, .async = procs)) {
+        nob_log(NOB_ERROR, "Failed to download %s from %s", file_path, repo);
+        exit(1);
+    }
+    nob_log(NOB_INFO, "Downloaded %s successfully", output_path);
+}
+
+int main(int argc, char **argv) {
+    NOB_GO_REBUILD_URSELF(argc, argv);
+    Cmd cmd = {0};
+    Procs procs = {0};
+    if (argc > 1 && (strcmp(argv[1], "update") == 0)) {
+        download_github_dep(&procs, "mceck/c-stb", "main/ds.h", "ds.h");
+        download_github_dep(&procs, "tsoding/nob.h", "main/nob.h", "nob.h");
+        return !procs_flush(&procs);
+    }
+    cmd_append(&cmd, "cc", "-o", "revpx", "revpx.c", "-lssl", "-lcrypto");
+    if (!cmd_run(&cmd)) {
+        nob_log(NOB_ERROR, "Build failed");
+        return 1;
+    }
+
+    if (argc > 1 && (strcmp(argv[1], "run") == 0)) {
+        cmd_append(&cmd, "sudo", "./revpx");
+        if (!cmd_run(&cmd)) {
+            nob_log(NOB_ERROR, "Failed to start revpx");
+            return 1;
+        }
+    }
+
+    return 0;
+}
