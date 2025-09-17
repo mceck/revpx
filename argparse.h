@@ -16,8 +16,8 @@ int parse_config_file(int argc, char **argv) {
         return 1;
     }
     Jsp jsp = {0};
-    ret = jsp_init(&jsp, sb.items, sb.count);
-    ret = ret || jsp_begin_array(&jsp);
+    jsp_init(&jsp, sb.items, sb.count);
+    ret = jsp_begin_array(&jsp);
     if (ret != 0) {
         log_error("Failed to initialize JSON parser for config file %s\n", config_path);
         ret = 1;
