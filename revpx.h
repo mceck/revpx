@@ -42,10 +42,10 @@ typedef struct conn {
 } conn_t;
 
 typedef struct {
-    const char *domain;
-    const char *port;
-    const char *cert;
-    const char *key;
+    char *domain;
+    char *port;
+    char *cert;
+    char *key;
     SSL_CTX *ctx;
 } domain_t;
 
@@ -734,12 +734,15 @@ void run_revpx_server(const char *http_port, const char *https_port) {
     }
 
     SSL_CTX_free(default_ctx);
+}
+
+void free_domains() {
     da_foreach(&domains, d) {
         if (d->ctx) SSL_CTX_free(d->ctx);
-        free((void *)d->domain);
-        free((void *)d->port);
-        free((void *)d->cert);
-        free((void *)d->key);
+        if (d->domain) free(d->domain);
+        if (d->port) free(d->port);
+        if (d->cert) free(d->cert);
+        if (d->key) free(d->key);
     }
     da_free(&domains);
 }

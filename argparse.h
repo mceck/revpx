@@ -35,7 +35,7 @@ int parse_config_file(int argc, char **argv) {
             ret = 1;
             goto cleanup;
         }
-        char domain[512], port[16], cert_file[512], key_file[512];
+        char domain[256], port[16], cert_file[512], key_file[512];
         while (jsp_key(&jsp) == 0) {
             if (strcmp(jsp.string, "domain") == 0) {
                 if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) {

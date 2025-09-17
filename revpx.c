@@ -42,5 +42,6 @@ int main(int argc, char **argv) {
     }
     run_revpx_server(plain_port, sec_port);
 
+    free_domains();
     return 0;
 }
