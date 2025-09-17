@@ -25,13 +25,19 @@ int main(int argc, char **argv) {
         return !procs_flush(&procs);
     }
     cmd_append(&cmd, "cc", "-o", "revpx", "revpx.c", "-lssl", "-lcrypto");
+#if __APPLE__
+    cmd_append(&cmd, "-I/opt/homebrew/include/", "-L/opt/homebrew/lib/");
+#endif
     if (!cmd_run(&cmd)) {
         nob_log(NOB_ERROR, "Build failed");
         return 1;
     }
 
     if (argc > 1 && (strcmp(argv[1], "run") == 0)) {
-        cmd_append(&cmd, "sudo", "./revpx");
+#ifndef __APPLE__
+        cmd_append(&cmd, "sudo");
+#endif
+        cmd_append(&cmd, "./revpx");
         if (!cmd_run(&cmd)) {
             nob_log(NOB_ERROR, "Failed to start revpx");
             return 1;
