@@ -304,8 +304,9 @@ static void handle_proxy(int epfd, conn_t *c, uint32_t events) {
             if (nread > 0) {
                 log_debug("proxy: read %d bytes from fd=%d\n", nread, c->fd);
                 if (peer->buf_len > 0) {
-                    close_and_cleanup_fd(epfd, c->fd);
-                    return;
+                    mod_epoll(epfd, c->fd, 0);
+                    mod_epoll(epfd, peer->fd, EPOLLOUT | EPOLLET);
+                    break;
                 }
                 size_t nwritten = 0;
                 while (nwritten < (size_t)nread) {
@@ -527,7 +528,8 @@ void run_revpx_server(const char *port, const char *sec_port) {
             conn_t *c = fd_map[fd];
             if (!c) continue;
 
-            if (ev & (EPOLLERR | EPOLLHUP)) {
+            // Handle error/hangup
+            if (ev & EPOLLERR) {
                 if (c->state == ST_BACKEND_CONNECTING) {
                     conn_t *client = fd_map[c->peer_fd];
                     if (client && client->ssl) {
@@ -536,6 +538,16 @@ void run_revpx_server(const char *port, const char *sec_port) {
                 }
                 close_and_cleanup_fd(epfd, fd);
                 continue;
+            }
+            if (ev & EPOLLHUP) {
+                if (!(ev & EPOLLIN)) {
+                    if (c->buf_len == 0) {
+                        close_and_cleanup_fd(epfd, fd);
+                        continue;
+                    } else {
+                        mod_epoll(epfd, fd, EPOLLOUT | EPOLLET);
+                    }
+                }
             }
 
             switch (c->state) {
