@@ -31,7 +31,7 @@ int parse_config_file(int argc, char **argv) {
     }
     for (int i = 0; i < len; i++) {
         if (jsp_begin_object(&jsp) != 0) {
-            log_error("Failed to parse object %zu in config file %s\n", i, config_path);
+            log_error("Failed to parse object %d in config file %s\n", i, config_path);
             ret = 1;
             goto cleanup;
         }
@@ -39,28 +39,28 @@ int parse_config_file(int argc, char **argv) {
         while (jsp_key(&jsp) == 0) {
             if (strcmp(jsp.string, "domain") == 0) {
                 if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) {
-                    log_error("Invalid 'domain' value in object %zu in config file %s\n", i, config_path);
+                    log_error("Invalid 'domain' value in object %d in config file %s\n", i, config_path);
                     ret = 1;
                     goto cleanup;
                 }
                 strcpy(domain, jsp.string);
             } else if (strcmp(jsp.string, "port") == 0) {
                 if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) {
-                    log_error("Invalid 'port' value in object %zu in config file %s\n", i, config_path);
+                    log_error("Invalid 'port' value in object %d in config file %s\n", i, config_path);
                     ret = 1;
                     goto cleanup;
                 }
                 strcpy(port, jsp.string);
             } else if (strcmp(jsp.string, "cert_file") == 0) {
                 if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) {
-                    log_error("Invalid 'cert_file' value in object %zu in config file %s\n", i, config_path);
+                    log_error("Invalid 'cert_file' value in object %d in config file %s\n", i, config_path);
                     ret = 1;
                     goto cleanup;
                 }
                 strcpy(cert_file, jsp.string);
             } else if (strcmp(jsp.string, "key_file") == 0) {
                 if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) {
-                    log_error("Invalid 'key_file' value in object %zu in config file %s\n", i, config_path);
+                    log_error("Invalid 'key_file' value in object %d in config file %s\n", i, config_path);
                     ret = 1;
                     goto cleanup;
                 }
@@ -68,14 +68,14 @@ int parse_config_file(int argc, char **argv) {
             } else {
                 // Unknown key; skip its value
                 if (jsp_skip(&jsp) != 0) {
-                    log_error("Failed to skip unknown key '%s' in object %zu in config file %s\n", jsp.string, i, config_path);
+                    log_error("Failed to skip unknown key '%s' in object %d in config file %s\n", jsp.string, i, config_path);
                     ret = 1;
                     goto cleanup;
                 }
             }
         }
         if (jsp_end_object(&jsp) != 0) {
-            log_error("Failed to end object %zu in config file %s\n", i, config_path);
+            log_error("Failed to end object %d in config file %s\n", i, config_path);
             ret = 1;
             goto cleanup;
         }
