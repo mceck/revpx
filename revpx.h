@@ -26,6 +26,8 @@
 #define MAX_EVENTS 1024
 #define BUF_SIZE 16384
 #define MAX_FD_MAP 65536
+#define REDIRECT_BUF_SIZE 4096
+#define ERROR_BUF_SIZE 1024
 
 typedef enum {
     ST_SSL_HANDSHAKE,
@@ -564,14 +566,14 @@ static int do_write(conn_t *c, const void *buf, size_t len);
 static void send_http_error_and_close(int epfd, conn_t *client, int status, const char *reason, const char *detail) {
     log_error("HTTP %d %s: %s\n", status, reason, detail ? detail : "");
     if (!client) return;
-    char body[512];
+    char body[ERROR_BUF_SIZE];
     int body_len = snprintf(body, sizeof(body),
                             "<html><head><title>%d %s</title></head><body><h1>%d %s</h1><p>revpx err: %s</p></body></html>",
                             status, reason, status, reason, detail ? detail : "");
     if (body_len < 0) body_len = 0;
     if (body_len > (int)sizeof(body)) body_len = (int)sizeof(body);
 
-    char header[512];
+    char header[ERROR_BUF_SIZE];
     int header_len = snprintf(header, sizeof(header),
                               "HTTP/1.1 %d %s\r\n"
                               "Content-Type: text/html; charset=UTF-8\r\n"
@@ -604,14 +606,14 @@ static void send_http_redirect_and_close(int epfd, conn_t *client, const char *h
     if (!host) host = "";
     if (!target || target[0] == '\0') target = "/";
 
-    char location[1024];
+    char location[REDIRECT_BUF_SIZE];
     if (sec_port && strcmp(sec_port, "443") != 0) {
         snprintf(location, sizeof(location), "https://%s:%s%s", host, sec_port, target);
     } else {
         snprintf(location, sizeof(location), "https://%s%s", host, target);
     }
 
-    char header[1024];
+    char header[REDIRECT_BUF_SIZE];
     int header_len = snprintf(header, sizeof(header),
                               "HTTP/1.1 301 Moved Permanently\r\n"
                               "Location: %s\r\n"
