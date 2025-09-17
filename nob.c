@@ -34,10 +34,16 @@ int main(int argc, char **argv) {
     }
 
     if (argc > 1 && (strcmp(argv[1], "run") == 0)) {
+        cmd_append(&cmd, "mkcert", "example.localhost");
+        if (!cmd_run(&cmd)) {
+            nob_log(NOB_ERROR, "Failed to create TLS certificates");
+            return 1;
+        }
 #ifndef __APPLE__
         cmd_append(&cmd, "sudo");
 #endif
         cmd_append(&cmd, "./revpx");
+        cmd_append(&cmd, "example.localhost", "8080", "example.localhost.pem", "example.localhost-key.pem");
         if (!cmd_run(&cmd)) {
             nob_log(NOB_ERROR, "Failed to start revpx");
             return 1;

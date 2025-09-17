@@ -106,6 +106,26 @@ static int extract_host(const unsigned char *buf, size_t len, char *out, size_t 
     return 0;
 }
 
+static int extract_request_target(const unsigned char *buf, size_t len, char *out, size_t outsz) {
+    if (!buf || len == 0 || !out || outsz == 0) return 0;
+    const char *p = (const char *)buf;
+    const char *end = (const char *)buf + len;
+    const char *line_end = memchr(p, '\n', end - p);
+    if (!line_end) line_end = end;
+    if (line_end > p && line_end[-1] == '\r') line_end--;
+    const char *sp1 = memchr(p, ' ', line_end - p);
+    if (!sp1) return 0;
+    while (sp1 < line_end && *sp1 == ' ')
+        sp1++;
+    const char *sp2 = memchr(sp1, ' ', line_end - sp1);
+    if (!sp2) return 0;
+    size_t copy_len = (size_t)(sp2 - sp1);
+    if (copy_len >= outsz) copy_len = outsz - 1;
+    memcpy(out, sp1, copy_len);
+    out[copy_len] = '\0';
+    return 1;
+}
+
 static SSL_CTX *create_ctx(const char *crt, const char *key) {
     SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
     if (!ctx) {
@@ -345,6 +365,36 @@ static int create_and_bind(const char *port) {
     return sfd;
 }
 
+// Forward declaration
+static int do_write(conn_t *c, const void *buf, size_t len);
+
+// Send a minimal HTTP error response to the client and close the connection
+static void send_http_error_and_close(int epfd, conn_t *client, int status, const char *reason, const char *detail) {
+    if (!client) return;
+    char body[512];
+    int body_len = snprintf(body, sizeof(body),
+                            "<html><head><title>%d %s</title></head><body><h1>%d %s</h1><p>revpx err: %s</p></body></html>",
+                            status, reason, status, reason, detail ? detail : "");
+    if (body_len < 0) body_len = 0;
+    if (body_len > (int)sizeof(body)) body_len = (int)sizeof(body);
+
+    char header[512];
+    int header_len = snprintf(header, sizeof(header),
+                              "HTTP/1.1 %d %s\r\n"
+                              "Content-Type: text/html; charset=UTF-8\r\n"
+                              "Content-Length: %d\r\n"
+                              "Connection: close\r\n"
+                              "\r\n",
+                              status, reason, body_len);
+    if (header_len < 0) header_len = 0;
+    if (header_len > (int)sizeof(header)) header_len = (int)sizeof(header);
+
+    if (header_len > 0) (void)do_write(client, header, (size_t)header_len);
+    if (body_len > 0) (void)do_write(client, body, (size_t)body_len);
+
+    close_and_cleanup_fd(epfd, client->fd);
+}
+
 static void init_revpx() {
     signal(SIGPIPE, SIG_IGN);
     SSL_library_init();
@@ -426,6 +476,13 @@ void run_revpx_server(const char *port) {
             if (!c) continue;
 
             if (ev & (EPOLLERR | EPOLLHUP)) {
+                // If the backend connect fails while in-progress, return an HTTP error to the client
+                if (c->state == ST_BACKEND_CONNECTING) {
+                    conn_t *client = fd_map[c->peer_fd];
+                    if (client && client->ssl) {
+                        send_http_error_and_close(epfd, client, 502, "Bad Gateway", "Backend connection failed");
+                    }
+                }
                 close_and_cleanup_fd(epfd, fd);
                 continue;
             }
@@ -453,7 +510,7 @@ void run_revpx_server(const char *port) {
                 if (r > 0)
                     c->buf_len += r;
                 else if (r == 0 || (r < 0 && SSL_get_error(c->ssl, r) != SSL_ERROR_WANT_READ)) {
-                    close_and_cleanup_fd(epfd, fd);
+                    send_http_error_and_close(epfd, c, 400, "Bad Request", "Failed to read request");
                     break;
                 }
 
@@ -466,23 +523,27 @@ void run_revpx_server(const char *port) {
                         log_debug("request: host='%s' -> port='%s'\n", host, backend_port ? backend_port : "(null)");
                     }
                     if (!backend_port) {
-                        close_and_cleanup_fd(epfd, fd);
+                        send_http_error_and_close(epfd, c, 421, "Misdirected Request", "Unknown Host header");
                         break;
                     }
 
                     int bfd = start_connect_backend(backend_port);
                     if (bfd < 0) {
-                        close_and_cleanup_fd(epfd, fd);
+                        send_http_error_and_close(epfd, c, 502, "Bad Gateway", "Failed to connect to backend");
                         break;
                     }
 
-                    log_info("proxy: %s -> %s:%s (client_fd=%d backend_fd=%d)\n", host, BACKEND_HOST, backend_port, fd, bfd);
+                    char target[512] = "/";
+                    if (!extract_request_target(c->buf, (size_t)hdr_end, target, sizeof(target))) {
+                        strcpy(target, "/");
+                    }
+                    log_info("proxy: %s%s -> %s:%s\n", host, target, BACKEND_HOST, backend_port);
                     conn_t *backend = alloc_conn(bfd, NULL, ST_BACKEND_CONNECTING);
                     c->peer_fd = bfd;
                     backend->peer_fd = fd;
                     add_epoll(epfd, bfd, EPOLLOUT | EPOLLET);
                 } else if (c->buf_len == sizeof(c->buf)) {
-                    close_and_cleanup_fd(epfd, fd);
+                    send_http_error_and_close(epfd, c, 400, "Bad Request", "Header too large or malformed");
                 }
                 break;
             }
@@ -490,7 +551,13 @@ void run_revpx_server(const char *port) {
                 int err = 0;
                 socklen_t len = sizeof(err);
                 if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
-                    close_and_cleanup_fd(epfd, fd);
+                    // Backend connection failed; inform client with a simple error page
+                    conn_t *client = fd_map[c->peer_fd];
+                    if (client && client->ssl) {
+                        send_http_error_and_close(epfd, client, 502, "Bad Gateway", "Backend connection failed");
+                    } else {
+                        close_and_cleanup_fd(epfd, fd);
+                    }
                     break;
                 }
                 conn_t *client = fd_map[c->peer_fd];
@@ -518,6 +585,10 @@ void run_revpx_server(const char *port) {
                     } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
                         mod_epoll(epfd, fd, EPOLLIN | EPOLLOUT | EPOLLET);
                     } else {
+                        // Backend write failed right after connect: notify client with 502
+                        if (client && client->ssl) {
+                            send_http_error_and_close(epfd, client, 502, "Bad Gateway", "Backend write failed");
+                        }
                         close_and_cleanup_fd(epfd, fd);
                     }
                 } else {
