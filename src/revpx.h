@@ -173,7 +173,7 @@ static void send_error(RpConnection *c, int code, const char *status) {
                             "HTTP/1.1 %d %s\r\n"
                             "Content-Type: text/html; charset=utf-8\r\n"
                             "Content-Length: %d\r\n"
-                            "RpConnection: close\r\n\r\n",
+                            "Connection: close\r\n\r\n",
                             code, status, body_len);
     memcpy(c->buf, header, head_len);
     memcpy(c->buf + head_len, body, body_len);
@@ -189,7 +189,8 @@ static void send_redirect(RpConnection *c, const char *host, const char *target,
     int n = snprintf(resp, sizeof(resp),
                      "HTTP/1.1 301 Moved Permanently\r\n"
                      "Location: https://%s%s%s%s\r\n"
-                     "Content-Length: 0\r\nRpConnection: close\r\n\r\n",
+                     "Content-Length: 0\r\n"
+                     "Connection: close\r\n\r\n",
                      host, strcmp(port, "443") ? ":" : "", strcmp(port, "443") ? port : "", target);
     memcpy(c->buf, resp, n);
     c->len = n;
