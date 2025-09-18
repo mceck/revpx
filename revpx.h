@@ -443,7 +443,7 @@ static int create_backend(const char *host, const char *port) {
     return fd;
 }
 
-static void handle_event(int fd, uint32_t events) {
+static void handle_event(int fd, uint32_t events, const char *https_port) {
     conn_t *c = conns[fd];
     if (!c) return;
 
@@ -514,7 +514,7 @@ static void handle_event(int fd, uint32_t events) {
             extract_target(c->buf, end, target, sizeof(target));
 
             if (!c->ssl) {
-                send_redirect(c, host, target, "443");
+                send_redirect(c, host, target, https_port);
                 break;
             }
 
@@ -723,7 +723,7 @@ void run_revpx_server(const char *http_port, const char *https_port) {
                     if (c) ep_add(client, EPOLLIN | EPOLLET);
                 }
             } else {
-                handle_event(fd, events[i].events);
+                handle_event(fd, events[i].events, https_port);
             }
         }
     }

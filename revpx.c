@@ -27,7 +27,7 @@ int main(int argc, const char **argv) {
             print_help();
             return 0;
         } else if (named_arg(&args, "file", "f")) {
-            if (parse_config_file(argc, argv) != 0) {
+            if (parse_config_file(args.value) != 0) {
                 print_help();
                 return 1;
             }
@@ -36,6 +36,12 @@ int main(int argc, const char **argv) {
             sec_port = args.value;
         } else if (named_arg(&args, "port-plain", "pp")) {
             plain_port = args.value;
+        } else if (named_arg(&args, "monade", "m")) {
+            if (parse_monade_yaml(args.value) != 0) {
+                print_help();
+                return 1;
+            }
+            has_file_arg = 1;
         }
     }
 
