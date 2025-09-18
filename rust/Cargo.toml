@@ -1,0 +1,16 @@
+[package]
+name = "revpx"
+version = "0.1.0"
+edition = "2024"
+authors = ["Mattia Cecchini"]
+description = "Simple reverse proxy"
+license = "MIT"
+repository = "https://github.com/mceck/revpx"
+homepage = "https://github.com/mceck/revpx"
+documentation = "https://github.com/mceck/revpx"
+readme = "README.md"
+keywords = ["rust", "reverse-proxy", "development"]
+categories = ["development-tools"]
+
+[build-dependencies]
+cc = "1.2.37"
