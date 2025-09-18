@@ -17,29 +17,40 @@ void print_help() {
     printf("  REVPX_PORT_PLAIN: Port for revpx to listen on (default: 80)\n");
 }
 
-int main(int argc, char **argv) {
-    char *sec_port = getenv("REVPX_PORT");
-    if (!sec_port) sec_port = DEFAULT_PORT;
-    char *plain_port = getenv("REVPX_PORT_PLAIN");
-    if (!plain_port) plain_port = DEFAULT_PORT_PLAIN;
-    // -h, --help
-    if (argc == 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
+int main(int argc, const char **argv) {
+    const char *sec_port = getenv("REVPX_PORT");
+    const char *plain_port = getenv("REVPX_PORT_PLAIN");
+    Args args = {.argc = argc, .argv = argv};
+    int has_file_arg = 0;
+    while (arg_next(&args)) {
+        if (named_arg(&args, "help", "h")) {
+            print_help();
+            return 0;
+        } else if (named_arg(&args, "file", "f")) {
+            if (parse_config_file(argc, argv) != 0) {
+                print_help();
+                return 1;
+            }
+            has_file_arg = 1;
+        } else if (named_arg(&args, "port", "p")) {
+            sec_port = args.value;
+        } else if (named_arg(&args, "port-plain", "pp")) {
+            plain_port = args.value;
+        }
+    }
+
+    // <domain> <port> <cert_file> <key_file> ...
+    if (!has_file_arg && parse_args(argc, argv) != 0) {
         print_help();
-        return 0;
+        return 1;
     }
-    // --file <path>
-    if (argc == 3 && strcmp(argv[1], "--file") == 0) {
-        if (parse_config_file(argc, argv) != 0) {
-            print_help();
-            return 1;
-        }
-    } else {
-        // <domain> <port> <cert_file> <key_file> ...
-        if (parse_args(argc, argv) != 0) {
-            print_help();
-            return 1;
-        }
+    if (domains.count == 0) {
+        log_error("No domain mappings provided\n");
+        print_help();
+        return 1;
     }
+    if (!sec_port) sec_port = DEFAULT_PORT;
+    if (!plain_port) plain_port = DEFAULT_PORT_PLAIN;
     run_revpx_server(plain_port, sec_port);
 
     free_domains();

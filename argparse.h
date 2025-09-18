@@ -2,7 +2,61 @@
 #define JSP_IMPLEMENTATION
 #include "jsp.h"
 
-int parse_config_file(int argc, char **argv) {
+typedef enum {
+    ARG_UNKNOWN,
+    ARG_NAMED,
+    ARG_POSITIONAL
+} ArgType;
+typedef struct {
+    int argc;
+    const char **argv;
+    int index;
+    ArgType type;
+    const char *value;
+    union {
+        int position;
+        const char *name;
+    };
+} Args;
+
+int arg_next(Args *args) {
+    if (args->index == 0) args->index = 1; // skip program name
+    if (args->index >= args->argc) return 0;
+    const char *arg = args->argv[args->index++];
+    if (arg[0] == '-') {
+        if (args->index >= args->argc) return -1;
+        args->type = ARG_NAMED;
+        args->name = arg + (arg[1] == '-' ? 2 : 1);
+        args->value = args->argv[args->index++];
+    } else {
+        args->type = ARG_POSITIONAL;
+        args->position = args->index - 1;
+        args->value = arg;
+    }
+    return 1;
+}
+
+int named_arg(Args *args, ...) {
+    if (args->type != ARG_NAMED) return 0;
+    const char *arg = args->name;
+    va_list va;
+    va_start(va, args);
+    const char *n;
+    while ((n = va_arg(va, const char *))) {
+        if (strcmp(arg, n) == 0) {
+            va_end(va);
+            return 1;
+        }
+    }
+    va_end(va);
+    return 0;
+}
+
+int positional_arg(Args *args) {
+    return args->type == ARG_POSITIONAL ? args->position : 0;
+}
+
+int parse_config_file(int argc, const char **argv) {
     if (argc != 3) {
         log_error("Argument error\n");
         return 1;
@@ -93,18 +147,23 @@ cleanup:
     return ret;
 }
 
-int parse_args(int argc, char **argv) {
-    if (argc < 5 || (argc - 1) % 4 != 0) {
-        log_error("Argument error\n");
-        return 1;
+int parse_args(int argc, const char **argv) {
+    Args args = {.argc = argc, .argv = argv};
+    const char *buf[4];
+    int idx = 0;
+    while (arg_next(&args)) {
+        if (positional_arg(&args)) {
+            buf[idx++] = args.value;
+            if (idx == 4) {
+                add_domain(buf[0], NULL, buf[1], buf[2], buf[3]);
+                log_info("Mapping domain %s to port %s\n", buf[0], buf[1]);
+                idx = 0;
+            }
+        }
     }
-    for (int i = 1; i < argc; i += 4) {
-        const char *domain = argv[i];
-        const char *backend_port = argv[i + 1];
-        const char *cert_file = argv[i + 2];
-        const char *key_file = argv[i + 3];
-        add_domain(domain, NULL, backend_port, cert_file, key_file);
-        log_info("Mapping domain %s to port %s\n", domain, backend_port);
+    if (idx != 0) {
+        log_error("Incomplete domain mapping arguments\n");
+        return 1;
     }
     return 0;
 }
