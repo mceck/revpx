@@ -27,19 +27,19 @@ typedef enum {
     ST_CONNECTING,
     ST_PROXYING,
     ST_SHUTTING_DOWN
-} state_e;
+} ConnectionState;
 
-typedef struct conn {
+typedef struct {
     int fd;
     SSL *ssl;
     int peer;
-    state_e state;
+    ConnectionState state;
     unsigned char buf[BUF_SIZE];
     size_t len, off;
     int closing;
     int write_retry;
     int read_stalled;
-} conn_t;
+} Connection;
 
 typedef struct {
     char *domain;
@@ -48,11 +48,11 @@ typedef struct {
     char *cert;
     char *key;
     SSL_CTX *ctx;
-} domain_t;
+} HostDomain;
 
-da_declare(Domains, domain_t);
+da_declare(Domains, HostDomain);
 
-static conn_t *conns[MAX_FD];
+static Connection *conns[MAX_FD];
 static Domains domains = {0};
 static int epfd;
 
@@ -72,7 +72,7 @@ static void ep_mod(int fd, uint32_t events) {
 
 static void cleanup(int fd) {
     if (fd < 0 || fd >= MAX_FD || !conns[fd]) return;
-    conn_t *c = conns[fd];
+    Connection *c = conns[fd];
     int peer = c->peer;
 
     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
@@ -86,7 +86,7 @@ static void cleanup(int fd) {
     free(c);
 
     if (peer >= 0 && conns[peer]) {
-        conn_t *p = conns[peer];
+        Connection *p = conns[peer];
         p->peer = -1;
         if (p->len > 0) {
             p->closing = 1;
@@ -109,13 +109,13 @@ static void cleanup_both(int fd) {
     }
 }
 
-static conn_t *alloc_conn(int fd, SSL *ssl, state_e state) {
+static Connection *alloc_conn(int fd, SSL *ssl, ConnectionState state) {
     if (fd >= MAX_FD) {
         if (ssl) SSL_free(ssl);
         close(fd);
         return NULL;
     }
-    conn_t *c = calloc(1, sizeof(conn_t));
+    Connection *c = calloc(1, sizeof(Connection));
     c->fd = fd;
     c->ssl = ssl;
     c->peer = -1;
@@ -124,20 +124,20 @@ static conn_t *alloc_conn(int fd, SSL *ssl, state_e state) {
     return c;
 }
 
-static int do_write(conn_t *c, const void *data, size_t size) {
+static int do_write(Connection *c, const void *data, size_t size) {
     return c->ssl ? SSL_write(c->ssl, data, size) : write(c->fd, data, size);
 }
 
-static int do_read(conn_t *c, void *data, size_t size) {
+static int do_read(Connection *c, void *data, size_t size) {
     return c->ssl ? SSL_read(c->ssl, data, size) : read(c->fd, data, size);
 }
 
-static int get_error(conn_t *c, int ret) {
+static int get_error(Connection *c, int ret) {
     if (c->ssl) return SSL_get_error(c->ssl, ret);
     return errno == EAGAIN || errno == EWOULDBLOCK ? SSL_ERROR_WANT_WRITE : SSL_ERROR_SYSCALL;
 }
 
-static void compact_buffer(conn_t *c) {
+static void compact_buffer(Connection *c) {
     if (c->off > 0 && c->len > 0) {
         memmove(c->buf, c->buf + c->off, c->len);
         c->off = 0;
@@ -146,12 +146,12 @@ static void compact_buffer(conn_t *c) {
     }
 }
 
-static size_t buffer_space(conn_t *c) {
+static size_t buffer_space(Connection *c) {
     size_t used = c->off + c->len;
     return used < sizeof(c->buf) ? sizeof(c->buf) - used : 0;
 }
 
-static void send_error(conn_t *c, int code, const char *status) {
+static void send_error(Connection *c, int code, const char *status) {
     char body[4096];
     int body_len = snprintf(body, sizeof(body),
                             "<html><head><title>%d %s</title></head>"
@@ -173,7 +173,7 @@ static void send_error(conn_t *c, int code, const char *status) {
     ep_mod(c->fd, EPOLLOUT | EPOLLET);
 }
 
-static void send_redirect(conn_t *c, const char *host, const char *target, const char *port) {
+static void send_redirect(Connection *c, const char *host, const char *target, const char *port) {
     char resp[4096];
     int n = snprintf(resp, sizeof(resp),
                      "HTTP/1.1 301 Moved Permanently\r\n"
@@ -272,7 +272,7 @@ static int sni_callback(SSL *ssl, int *ad, void *arg) {
     return SSL_TLSEXT_ERR_OK;
 }
 
-static void flush_buffer(conn_t *c) {
+static void flush_buffer(Connection *c) {
     while (c->len > 0) {
         int n = do_write(c, c->buf + c->off, c->len);
         if (n > 0) {
@@ -313,7 +313,7 @@ static void flush_buffer(conn_t *c) {
                 cleanup(c->fd);
             }
         } else {
-            conn_t *peer = c->peer >= 0 ? conns[c->peer] : NULL;
+            Connection *peer = c->peer >= 0 ? conns[c->peer] : NULL;
             if (peer && peer->read_stalled) {
                 peer->read_stalled = 0;
                 ep_mod(peer->fd, EPOLLIN | EPOLLET);
@@ -323,8 +323,8 @@ static void flush_buffer(conn_t *c) {
     }
 }
 
-static void proxy_data(conn_t *src, uint32_t events) {
-    conn_t *dst = src->peer >= 0 ? conns[src->peer] : NULL;
+static void proxy_data(Connection *src, uint32_t events) {
+    Connection *dst = src->peer >= 0 ? conns[src->peer] : NULL;
 
     if (!dst && !src->closing) {
         cleanup(src->fd);
@@ -444,12 +444,12 @@ static int create_backend(const char *host, const char *port) {
 }
 
 static void handle_event(int fd, uint32_t events, const char *https_port) {
-    conn_t *c = conns[fd];
+    Connection *c = conns[fd];
     if (!c) return;
 
     if (events & EPOLLERR) {
         if (c->state == ST_CONNECTING) {
-            conn_t *client = conns[c->peer];
+            Connection *client = conns[c->peer];
             if (client) {
                 send_error(client, 502, "Bad Gateway");
                 client->peer = -1;
@@ -518,7 +518,7 @@ static void handle_event(int fd, uint32_t events, const char *https_port) {
                 break;
             }
 
-            domain_t *d = da_find(&domains, strcasecmp(e->domain, host) == 0);
+            HostDomain *d = da_find(&domains, strcasecmp(e->domain, host) == 0);
             if (!d) {
                 send_error(c, 421, "Misdirected Request");
                 break;
@@ -532,7 +532,7 @@ static void handle_event(int fd, uint32_t events, const char *https_port) {
                 break;
             }
 
-            conn_t *b = alloc_conn(backend, NULL, ST_CONNECTING);
+            Connection *b = alloc_conn(backend, NULL, ST_CONNECTING);
             c->peer = backend;
             b->peer = fd;
             ep_add(backend, EPOLLOUT | EPOLLET);
@@ -546,7 +546,7 @@ static void handle_event(int fd, uint32_t events, const char *https_port) {
         int err = 0;
         socklen_t len = sizeof(err);
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
-            conn_t *client = conns[c->peer];
+            Connection *client = conns[c->peer];
             if (client) {
                 send_error(client, 502, "Bad Gateway");
                 client->peer = -1;
@@ -556,7 +556,7 @@ static void handle_event(int fd, uint32_t events, const char *https_port) {
             break;
         }
 
-        conn_t *client = conns[c->peer];
+        Connection *client = conns[c->peer];
         if (!client) {
             cleanup(fd);
             break;
@@ -645,7 +645,7 @@ static int create_listener(const char *port) {
 }
 
 void add_domain(const char *domain, const char *host, const char *port, const char *cert, const char *key) {
-    da_append(&domains, ((domain_t){
+    da_append(&domains, ((HostDomain){
                             .domain = strdup(domain),
                             .host = host && host[0] ? strdup(host) : strdup(DEFAULT_BACKEND_HOST),
                             .port = strdup(port),
@@ -699,7 +699,7 @@ void run_revpx_server(const char *http_port, const char *https_port) {
                     SSL_set_fd(ssl, client);
                     SSL_set_accept_state(ssl);
 
-                    conn_t *c = alloc_conn(client, ssl, ST_SSL_HANDSHAKE);
+                    Connection *c = alloc_conn(client, ssl, ST_SSL_HANDSHAKE);
                     if (!c) continue;
 
                     int ret = SSL_accept(ssl);
@@ -719,7 +719,7 @@ void run_revpx_server(const char *http_port, const char *https_port) {
                     struct linger lin = {.l_onoff = 0, .l_linger = 0};
                     setsockopt(client, SOL_SOCKET, SO_LINGER, &lin, sizeof(lin));
 
-                    conn_t *c = alloc_conn(client, NULL, ST_READ_HEADER);
+                    Connection *c = alloc_conn(client, NULL, ST_READ_HEADER);
                     if (c) ep_add(client, EPOLLIN | EPOLLET);
                 }
             } else {
