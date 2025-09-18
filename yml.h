@@ -50,7 +50,6 @@ static void add_child(YamlNode *parent, YamlNode *child) {
 YamlNode *parse_yaml(const char *filename) {
     FILE *f = fopen(filename, "r");
     if (!f) {
-        perror("fopen");
         return NULL;
     }
     char line[MAX_LINE];

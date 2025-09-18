@@ -6,15 +6,16 @@
 
 void print_help() {
     printf("revpx - Reverse Proxy\n");
-    printf("Usage:\n");
-    printf("  revpx --file <path>          Load domain mappings from JSON config file\n");
-    printf("  revpx <domain> <port> <cert_file> <key_file> ...\n");
+    printf("revpx [<options>] [<domain> <port> <cert_file> <key_file> ...]\n");
+    printf("Options:\n");
+    printf("    --help/-h                 Show this help message\n");
+    printf("    --file/-f <path>          Load config from JSON config file\n");
+    printf("    --monade/-m <path>        Load config from Monade config file (default: ./monade.yaml)\n");
+    printf("    --port/-p <port>          Https port for revpx to listen on (default: 443)\n");
+    printf("    --port-plain/-pp <port>   Http port for revpx to listen on (default: 80)\n\n");
     printf("\nExamples:\n");
     printf("  revpx --file config.json\n");
     printf("  revpx example.localhost 8080 example.localhost.pem example.localhost-key.pem\n");
-    printf("\nEnvironment Variables:\n");
-    printf("  REVPX_PORT: Port for revpx to listen on (default: 443)\n");
-    printf("  REVPX_PORT_PLAIN: Port for revpx to listen on (default: 80)\n");
 }
 
 int main(int argc, const char **argv) {
@@ -51,9 +52,10 @@ int main(int argc, const char **argv) {
         return 1;
     }
     if (domains.count == 0) {
-        log_error("No domain mappings provided\n");
-        print_help();
-        return 1;
+        if (parse_monade_yaml(NULL) != 0) {
+            print_help();
+            return 1;
+        }
     }
     if (!sec_port) sec_port = DEFAULT_PORT;
     if (!plain_port) plain_port = DEFAULT_PORT_PLAIN;

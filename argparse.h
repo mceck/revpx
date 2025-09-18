@@ -148,9 +148,10 @@ cleanup:
 int parse_monade_yaml(const char *yaml_file) {
     const char *home = getenv("HOME");
     int ret = 0;
-    YamlNode *yaml = parse_yaml(yaml_file && yaml_file[0] ? yaml_file : "monade.yaml");
+    const char *yaml_path = yaml_file && yaml_file[0] ? yaml_file : "monade.yaml";
+    YamlNode *yaml = parse_yaml(yaml_path);
     if (!yaml) {
-        log_error("Failed to parse YAML file %s\n", yaml_file);
+        log_error("Failed to parse %s\n", yaml_path);
         ret = 1;
         goto cleanup;
     }
