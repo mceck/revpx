@@ -88,14 +88,15 @@ typedef struct {
     char https_port[16];
     char http_port[16];
     int domain_count;
+    bool stop;
     RpHostDomain domains[RP_MAX_DOMAINS];
     RpConnection *conns[RP_MAX_FD];
 } RevPx;
 
-bool revpx_add_domain(RevPx *revpx, const char *domain, const char *host, const char *port, const char *cert, const char *key);
-void revpx_run_server(RevPx *revpx);
 RevPx *revpx_create(const char *http_port, const char *https_port);
 void revpx_free(RevPx *revpx);
+bool revpx_add_domain(RevPx *revpx, const char *domain, const char *host, const char *port, const char *cert, const char *key);
+int revpx_run_server(RevPx *revpx);
 
 #ifdef REVPX_IMPLEMENTATION
 
@@ -689,6 +690,11 @@ static int create_listener(const char *port) {
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
     if (bind(fd, res->ai_addr, res->ai_addrlen) < 0) {
+        if (errno == EADDRINUSE) {
+            close(fd);
+            freeaddrinfo(res);
+            return -1;
+        }
         close(fd);
         freeaddrinfo(res);
         return -1;
@@ -696,7 +702,10 @@ static int create_listener(const char *port) {
 
     freeaddrinfo(res);
     set_nonblock(fd);
-    listen(fd, 512);
+    if (listen(fd, 512) < 0) {
+        close(fd);
+        return -1;
+    }
     return fd;
 }
 
@@ -719,35 +728,50 @@ bool revpx_add_domain(RevPx *revpx, const char *domain, const char *host, const 
     return true;
 }
 
-void revpx_run_server(RevPx *revpx) {
+int revpx_run_server(RevPx *revpx) {
     signal(SIGPIPE, SIG_IGN);
     SSL_library_init();
     SSL_load_error_strings();
 
     revpx->epfd = epoll_create1(0);
     memset(revpx->conns, 0, sizeof(revpx->conns));
+    revpx->stop = false;
 
     int https_fd = create_listener(revpx->https_port);
+    if (https_fd < 0) {
+        rp_log_error("Failed to create https listener on port %s\n", revpx->https_port);
+        return -1;
+    }
     ep_add(revpx, https_fd, EPOLLIN | EPOLLET);
     rp_log_info("Listening https on %s\n", revpx->https_port);
 
     int http_fd = -1;
     if (*revpx->http_port) {
         http_fd = create_listener(revpx->http_port);
+        if (http_fd < 0) {
+            rp_log_error("Failed to create http listener on port %s\n", revpx->http_port);
+            close(https_fd);
+            return -1;
+        }
         ep_add(revpx, http_fd, EPOLLIN | EPOLLET);
         rp_log_info("Redirecting http %s -> %s\n", revpx->http_port, revpx->https_port);
     }
 
-    SSL_CTX *default_ctx = SSL_CTX_new(TLS_server_method());
-    SSL_CTX_set_mode(default_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-    SSL_CTX_set_tlsext_servername_callback(default_ctx, sni_callback);
-    SSL_CTX_set_tlsext_servername_arg(default_ctx, revpx);
+    SSL_CTX *root_ctx = SSL_CTX_new(TLS_server_method());
+    SSL_CTX_set_mode(root_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    SSL_CTX_set_tlsext_servername_callback(root_ctx, sni_callback);
+    SSL_CTX_set_tlsext_servername_arg(root_ctx, revpx);
 
     struct epoll_event events[RP_MAX_EVENTS];
-
-    while (1) {
+    int ret = 0;
+    while (!revpx->stop) {
         int n = epoll_wait(revpx->epfd, events, RP_MAX_EVENTS, -1);
-        if (n < 0 && errno != EINTR) break;
+        if (n < 0 && errno != EINTR) {
+            rp_log_error("epoll_wait error: %s\n", strerror(errno));
+            ret = -1;
+            revpx->stop = true;
+            break;
+        }
 
         for (int i = 0; i < n; i++) {
             int fd = events[i].data.fd;
@@ -758,7 +782,7 @@ void revpx_run_server(RevPx *revpx) {
                     if (client < 0) break;
                     set_nonblock(client);
 
-                    SSL *ssl = SSL_new(default_ctx);
+                    SSL *ssl = SSL_new(root_ctx);
                     SSL_set_fd(ssl, client);
                     SSL_set_accept_state(ssl);
 
@@ -789,7 +813,17 @@ void revpx_run_server(RevPx *revpx) {
         }
     }
 
-    SSL_CTX_free(default_ctx);
+    // Cleanup resources
+    for (int i = 0; i < RP_MAX_FD; i++) {
+        if (revpx->conns[i]) {
+            cleanup(revpx, i);
+        }
+    }
+    if (http_fd >= 0) close(http_fd);
+    if (https_fd >= 0) close(https_fd);
+    if (revpx->epfd >= 0) close(revpx->epfd);
+    SSL_CTX_free(root_ctx);
+    return ret;
 }
 
 RevPx *revpx_create(const char *http_port, const char *https_port) {
