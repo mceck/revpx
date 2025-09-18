@@ -116,7 +116,11 @@ static void cleanup_both(int fd) {
 }
 
 static RpConnection *alloc_conn(int fd, SSL *ssl, RpConnectionState state) {
-    if (fd >= RP_MAX_FD) {
+    if (fd >= RP_MAX_FD || rp_conns[fd]) {
+        if (fd >= RP_MAX_FD)
+            ds_log_error("Too many connections\n");
+        else
+            ds_log_error("fd in use: %d\n", fd);
         if (ssl) SSL_free(ssl);
         close(fd);
         return NULL;
@@ -176,6 +180,7 @@ static void send_error(RpConnection *c, int code, const char *status) {
     c->len = head_len + body_len;
     c->off = 0;
     c->closing = 1;
+    ds_log_info("connection error: %d %s\n", code, status);
     ep_mod(c->fd, EPOLLOUT | EPOLLET);
 }
 
