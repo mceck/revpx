@@ -43,6 +43,7 @@ bool flag_arg(Args *args, ...) {
     va_start(va, args);
     const char *n;
     while ((n = va_arg(va, const char *))) {
+        if (!n[0]) break;
         if (strcmp(arg, n) == 0) {
             va_end(va);
             return true;
