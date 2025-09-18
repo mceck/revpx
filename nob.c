@@ -43,9 +43,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    cmd_append(&cmd, "cc", "-c", "src/revpx-lib.c", "-o", "build/revpx.o", "-lssl", "-lcrypto", "-O2", "-Wall", "-Wextra");
+    cmd_append(&cmd, "cc", "-c", "src/revpx-lib.c", "-o", "build/revpx.o", "-O2", "-Wall", "-Wextra");
 #if __APPLE__
-    cmd_append(&cmd, "-I/opt/homebrew/include/", "-L/opt/homebrew/lib/");
+    cmd_append(&cmd, "-I/opt/homebrew/include/");
 #endif
     if (!cmd_run(&cmd, .async = &procs)) {
         nob_log(NOB_ERROR, "Build failed");
