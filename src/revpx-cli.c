@@ -1,5 +1,6 @@
 #include <stdio.h>
 #define REVPX_IMPLEMENTATION
+#define DS_NO_PREFIX
 #include "revpx.h"
 #include "argparse.h"
 #define DEFAULT_PORT "443"

@@ -14,14 +14,13 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
-#define DS_NO_PREFIX
 #include "ds.h"
 #include "ep.h"
 
-#define DEFAULT_BACKEND_HOST "127.0.0.1"
-#define MAX_EVENTS 1024
-#define BUF_SIZE 16384
-#define MAX_FD 65536
+#define RP_DEFAULT_BACKEND_HOST "127.0.0.1"
+#define RP_MAX_EVENTS 1024
+#define RP_BUF_SIZE 16384
+#define RP_MAX_FD 65536
 
 typedef enum {
     ST_SSL_HANDSHAKE,
@@ -36,7 +35,7 @@ typedef struct {
     SSL *ssl;
     int peer;
     RpConnectionState state;
-    unsigned char buf[BUF_SIZE];
+    unsigned char buf[RP_BUF_SIZE];
     size_t len, off;
     int closing;
     int write_retry;
@@ -52,9 +51,9 @@ typedef struct {
     SSL_CTX *ctx;
 } RpHostDomain;
 
-da_declare(RpDomains, RpHostDomain);
+ds_da_declare(RpDomains, RpHostDomain);
 
-static RpConnection *rp_conns[MAX_FD];
+static RpConnection *rp_conns[RP_MAX_FD];
 static RpDomains rp_domains = {0};
 static int rp_epfd;
 
@@ -79,7 +78,7 @@ static void ep_mod(int fd, uint32_t events) {
 }
 
 static void cleanup(int fd) {
-    if (fd < 0 || fd >= MAX_FD || !rp_conns[fd]) return;
+    if (fd < 0 || fd >= RP_MAX_FD || !rp_conns[fd]) return;
     RpConnection *c = rp_conns[fd];
     int peer = c->peer;
 
@@ -107,7 +106,7 @@ static void cleanup(int fd) {
 }
 
 static void cleanup_both(int fd) {
-    if (fd < 0 || fd >= MAX_FD || !rp_conns[fd]) return;
+    if (fd < 0 || fd >= RP_MAX_FD || !rp_conns[fd]) return;
     int peer = rp_conns[fd]->peer;
 
     cleanup(fd);
@@ -118,7 +117,7 @@ static void cleanup_both(int fd) {
 }
 
 static RpConnection *alloc_conn(int fd, SSL *ssl, RpConnectionState state) {
-    if (fd >= MAX_FD) {
+    if (fd >= RP_MAX_FD) {
         if (ssl) SSL_free(ssl);
         close(fd);
         return NULL;
@@ -259,7 +258,7 @@ static void extract_target(const unsigned char *buf, size_t len, char *out, size
 }
 
 static SSL_CTX *get_ctx(const char *host) {
-    da_foreach(&rp_domains, d) {
+    ds_da_foreach(&rp_domains, d) {
         if (strcasecmp(d->domain, host) == 0) {
             if (!d->ctx) {
                 d->ctx = SSL_CTX_new(TLS_server_method());
@@ -346,7 +345,7 @@ static void proxy_data(RpConnection *src, uint32_t events) {
     }
 
     if ((events & EPOLLIN) && dst) {
-        unsigned char temp[BUF_SIZE];
+        unsigned char temp[RP_BUF_SIZE];
 
         while (1) {
             dst = src->peer >= 0 ? rp_conns[src->peer] : NULL;
@@ -528,13 +527,13 @@ static void handle_event(int fd, uint32_t events, const char *https_port) {
                 break;
             }
 
-            RpHostDomain *d = da_find(&rp_domains, strcasecmp(e->domain, host) == 0);
+            RpHostDomain *d = ds_da_find(&rp_domains, strcasecmp(e->domain, host) == 0);
             if (!d) {
                 send_error(c, 421, "Misdirected Request");
                 break;
             }
 
-            log_info("proxy: %s%s -> %s:%s\n", host, target, d->host, d->port);
+            ds_log_info("proxy: %s%s -> %s:%s\n", host, target, d->host, d->port);
 
             int backend = create_backend(d->host, d->port);
             if (backend < 0) {
@@ -655,14 +654,14 @@ static int create_listener(const char *port) {
 }
 
 void revpx_add_domain(const char *domain, const char *host, const char *port, const char *cert, const char *key) {
-    da_append(&rp_domains, ((RpHostDomain){
-                               .domain = strdup(domain),
-                               .host = host && host[0] ? strdup(host) : strdup(DEFAULT_BACKEND_HOST),
-                               .port = strdup(port),
-                               .cert = strdup(cert),
-                               .key = strdup(key),
-                               .ctx = NULL}));
-    log_debug("domain: %s -> %s\n", domain, port);
+    ds_da_append(&rp_domains, ((RpHostDomain){
+                                  .domain = strdup(domain),
+                                  .host = host && host[0] ? strdup(host) : strdup(RP_DEFAULT_BACKEND_HOST),
+                                  .port = strdup(port),
+                                  .cert = strdup(cert),
+                                  .key = strdup(key),
+                                  .ctx = NULL}));
+    ds_log_debug("domain: %s -> %s\n", domain, port);
 }
 
 void revpx_run_server(const char *http_port, const char *https_port) {
@@ -675,23 +674,23 @@ void revpx_run_server(const char *http_port, const char *https_port) {
 
     int https_fd = create_listener(https_port);
     ep_add(https_fd, EPOLLIN | EPOLLET);
-    log_info("HTTPS on port %s\n", https_port);
+    ds_log_info("HTTPS on port %s\n", https_port);
 
     int http_fd = -1;
     if (http_port && *http_port) {
         http_fd = create_listener(http_port);
         ep_add(http_fd, EPOLLIN | EPOLLET);
-        log_info("HTTP on port %s\n", http_port);
+        ds_log_info("HTTP on port %s\n", http_port);
     }
 
     SSL_CTX *default_ctx = SSL_CTX_new(TLS_server_method());
     SSL_CTX_set_mode(default_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
     SSL_CTX_set_tlsext_servername_callback(default_ctx, sni_callback);
 
-    struct epoll_event events[MAX_EVENTS];
+    struct epoll_event events[RP_MAX_EVENTS];
 
     while (1) {
-        int n = epoll_wait(rp_epfd, events, MAX_EVENTS, -1);
+        int n = epoll_wait(rp_epfd, events, RP_MAX_EVENTS, -1);
         if (n < 0 && errno != EINTR) break;
 
         for (int i = 0; i < n; i++) {
@@ -742,7 +741,7 @@ void revpx_run_server(const char *http_port, const char *https_port) {
 }
 
 void revpx_free_domains() {
-    da_foreach(&rp_domains, d) {
+    ds_da_foreach(&rp_domains, d) {
         if (d->ctx) SSL_CTX_free(d->ctx);
         if (d->domain) free(d->domain);
         if (d->port) free(d->port);
@@ -750,7 +749,7 @@ void revpx_free_domains() {
         if (d->key) free(d->key);
         if (d->host) free(d->host);
     }
-    da_free(&rp_domains);
+    ds_da_free(&rp_domains);
 }
 
 #endif // REVPX_IMPLEMENTATION
