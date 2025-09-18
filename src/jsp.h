@@ -50,6 +50,7 @@ const char *json = "{\"name\": \"John\", \"age\": 30, \"is_student\": false, \"a
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <assert.h>
 
 #define JSP_SMIN_CAPACITY 32
 #ifndef JSP_MAX_NESTING

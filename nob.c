@@ -27,7 +27,6 @@ int main(int argc, char **argv) {
 
     // UPDATE
     if (argc > 1 && (strcmp(argv[1], "update") == 0)) {
-        download_github_dep(&procs, "mceck/c-stb", "main/ds.h", "src/ds.h");
         download_github_dep(&procs, "mceck/c-stb", "main/jsp.h", "src/jsp.h");
         download_github_dep(&procs, "tsoding/nob.h", "main/nob.h", "nob.h");
         return !procs_flush(&procs);

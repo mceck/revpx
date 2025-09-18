@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <signal.h>
 #include <fcntl.h>
@@ -14,13 +16,43 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
-#include "ds.h"
 #include "ep.h"
 
 #define RP_DEFAULT_BACKEND_HOST "127.0.0.1"
 #define RP_MAX_EVENTS 1024
 #define RP_BUF_SIZE 16384
 #define RP_MAX_FD 65536
+#define RP_MAX_DOMAINS 128
+
+enum log_level {
+    RP_DEBUG,
+    RP_INFO,
+    RP_WARN,
+    RP_ERROR
+};
+
+#ifndef RP_LOG_LEVEL
+#define RP_LOG_LEVEL RP_INFO
+#endif // RP_LOG_LEVEL
+
+static const char *RpLogLevelStrings[] = {
+    [RP_DEBUG] = "DEBUG",
+    [RP_INFO] = "INFO",
+    [RP_WARN] = "WARN",
+    [RP_ERROR] = "ERROR"};
+
+#define rp_log(LVL, FMT, ...)                                                                  \
+    do {                                                                                       \
+        if (RP_LOG_LEVEL <= LVL) {                                                             \
+            FILE *log_file = LVL >= RP_ERROR ? stderr : stdout;                                \
+            fprintf(log_file, "[%s] " FMT, RpLogLevelStrings[LVL] __VA_OPT__(, ) __VA_ARGS__); \
+            fflush(log_file);                                                                  \
+        }                                                                                      \
+    } while (0)
+#define rp_log_info(FMT, ...) rp_log(RP_INFO, FMT, __VA_ARGS__)
+#define rp_log_debug(FMT, ...) rp_log(RP_DEBUG, FMT, __VA_ARGS__)
+#define rp_log_warn(FMT, ...) rp_log(RP_WARN, FMT, __VA_ARGS__)
+#define rp_log_error(FMT, ...) rp_log(RP_ERROR, FMT, __VA_ARGS__)
 
 typedef enum {
     ST_SSL_HANDSHAKE,
@@ -51,14 +83,18 @@ typedef struct {
     SSL_CTX *ctx;
 } RpHostDomain;
 
-ds_da_declare(RpDomains, RpHostDomain);
+typedef struct {
+    int epfd;
+    const char *https_port;
+    const char *http_port;
+    int domain_count;
+    RpHostDomain domains[RP_MAX_DOMAINS];
+    RpConnection *conns[RP_MAX_FD];
+} RevPx;
 
-static RpConnection *rp_conns[RP_MAX_FD];
-static RpDomains rp_domains = {0};
-static int rp_epfd;
-
-void revpx_add_domain(const char *domain, const char *host, const char *port, const char *cert, const char *key);
-void revpx_run_server(const char *http_port, const char *https_port);
+bool revpx_add_domain(RevPx *revpx, const char *domain, const char *host, const char *port, const char *cert, const char *key);
+void revpx_run_server(RevPx *revpx);
+void revpx_free(RevPx *revpx);
 
 #ifdef REVPX_IMPLEMENTATION
 
@@ -66,23 +102,23 @@ static void set_nonblock(int fd) {
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
 }
 
-static void ep_add(int fd, uint32_t events) {
+static void ep_add(RevPx *revpx, int fd, uint32_t events) {
     struct epoll_event ev = {.data.fd = fd, .events = events};
-    epoll_ctl(rp_epfd, EPOLL_CTL_ADD, fd, &ev);
+    epoll_ctl(revpx->epfd, EPOLL_CTL_ADD, fd, &ev);
 }
 
-static void ep_mod(int fd, uint32_t events) {
+static void ep_mod(RevPx *revpx, int fd, uint32_t events) {
     struct epoll_event ev = {.data.fd = fd, .events = events};
-    epoll_ctl(rp_epfd, EPOLL_CTL_MOD, fd, &ev);
+    epoll_ctl(revpx->epfd, EPOLL_CTL_MOD, fd, &ev);
 }
 
-static void cleanup(int fd) {
-    if (fd < 0 || fd >= RP_MAX_FD || !rp_conns[fd]) return;
-    RpConnection *c = rp_conns[fd];
+static void cleanup(RevPx *revpx, int fd) {
+    if (fd < 0 || fd >= RP_MAX_FD || !revpx->conns[fd]) return;
+    RpConnection *c = revpx->conns[fd];
     int peer = c->peer;
 
-    epoll_ctl(rp_epfd, EPOLL_CTL_DEL, fd, NULL);
-    rp_conns[fd] = NULL;
+    epoll_ctl(revpx->epfd, EPOLL_CTL_DEL, fd, NULL);
+    revpx->conns[fd] = NULL;
 
     if (c->ssl) {
         SSL_shutdown(c->ssl);
@@ -91,36 +127,36 @@ static void cleanup(int fd) {
     close(fd);
     free(c);
 
-    if (peer >= 0 && rp_conns[peer]) {
-        RpConnection *p = rp_conns[peer];
+    if (peer >= 0 && revpx->conns[peer]) {
+        RpConnection *p = revpx->conns[peer];
         p->peer = -1;
         if (p->len > 0) {
             p->closing = 1;
-            ep_mod(peer, EPOLLOUT | EPOLLET);
+            ep_mod(revpx, peer, EPOLLOUT | EPOLLET);
         } else {
             p->state = ST_SHUTTING_DOWN;
-            ep_mod(peer, EPOLLOUT | EPOLLET);
+            ep_mod(revpx, peer, EPOLLOUT | EPOLLET);
         }
     }
 }
 
-static void cleanup_both(int fd) {
-    if (fd < 0 || fd >= RP_MAX_FD || !rp_conns[fd]) return;
-    int peer = rp_conns[fd]->peer;
+static void cleanup_both(RevPx *revpx, int fd) {
+    if (fd < 0 || fd >= RP_MAX_FD || !revpx->conns[fd]) return;
+    int peer = revpx->conns[fd]->peer;
 
-    cleanup(fd);
-    if (peer >= 0 && rp_conns[peer]) {
-        rp_conns[peer]->peer = -1;
-        cleanup(peer);
+    cleanup(revpx, fd);
+    if (peer >= 0 && revpx->conns[peer]) {
+        revpx->conns[peer]->peer = -1;
+        cleanup(revpx, peer);
     }
 }
 
-static RpConnection *alloc_conn(int fd, SSL *ssl, RpConnectionState state) {
-    if (fd >= RP_MAX_FD || rp_conns[fd]) {
+static RpConnection *alloc_conn(RevPx *revpx, int fd, SSL *ssl, RpConnectionState state) {
+    if (fd >= RP_MAX_FD || revpx->conns[fd]) {
         if (fd >= RP_MAX_FD)
-            ds_log_error("Too many connections\n");
+            rp_log_error("Too many connections\n");
         else
-            ds_log_error("fd in use: %d\n", fd);
+            rp_log_error("fd in use: %d\n", fd);
         if (ssl) SSL_free(ssl);
         close(fd);
         return NULL;
@@ -130,7 +166,7 @@ static RpConnection *alloc_conn(int fd, SSL *ssl, RpConnectionState state) {
     c->ssl = ssl;
     c->peer = -1;
     c->state = state;
-    rp_conns[fd] = c;
+    revpx->conns[fd] = c;
     return c;
 }
 
@@ -161,7 +197,7 @@ static size_t buffer_space(RpConnection *c) {
     return used < sizeof(c->buf) ? sizeof(c->buf) - used : 0;
 }
 
-static void send_error(RpConnection *c, int code, const char *status) {
+static void send_error(RevPx *revpx, RpConnection *c, int code, const char *status) {
     char body[1024];
     int body_len = snprintf(body, sizeof(body),
                             "<html><head><title>%d %s</title></head>"
@@ -180,11 +216,11 @@ static void send_error(RpConnection *c, int code, const char *status) {
     c->len = head_len + body_len;
     c->off = 0;
     c->closing = 1;
-    ds_log_info("connection error: %d %s\n", code, status);
-    ep_mod(c->fd, EPOLLOUT | EPOLLET);
+    rp_log_info("connection error: %d %s\n", code, status);
+    ep_mod(revpx, c->fd, EPOLLOUT | EPOLLET);
 }
 
-static void send_redirect(RpConnection *c, const char *host, const char *target, const char *port) {
+static void send_redirect(RevPx *revpx, RpConnection *c, const char *host, const char *target, const char *port) {
     char resp[2048];
     int n = snprintf(resp, sizeof(resp),
                      "HTTP/1.1 301 Moved Permanently\r\n"
@@ -196,7 +232,7 @@ static void send_redirect(RpConnection *c, const char *host, const char *target,
     c->len = n;
     c->off = 0;
     c->closing = 1;
-    ep_mod(c->fd, EPOLLOUT | EPOLLET);
+    ep_mod(revpx, c->fd, EPOLLOUT | EPOLLET);
 }
 
 static int find_headers_end(const unsigned char *buf, size_t len) {
@@ -262,8 +298,9 @@ static void extract_target(const unsigned char *buf, size_t len, char *out, size
     out[n] = '\0';
 }
 
-static SSL_CTX *get_ctx(const char *host) {
-    ds_da_foreach(&rp_domains, d) {
+static SSL_CTX *get_ctx(RevPx *revpx, const char *host) {
+    for (int i = 0; i < revpx->domain_count; i++) {
+        RpHostDomain *d = &revpx->domains[i];
         if (strcasecmp(d->domain, host) == 0) {
             if (!d->ctx) {
                 d->ctx = SSL_CTX_new(TLS_server_method());
@@ -279,14 +316,14 @@ static SSL_CTX *get_ctx(const char *host) {
 
 static int sni_callback(SSL *ssl, int *ad, void *arg) {
     (void)ad;
-    (void)arg;
+    RevPx *revpx = (RevPx *)arg;
     const char *name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
-    SSL_CTX *ctx = name ? get_ctx(name) : NULL;
+    SSL_CTX *ctx = name ? get_ctx(revpx, name) : NULL;
     if (ctx) SSL_set_SSL_CTX(ssl, ctx);
     return SSL_TLSEXT_ERR_OK;
 }
 
-static void flush_buffer(RpConnection *c) {
+static void flush_buffer(RevPx *revpx, RpConnection *c) {
     while (c->len > 0) {
         int n = do_write(c, c->buf + c->off, c->len);
         if (n > 0) {
@@ -296,23 +333,23 @@ static void flush_buffer(RpConnection *c) {
         } else {
             int err = get_error(c, n);
             if (err == SSL_ERROR_WANT_WRITE) {
-                ep_mod(c->fd, EPOLLOUT | EPOLLET);
+                ep_mod(revpx, c->fd, EPOLLOUT | EPOLLET);
                 return;
             }
             if (err == SSL_ERROR_WANT_READ) {
-                ep_mod(c->fd, EPOLLIN | EPOLLOUT | EPOLLET);
+                ep_mod(revpx, c->fd, EPOLLIN | EPOLLOUT | EPOLLET);
                 return;
             }
             if (err == SSL_ERROR_ZERO_RETURN || (err == SSL_ERROR_SYSCALL && errno == 0)) {
-                cleanup_both(c->fd);
+                cleanup_both(revpx, c->fd);
                 return;
             }
             if (!c->write_retry) {
                 c->write_retry = 1;
-                ep_mod(c->fd, EPOLLOUT | EPOLLET);
+                ep_mod(revpx, c->fd, EPOLLOUT | EPOLLET);
                 return;
             }
-            cleanup(c->fd);
+            cleanup(revpx, c->fd);
             return;
         }
     }
@@ -322,40 +359,40 @@ static void flush_buffer(RpConnection *c) {
         if (c->closing) {
             if (c->ssl) {
                 c->state = ST_SHUTTING_DOWN;
-                ep_mod(c->fd, EPOLLOUT | EPOLLET);
+                ep_mod(revpx, c->fd, EPOLLOUT | EPOLLET);
             } else {
-                cleanup(c->fd);
+                cleanup(revpx, c->fd);
             }
         } else {
-            RpConnection *peer = c->peer >= 0 ? rp_conns[c->peer] : NULL;
+            RpConnection *peer = c->peer >= 0 ? revpx->conns[c->peer] : NULL;
             if (peer && peer->read_stalled) {
                 peer->read_stalled = 0;
-                ep_mod(peer->fd, EPOLLIN | EPOLLET);
+                ep_mod(revpx, peer->fd, EPOLLIN | EPOLLET);
             }
-            ep_mod(c->fd, EPOLLIN | EPOLLET);
+            ep_mod(revpx, c->fd, EPOLLIN | EPOLLET);
         }
     }
 }
 
-static void proxy_data(RpConnection *src, uint32_t events) {
-    RpConnection *dst = src->peer >= 0 ? rp_conns[src->peer] : NULL;
+static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
+    RpConnection *dst = src->peer >= 0 ? revpx->conns[src->peer] : NULL;
 
     if (!dst && !src->closing) {
-        cleanup(src->fd);
+        cleanup(revpx, src->fd);
         return;
     }
 
     if (events & EPOLLOUT) {
-        flush_buffer(src);
+        flush_buffer(revpx, src);
     }
 
     if ((events & EPOLLIN) && dst) {
         unsigned char temp[RP_BUF_SIZE];
 
         while (1) {
-            dst = src->peer >= 0 ? rp_conns[src->peer] : NULL;
+            dst = src->peer >= 0 ? revpx->conns[src->peer] : NULL;
             if (!dst) {
-                cleanup(src->fd);
+                cleanup(revpx, src->fd);
                 return;
             }
 
@@ -369,9 +406,9 @@ static void proxy_data(RpConnection *src, uint32_t events) {
                 if (!src->read_stalled) {
                     src->read_stalled = 1;
                     uint32_t ev = src->len > 0 ? (EPOLLOUT | EPOLLET) : 0;
-                    if (ev) ep_mod(src->fd, ev);
+                    if (ev) ep_mod(revpx, src->fd, ev);
                 }
-                ep_mod(dst->fd, EPOLLOUT | EPOLLET);
+                ep_mod(revpx, dst->fd, EPOLLOUT | EPOLLET);
                 break;
             }
 
@@ -389,18 +426,18 @@ static void proxy_data(RpConnection *src, uint32_t events) {
                         int err = get_error(dst, w);
                         if (err == SSL_ERROR_WANT_WRITE) break;
                         if (err == SSL_ERROR_WANT_READ) {
-                            ep_mod(dst->fd, EPOLLIN | EPOLLOUT | EPOLLET);
+                            ep_mod(revpx, dst->fd, EPOLLIN | EPOLLOUT | EPOLLET);
                             break;
                         }
                         if (err == SSL_ERROR_ZERO_RETURN || (err == SSL_ERROR_SYSCALL && errno == 0)) {
-                            cleanup_both(src->fd);
+                            cleanup_both(revpx, src->fd);
                             return;
                         }
                         if (!dst->write_retry) {
                             dst->write_retry = 1;
                             break;
                         }
-                        cleanup(src->fd);
+                        cleanup(revpx, src->fd);
                         return;
                     }
                 }
@@ -410,23 +447,23 @@ static void proxy_data(RpConnection *src, uint32_t events) {
                     if (buffer_space(dst) < remain) compact_buffer(dst);
                     memcpy(dst->buf + dst->off + dst->len, temp + written, remain);
                     dst->len += remain;
-                    ep_mod(dst->fd, EPOLLOUT | EPOLLET);
+                    ep_mod(revpx, dst->fd, EPOLLOUT | EPOLLET);
                 }
             } else if (n == 0) {
-                cleanup(src->fd);
+                cleanup(revpx, src->fd);
                 return;
             } else {
                 int err = get_error(src, n);
                 if (err == SSL_ERROR_WANT_READ) break;
                 if (err == SSL_ERROR_WANT_WRITE) {
-                    ep_mod(src->fd, EPOLLOUT | EPOLLIN | EPOLLET);
+                    ep_mod(revpx, src->fd, EPOLLOUT | EPOLLIN | EPOLLET);
                     break;
                 }
                 if (err == SSL_ERROR_ZERO_RETURN || (err == SSL_ERROR_SYSCALL && errno == 0)) {
-                    cleanup(src->fd);
+                    cleanup(revpx, src->fd);
                     return;
                 }
-                cleanup(src->fd);
+                cleanup(revpx, src->fd);
                 return;
             }
         }
@@ -449,49 +486,47 @@ static int create_backend(const char *host, const char *port) {
     set_nonblock(fd);
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    struct linger lin = {.l_onoff = 0, .l_linger = 0};
-    setsockopt(fd, SOL_SOCKET, SO_LINGER, &lin, sizeof(lin));
 
     connect(fd, res->ai_addr, res->ai_addrlen);
     freeaddrinfo(res);
     return fd;
 }
 
-static void handle_event(int fd, uint32_t events, const char *https_port) {
-    RpConnection *c = rp_conns[fd];
+static void handle_event(RevPx *revpx, int fd, uint32_t events) {
+    RpConnection *c = revpx->conns[fd];
     if (!c) return;
 
     if (events & EPOLLERR) {
         if (c->state == ST_CONNECTING) {
-            RpConnection *client = rp_conns[c->peer];
+            RpConnection *client = revpx->conns[c->peer];
             if (client) {
-                send_error(client, 502, "Bad Gateway");
+                send_error(revpx, client, 502, "Bad Gateway");
                 client->peer = -1;
             }
             c->peer = -1;
-            cleanup(fd);
+            cleanup(revpx, fd);
         } else if (c->state == ST_PROXYING) {
-            cleanup(fd);
+            cleanup(revpx, fd);
         } else {
-            cleanup_both(fd);
+            cleanup_both(revpx, fd);
         }
         return;
     }
 
     if (events & EPOLLHUP) {
         if (c->state == ST_PROXYING && (events & EPOLLIN)) {
-            proxy_data(c, events);
+            proxy_data(revpx, c, events);
             return;
         }
         if (c->state != ST_SHUTTING_DOWN) {
-            cleanup(fd);
+            cleanup(revpx, fd);
             return;
         }
     }
 
     if (c->state != ST_PROXYING && c->len > 0 && (events & EPOLLOUT)) {
-        flush_buffer(c);
-        if (!rp_conns[fd]) return;
+        flush_buffer(revpx, c);
+        if (!revpx->conns[fd]) return;
     }
 
     switch (c->state) {
@@ -499,15 +534,15 @@ static void handle_event(int fd, uint32_t events, const char *https_port) {
         int ret = SSL_accept(c->ssl);
         if (ret == 1) {
             c->state = ST_READ_HEADER;
-            ep_mod(fd, EPOLLIN | EPOLLET);
+            ep_mod(revpx, fd, EPOLLIN | EPOLLET);
         } else {
             int err = SSL_get_error(c->ssl, ret);
             if (err == SSL_ERROR_WANT_READ)
-                ep_mod(fd, EPOLLIN | EPOLLET);
+                ep_mod(revpx, fd, EPOLLIN | EPOLLET);
             else if (err == SSL_ERROR_WANT_WRITE)
-                ep_mod(fd, EPOLLOUT | EPOLLET);
+                ep_mod(revpx, fd, EPOLLOUT | EPOLLET);
             else
-                cleanup(fd);
+                cleanup(revpx, fd);
         }
         break;
     }
@@ -517,7 +552,7 @@ static void handle_event(int fd, uint32_t events, const char *https_port) {
         if (n > 0)
             c->len += n;
         else if (n <= 0 && get_error(c, n) != SSL_ERROR_WANT_READ) {
-            cleanup(fd);
+            cleanup(revpx, fd);
             break;
         }
 
@@ -528,30 +563,36 @@ static void handle_event(int fd, uint32_t events, const char *https_port) {
             extract_target(c->buf, end, target, sizeof(target));
 
             if (!c->ssl) {
-                send_redirect(c, host, target, https_port);
+                send_redirect(revpx, c, host, target, revpx->https_port);
                 break;
             }
 
-            RpHostDomain *d = ds_da_find(&rp_domains, strcasecmp(e->domain, host) == 0);
+            RpHostDomain *d = NULL;
+            for (int i = 0; i < revpx->domain_count; i++) {
+                if (strcasecmp(revpx->domains[i].domain, host) == 0) {
+                    d = &revpx->domains[i];
+                    break;
+                }
+            }
             if (!d) {
-                send_error(c, 421, "Misdirected Request");
+                send_error(revpx, c, 421, "Misdirected Request");
                 break;
             }
 
-            ds_log_info("proxy: %s%s -> %s:%s\n", host, target, d->host, d->port);
+            rp_log_info("proxy: %s%s -> %s:%s\n", host, target, d->host, d->port);
 
             int backend = create_backend(d->host, d->port);
             if (backend < 0) {
-                send_error(c, 502, "Bad Gateway");
+                send_error(revpx, c, 502, "Bad Gateway");
                 break;
             }
 
-            RpConnection *b = alloc_conn(backend, NULL, ST_CONNECTING);
+            RpConnection *b = alloc_conn(revpx, backend, NULL, ST_CONNECTING);
             c->peer = backend;
             b->peer = fd;
-            ep_add(backend, EPOLLOUT | EPOLLET);
+            ep_add(revpx, backend, EPOLLOUT | EPOLLET);
         } else if (c->len == sizeof(c->buf)) {
-            send_error(c, 400, "Bad Request");
+            send_error(revpx, c, 400, "Bad Request");
         }
         break;
     }
@@ -560,19 +601,19 @@ static void handle_event(int fd, uint32_t events, const char *https_port) {
         int err = 0;
         socklen_t len = sizeof(err);
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
-            RpConnection *client = rp_conns[c->peer];
+            RpConnection *client = revpx->conns[c->peer];
             if (client) {
-                send_error(client, 502, "Bad Gateway");
+                send_error(revpx, client, 502, "Bad Gateway");
                 client->peer = -1;
             }
             c->peer = -1;
-            cleanup(fd);
+            cleanup(revpx, fd);
             break;
         }
 
-        RpConnection *client = rp_conns[c->peer];
+        RpConnection *client = revpx->conns[c->peer];
         if (!client) {
-            cleanup(fd);
+            cleanup(revpx, fd);
             break;
         }
 
@@ -590,39 +631,39 @@ static void handle_event(int fd, uint32_t events, const char *https_port) {
                 client->len -= to_copy;
                 if (client->len == 0) client->off = 0;
             }
-            ep_mod(fd, EPOLLOUT | EPOLLIN | EPOLLET);
-            ep_mod(client->fd, EPOLLIN | EPOLLET);
+            ep_mod(revpx, fd, EPOLLOUT | EPOLLIN | EPOLLET);
+            ep_mod(revpx, client->fd, EPOLLIN | EPOLLET);
         } else {
-            ep_mod(fd, EPOLLIN | EPOLLET);
-            ep_mod(client->fd, EPOLLIN | EPOLLET);
+            ep_mod(revpx, fd, EPOLLIN | EPOLLET);
+            ep_mod(revpx, client->fd, EPOLLIN | EPOLLET);
         }
         break;
     }
 
     case ST_PROXYING:
-        proxy_data(c, events);
+        proxy_data(revpx, c, events);
         break;
 
     case ST_SHUTTING_DOWN: {
         if (!c->ssl) {
             shutdown(c->fd, SHUT_WR);
-            cleanup(c->fd);
+            cleanup(revpx, c->fd);
             break;
         }
 
         int ret = SSL_shutdown(c->ssl);
         if (ret == 1) {
-            cleanup(c->fd);
+            cleanup(revpx, c->fd);
         } else if (ret == 0) {
-            ep_mod(c->fd, EPOLLIN | EPOLLET);
+            ep_mod(revpx, c->fd, EPOLLIN | EPOLLET);
         } else {
             int err = SSL_get_error(c->ssl, ret);
             if (err == SSL_ERROR_WANT_READ)
-                ep_mod(c->fd, EPOLLIN | EPOLLET);
+                ep_mod(revpx, c->fd, EPOLLIN | EPOLLET);
             else if (err == SSL_ERROR_WANT_WRITE)
-                ep_mod(c->fd, EPOLLOUT | EPOLLET);
+                ep_mod(revpx, c->fd, EPOLLOUT | EPOLLET);
             else
-                cleanup(c->fd);
+                cleanup(revpx, c->fd);
         }
         break;
     }
@@ -658,44 +699,53 @@ static int create_listener(const char *port) {
     return fd;
 }
 
-void revpx_add_domain(const char *domain, const char *host, const char *port, const char *cert, const char *key) {
-    ds_da_append(&rp_domains, ((RpHostDomain){
-                                  .domain = strdup(domain),
-                                  .host = host && host[0] ? strdup(host) : strdup(RP_DEFAULT_BACKEND_HOST),
-                                  .port = strdup(port),
-                                  .cert = strdup(cert),
-                                  .key = strdup(key),
-                                  .ctx = NULL}));
-    ds_log_info("%s -> %s:%s\n", domain, host ? host : "", port);
+bool revpx_add_domain(RevPx *revpx, const char *domain, const char *host, const char *port, const char *cert, const char *key) {
+    if (revpx->domain_count >= RP_MAX_DOMAINS) {
+        rp_log_error("Maximum number of domains reached\n");
+        return false;
+    }
+    RpHostDomain *d = &revpx->domains[revpx->domain_count++];
+    d->domain = strdup(domain);
+    if (host && host[0])
+        d->host = strdup(host);
+    else
+        d->host = strdup(RP_DEFAULT_BACKEND_HOST);
+    d->port = strdup(port);
+    d->cert = strdup(cert);
+    d->key = strdup(key);
+    d->ctx = NULL;
+    rp_log_info("%s -> %s:%s\n", domain, host ? host : "", port);
+    return true;
 }
 
-void revpx_run_server(const char *http_port, const char *https_port) {
+void revpx_run_server(RevPx *revpx) {
     signal(SIGPIPE, SIG_IGN);
     SSL_library_init();
     SSL_load_error_strings();
 
-    rp_epfd = epoll_create1(0);
-    memset(rp_conns, 0, sizeof(rp_conns));
+    revpx->epfd = epoll_create1(0);
+    memset(revpx->conns, 0, sizeof(revpx->conns));
 
-    int https_fd = create_listener(https_port);
-    ep_add(https_fd, EPOLLIN | EPOLLET);
-    ds_log_info("Listening https on %s\n", https_port);
+    int https_fd = create_listener(revpx->https_port);
+    ep_add(revpx, https_fd, EPOLLIN | EPOLLET);
+    rp_log_info("Listening https on %s\n", revpx->https_port);
 
     int http_fd = -1;
-    if (http_port && *http_port) {
-        http_fd = create_listener(http_port);
-        ep_add(http_fd, EPOLLIN | EPOLLET);
-        ds_log_info("Redirecting http %s -> %s\n", http_port, https_port);
+    if (revpx->http_port && *revpx->http_port) {
+        http_fd = create_listener(revpx->http_port);
+        ep_add(revpx, http_fd, EPOLLIN | EPOLLET);
+        rp_log_info("Redirecting http %s -> %s\n", revpx->http_port, revpx->https_port);
     }
 
     SSL_CTX *default_ctx = SSL_CTX_new(TLS_server_method());
     SSL_CTX_set_mode(default_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
     SSL_CTX_set_tlsext_servername_callback(default_ctx, sni_callback);
+    SSL_CTX_set_tlsext_servername_arg(default_ctx, revpx);
 
     struct epoll_event events[RP_MAX_EVENTS];
 
     while (1) {
-        int n = epoll_wait(rp_epfd, events, RP_MAX_EVENTS, -1);
+        int n = epoll_wait(revpx->epfd, events, RP_MAX_EVENTS, -1);
         if (n < 0 && errno != EINTR) break;
 
         for (int i = 0; i < n; i++) {
@@ -706,23 +756,21 @@ void revpx_run_server(const char *http_port, const char *https_port) {
                     int client = accept(https_fd, NULL, NULL);
                     if (client < 0) break;
                     set_nonblock(client);
-                    struct linger lin = {.l_onoff = 0, .l_linger = 0};
-                    setsockopt(client, SOL_SOCKET, SO_LINGER, &lin, sizeof(lin));
 
                     SSL *ssl = SSL_new(default_ctx);
                     SSL_set_fd(ssl, client);
                     SSL_set_accept_state(ssl);
 
-                    RpConnection *c = alloc_conn(client, ssl, ST_SSL_HANDSHAKE);
+                    RpConnection *c = alloc_conn(revpx, client, ssl, ST_SSL_HANDSHAKE);
                     if (!c) continue;
 
                     int ret = SSL_accept(ssl);
                     if (ret == 1) {
                         c->state = ST_READ_HEADER;
-                        ep_add(client, EPOLLIN | EPOLLET);
+                        ep_add(revpx, client, EPOLLIN | EPOLLET);
                     } else {
                         int err = SSL_get_error(ssl, ret);
-                        ep_add(client, err == SSL_ERROR_WANT_WRITE ? (EPOLLOUT | EPOLLET) : (EPOLLIN | EPOLLET));
+                        ep_add(revpx, client, err == SSL_ERROR_WANT_WRITE ? (EPOLLOUT | EPOLLET) : (EPOLLIN | EPOLLET));
                     }
                 }
             } else if (http_fd >= 0 && fd == http_fd) {
@@ -730,20 +778,22 @@ void revpx_run_server(const char *http_port, const char *https_port) {
                     int client = accept(http_fd, NULL, NULL);
                     if (client < 0) break;
                     set_nonblock(client);
-                    struct linger lin = {.l_onoff = 0, .l_linger = 0};
-                    setsockopt(client, SOL_SOCKET, SO_LINGER, &lin, sizeof(lin));
 
-                    RpConnection *c = alloc_conn(client, NULL, ST_READ_HEADER);
-                    if (c) ep_add(client, EPOLLIN | EPOLLET);
+                    RpConnection *c = alloc_conn(revpx, client, NULL, ST_READ_HEADER);
+                    if (c) ep_add(revpx, client, EPOLLIN | EPOLLET);
                 }
             } else {
-                handle_event(fd, events[i].events, https_port);
+                handle_event(revpx, fd, events[i].events);
             }
         }
     }
 
     SSL_CTX_free(default_ctx);
-    ds_da_foreach(&rp_domains, d) {
+}
+
+void revpx_free(RevPx *revpx) {
+    for (int i = 0; i < revpx->domain_count; i++) {
+        RpHostDomain *d = &revpx->domains[i];
         if (d->ctx) SSL_CTX_free(d->ctx);
         if (d->domain) free(d->domain);
         if (d->port) free(d->port);
@@ -751,7 +801,7 @@ void revpx_run_server(const char *http_port, const char *https_port) {
         if (d->key) free(d->key);
         if (d->host) free(d->host);
     }
-    ds_da_free(&rp_domains);
+    memset(revpx, 0, sizeof(RevPx));
 }
 
 #endif // REVPX_IMPLEMENTATION

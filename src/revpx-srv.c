@@ -1,6 +1,5 @@
 #define REVPX_IMPLEMENTATION
 #define JSP_IMPLEMENTATION
-#define DS_NO_PREFIX
 #include <stdio.h>
 #include "revpx.h"
 #include "jsp.h"
@@ -66,30 +65,53 @@ bool positional_arg(Args *args) {
     return args->type == ARG_POSITIONAL;
 }
 
-int parse_config_file(const char *config_file) {
-    StringBuilder sb = {0};
-    Jsp jsp = {0};
-    int ret = read_entire_file(config_file, &sb);
-    if (ret < 0) {
-        log_error("Failed to read config file %s\n", config_file);
+char *read_entire_file(const char *path, size_t *size) {
+    char *new_items = NULL;
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) goto cleanup;
+    if (fseek(f, 0, SEEK_END) < 0) goto cleanup;
+    *size = ftell(f);
+    if (*size < 0) goto cleanup;
+    if (fseek(f, 0, SEEK_SET) < 0) goto cleanup;
+
+    new_items = malloc(*size);
+    fread(new_items, *size, 1, f);
+    if (ferror(f) && new_items) {
+        free(new_items);
+        new_items = NULL;
         goto cleanup;
     }
-    jsp_init(&jsp, sb.items, sb.count);
+cleanup:
+    if (f) fclose(f);
+    return new_items;
+}
+
+int parse_config_file(RevPx *revpx, const char *config_file) {
+    Jsp jsp = {0};
+    size_t size = 0;
+    int ret = 0;
+    char *content = read_entire_file(config_file, &size);
+    if (!content) {
+        rp_log_error("Failed to read config file %s\n", config_file);
+        ret = 1;
+        goto cleanup;
+    }
+    jsp_init(&jsp, content, size);
     ret = jsp_begin_array(&jsp);
     if (ret != 0) {
-        log_error("Failed to initialize JSON parser for config file %s\n", config_file);
+        rp_log_error("Failed to initialize JSON parser for config file %s\n", config_file);
         ret = 1;
         goto cleanup;
     };
     int len = jsp_array_length(&jsp);
     if (len <= 0) {
-        log_error("Config file %s is not a valid JSON array\n", config_file);
+        rp_log_error("Config file %s is not a valid JSON array\n", config_file);
         ret = 1;
         goto cleanup;
     }
     for (int i = 0; i < len; i++) {
         if (jsp_begin_object(&jsp) != 0) {
-            log_error("Failed to parse object %d in config file %s\n", i, config_file);
+            rp_log_error("Failed to parse object %d in config file %s\n", i, config_file);
             ret = 1;
             goto cleanup;
         }
@@ -97,28 +119,28 @@ int parse_config_file(const char *config_file) {
         while (jsp_key(&jsp) == 0) {
             if (strcmp(jsp.string, "domain") == 0) {
                 if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) {
-                    log_error("Invalid 'domain' value in object %d in config file %s\n", i, config_file);
+                    rp_log_error("Invalid 'domain' value in object %d in config file %s\n", i, config_file);
                     ret = 1;
                     goto cleanup;
                 }
                 strcpy(domain, jsp.string);
             } else if (strcmp(jsp.string, "port") == 0) {
                 if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) {
-                    log_error("Invalid 'port' value in object %d in config file %s\n", i, config_file);
+                    rp_log_error("Invalid 'port' value in object %d in config file %s\n", i, config_file);
                     ret = 1;
                     goto cleanup;
                 }
                 strcpy(port, jsp.string);
             } else if (strcmp(jsp.string, "cert_file") == 0) {
                 if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) {
-                    log_error("Invalid 'cert_file' value in object %d in config file %s\n", i, config_file);
+                    rp_log_error("Invalid 'cert_file' value in object %d in config file %s\n", i, config_file);
                     ret = 1;
                     goto cleanup;
                 }
                 strcpy(cert_file, jsp.string);
             } else if (strcmp(jsp.string, "key_file") == 0) {
                 if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) {
-                    log_error("Invalid 'key_file' value in object %d in config file %s\n", i, config_file);
+                    rp_log_error("Invalid 'key_file' value in object %d in config file %s\n", i, config_file);
                     ret = 1;
                     goto cleanup;
                 }
@@ -130,33 +152,33 @@ int parse_config_file(const char *config_file) {
             } else {
                 // Unknown key; skip its value
                 if (jsp_skip(&jsp) != 0) {
-                    log_error("Failed to skip unknown key '%s' in object %d in config file %s\n", jsp.string, i, config_file);
+                    rp_log_error("Failed to skip unknown key '%s' in object %d in config file %s\n", jsp.string, i, config_file);
                     ret = 1;
                     goto cleanup;
                 }
             }
         }
         if (jsp_end_object(&jsp) != 0) {
-            log_error("Failed to end object %d in config file %s\n", i, config_file);
+            rp_log_error("Failed to end object %d in config file %s\n", i, config_file);
             ret = 1;
             goto cleanup;
         }
-        revpx_add_domain(domain, host, port, cert_file, key_file);
+        revpx_add_domain(revpx, domain, host, port, cert_file, key_file);
     }
     jsp_end_array(&jsp);
 cleanup:
     jsp_free(&jsp);
-    da_free(&sb);
+    if (content) free(content);
     return ret;
 }
 
-int parse_monade_yaml(const char *yaml_file) {
+int parse_monade_yaml(RevPx *revpx, const char *yaml_file) {
     const char *home = getenv("HOME");
     int ret = 0;
     const char *yaml_path = yaml_file && yaml_file[0] ? yaml_file : "monade.yaml";
     YamlNode *yaml = parse_yaml(yaml_path);
     if (!yaml) {
-        log_error("Failed to parse %s\n", yaml_path);
+        rp_log_error("Failed to parse %s\n", yaml_path);
         ret = 1;
         goto cleanup;
     }
@@ -165,7 +187,7 @@ int parse_monade_yaml(const char *yaml_file) {
         YamlNode *services = yaml->children[i];
         if (strcmp(services->key, "name") == 0 && services->type == YAML_SCALAR) {
             strcpy(project_name, services->value);
-            log_info("Monade project name: %s\n", project_name);
+            rp_log_info("Monade project name: %s\n", project_name);
             break;
         }
     }
@@ -195,7 +217,7 @@ int parse_monade_yaml(const char *yaml_file) {
                     char key_path[512], cert_path[512];
                     snprintf(cert_path, sizeof(cert_path), "%s/.config/monade/stacks/%s/certs/chain.pem", home, project_name);
                     snprintf(key_path, sizeof(key_path), "%s/.config/monade/stacks/%s/certs/key.pem", home, project_name);
-                    revpx_add_domain(domains[k], NULL, port, cert_path, key_path);
+                    revpx_add_domain(revpx, domains[k], NULL, port, cert_path, key_path);
                 }
             }
         }
@@ -206,7 +228,7 @@ cleanup:
     return ret;
 }
 
-int parse_args(int argc, const char **argv) {
+int parse_args(RevPx *revpx, int argc, const char **argv) {
     Args args = {.argc = argc, .argv = argv};
     const char *buf[4];
     int idx = 0;
@@ -214,13 +236,13 @@ int parse_args(int argc, const char **argv) {
         if (positional_arg(&args)) {
             buf[idx++] = args.value;
             if (idx == 4) {
-                revpx_add_domain(buf[0], NULL, buf[1], buf[2], buf[3]);
+                revpx_add_domain(revpx, buf[0], NULL, buf[1], buf[2], buf[3]);
                 idx = 0;
             }
         }
     }
     if (idx != 0) {
-        log_error("Incomplete domain mapping arguments\n");
+        rp_log_error("Incomplete domain mapping arguments\n");
         return 1;
     }
     return 0;
@@ -244,13 +266,14 @@ int main(int argc, const char **argv) {
     const char *sec_port = getenv("REVPX_PORT");
     const char *plain_port = getenv("REVPX_PORT_PLAIN");
     Args args = {.argc = argc, .argv = argv};
+    RevPx revpx = {0};
     int has_file_arg = 0;
     while (arg_next(&args)) {
         if (named_arg(&args, "help", "h")) {
             print_help();
             return 0;
         } else if (named_arg(&args, "file", "f")) {
-            if (parse_config_file(args.value) != 0) {
+            if (parse_config_file(&revpx, args.value) != 0) {
                 print_help();
                 return 1;
             }
@@ -260,7 +283,7 @@ int main(int argc, const char **argv) {
         } else if (named_arg(&args, "port-plain", "pp")) {
             plain_port = args.value;
         } else if (named_arg(&args, "monade", "m")) {
-            if (parse_monade_yaml(args.value) != 0) {
+            if (parse_monade_yaml(&revpx, args.value) != 0) {
                 print_help();
                 return 1;
             }
@@ -269,19 +292,22 @@ int main(int argc, const char **argv) {
     }
 
     // <domain> <port> <cert_file> <key_file> ...
-    if (!has_file_arg && parse_args(argc, argv) != 0) {
+    if (!has_file_arg && parse_args(&revpx, argc, argv) != 0) {
         print_help();
         return 1;
     }
-    if (rp_domains.count == 0) {
-        if (parse_monade_yaml(NULL) != 0) {
+    if (revpx.domain_count == 0) {
+        if (parse_monade_yaml(&revpx, NULL) != 0) {
             print_help();
             return 1;
         }
     }
     if (!sec_port) sec_port = DEFAULT_PORT;
     if (!plain_port) plain_port = DEFAULT_PORT_PLAIN;
-    revpx_run_server(plain_port, sec_port);
+    revpx.https_port = sec_port;
+    revpx.http_port = plain_port;
 
+    revpx_run_server(&revpx);
+    revpx_free(&revpx);
     return 0;
 }
