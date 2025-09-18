@@ -59,7 +59,6 @@ static int rp_epfd;
 
 void revpx_add_domain(const char *domain, const char *host, const char *port, const char *cert, const char *key);
 void revpx_run_server(const char *http_port, const char *https_port);
-void revpx_free_domains();
 
 #ifdef REVPX_IMPLEMENTATION
 
@@ -661,7 +660,7 @@ void revpx_add_domain(const char *domain, const char *host, const char *port, co
                                   .cert = strdup(cert),
                                   .key = strdup(key),
                                   .ctx = NULL}));
-    ds_log_debug("domain: %s -> %s\n", domain, port);
+    ds_log_info("Mapping domain %s to port %s\n", domain, port);
 }
 
 void revpx_run_server(const char *http_port, const char *https_port) {
@@ -738,9 +737,6 @@ void revpx_run_server(const char *http_port, const char *https_port) {
     }
 
     SSL_CTX_free(default_ctx);
-}
-
-void revpx_free_domains() {
     ds_da_foreach(&rp_domains, d) {
         if (d->ctx) SSL_CTX_free(d->ctx);
         if (d->domain) free(d->domain);

@@ -142,7 +142,6 @@ int parse_config_file(const char *config_file) {
             goto cleanup;
         }
         revpx_add_domain(domain, host, port, cert_file, key_file);
-        log_info("Mapping domain %s to port %s\n", domain, port);
     }
     jsp_end_array(&jsp);
 cleanup:
@@ -197,7 +196,6 @@ int parse_monade_yaml(const char *yaml_file) {
                     snprintf(cert_path, sizeof(cert_path), "%s/.config/monade/stacks/%s/certs/chain.pem", home, project_name);
                     snprintf(key_path, sizeof(key_path), "%s/.config/monade/stacks/%s/certs/key.pem", home, project_name);
                     revpx_add_domain(domains[k], NULL, port, cert_path, key_path);
-                    log_info("Mapping domain %s to port %s\n", domains[k], port);
                 }
             }
         }
@@ -217,7 +215,6 @@ int parse_args(int argc, const char **argv) {
             buf[idx++] = args.value;
             if (idx == 4) {
                 revpx_add_domain(buf[0], NULL, buf[1], buf[2], buf[3]);
-                log_info("Mapping domain %s to port %s\n", buf[0], buf[1]);
                 idx = 0;
             }
         }
@@ -286,6 +283,5 @@ int main(int argc, const char **argv) {
     if (!plain_port) plain_port = DEFAULT_PORT_PLAIN;
     revpx_run_server(plain_port, sec_port);
 
-    revpx_free_domains();
     return 0;
 }
