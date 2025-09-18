@@ -660,7 +660,7 @@ void revpx_add_domain(const char *domain, const char *host, const char *port, co
                                   .cert = strdup(cert),
                                   .key = strdup(key),
                                   .ctx = NULL}));
-    ds_log_info("%s -> %s:%s\n", domain, host, port);
+    ds_log_info("%s -> %s:%s\n", domain, host ? host : "", port);
 }
 
 void revpx_run_server(const char *http_port, const char *https_port) {
