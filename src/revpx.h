@@ -158,7 +158,7 @@ static size_t buffer_space(RpConnection *c) {
 }
 
 static void send_error(RpConnection *c, int code, const char *status) {
-    char body[4096];
+    char body[1024];
     int body_len = snprintf(body, sizeof(body),
                             "<html><head><title>%d %s</title></head>"
                             "<body><h1>%d %s</h1><p>revpx</p></body></html>",
@@ -180,7 +180,7 @@ static void send_error(RpConnection *c, int code, const char *status) {
 }
 
 static void send_redirect(RpConnection *c, const char *host, const char *target, const char *port) {
-    char resp[4096];
+    char resp[2048];
     int n = snprintf(resp, sizeof(resp),
                      "HTTP/1.1 301 Moved Permanently\r\n"
                      "Location: https://%s%s%s%s\r\n"
@@ -517,7 +517,7 @@ static void handle_event(int fd, uint32_t events, const char *https_port) {
 
         int end = find_headers_end(c->buf, c->len);
         if (end > 0) {
-            char host[256], target[512] = "/";
+            char host[512], target[1024] = "/";
             extract_host(c->buf, end, host, sizeof(host));
             extract_target(c->buf, end, target, sizeof(target));
 
