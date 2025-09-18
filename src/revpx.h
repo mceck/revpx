@@ -85,8 +85,8 @@ typedef struct {
 
 typedef struct {
     int epfd;
-    const char *https_port;
-    const char *http_port;
+    char https_port[16];
+    char http_port[16];
     int domain_count;
     RpHostDomain domains[RP_MAX_DOMAINS];
     RpConnection *conns[RP_MAX_FD];
@@ -94,6 +94,7 @@ typedef struct {
 
 bool revpx_add_domain(RevPx *revpx, const char *domain, const char *host, const char *port, const char *cert, const char *key);
 void revpx_run_server(RevPx *revpx);
+RevPx *revpx_create(const char *http_port, const char *https_port);
 void revpx_free(RevPx *revpx);
 
 #ifdef REVPX_IMPLEMENTATION
@@ -731,7 +732,7 @@ void revpx_run_server(RevPx *revpx) {
     rp_log_info("Listening https on %s\n", revpx->https_port);
 
     int http_fd = -1;
-    if (revpx->http_port && *revpx->http_port) {
+    if (*revpx->http_port) {
         http_fd = create_listener(revpx->http_port);
         ep_add(revpx, http_fd, EPOLLIN | EPOLLET);
         rp_log_info("Redirecting http %s -> %s\n", revpx->http_port, revpx->https_port);
@@ -791,7 +792,16 @@ void revpx_run_server(RevPx *revpx) {
     SSL_CTX_free(default_ctx);
 }
 
+RevPx *revpx_create(const char *http_port, const char *https_port) {
+    RevPx *revpx = calloc(1, sizeof(RevPx));
+    if (http_port) strncpy(revpx->http_port, http_port, sizeof(revpx->http_port) - 1);
+    if (https_port) strncpy(revpx->https_port, https_port, sizeof(revpx->https_port) - 1);
+    revpx->domain_count = 0;
+    return revpx;
+}
+
 void revpx_free(RevPx *revpx) {
+    if (!revpx) return;
     for (int i = 0; i < revpx->domain_count; i++) {
         RpHostDomain *d = &revpx->domains[i];
         if (d->ctx) SSL_CTX_free(d->ctx);
@@ -801,7 +811,7 @@ void revpx_free(RevPx *revpx) {
         if (d->key) free(d->key);
         if (d->host) free(d->host);
     }
-    memset(revpx, 0, sizeof(RevPx));
+    free(revpx);
 }
 
 #endif // REVPX_IMPLEMENTATION

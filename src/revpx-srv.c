@@ -187,7 +187,6 @@ int parse_monade_yaml(RevPx *revpx, const char *yaml_file) {
         YamlNode *services = yaml->children[i];
         if (strcmp(services->key, "name") == 0 && services->type == YAML_SCALAR) {
             strcpy(project_name, services->value);
-            rp_log_info("Monade project name: %s\n", project_name);
             break;
         }
     }
@@ -266,14 +265,14 @@ int main(int argc, const char **argv) {
     const char *sec_port = getenv("REVPX_PORT");
     const char *plain_port = getenv("REVPX_PORT_PLAIN");
     Args args = {.argc = argc, .argv = argv};
-    RevPx revpx = {0};
+    RevPx *revpx = revpx_create(NULL, NULL);
     int has_file_arg = 0;
     while (arg_next(&args)) {
         if (named_arg(&args, "help", "h")) {
             print_help();
             return 0;
         } else if (named_arg(&args, "file", "f")) {
-            if (parse_config_file(&revpx, args.value) != 0) {
+            if (parse_config_file(revpx, args.value) != 0) {
                 print_help();
                 return 1;
             }
@@ -283,7 +282,7 @@ int main(int argc, const char **argv) {
         } else if (named_arg(&args, "port-plain", "pp")) {
             plain_port = args.value;
         } else if (named_arg(&args, "monade", "m")) {
-            if (parse_monade_yaml(&revpx, args.value) != 0) {
+            if (parse_monade_yaml(revpx, args.value) != 0) {
                 print_help();
                 return 1;
             }
@@ -292,22 +291,22 @@ int main(int argc, const char **argv) {
     }
 
     // <domain> <port> <cert_file> <key_file> ...
-    if (!has_file_arg && parse_args(&revpx, argc, argv) != 0) {
+    if (!has_file_arg && parse_args(revpx, argc, argv) != 0) {
         print_help();
         return 1;
     }
-    if (revpx.domain_count == 0) {
-        if (parse_monade_yaml(&revpx, NULL) != 0) {
+    if (revpx->domain_count == 0) {
+        if (parse_monade_yaml(revpx, NULL) != 0) {
             print_help();
             return 1;
         }
     }
     if (!sec_port) sec_port = DEFAULT_PORT;
     if (!plain_port) plain_port = DEFAULT_PORT_PLAIN;
-    revpx.https_port = sec_port;
-    revpx.http_port = plain_port;
+    strncpy(revpx->http_port, plain_port, sizeof(revpx->http_port) - 1);
+    strncpy(revpx->https_port, sec_port, sizeof(revpx->https_port) - 1);
 
-    revpx_run_server(&revpx);
-    revpx_free(&revpx);
+    revpx_run_server(revpx);
+    revpx_free(revpx);
     return 0;
 }

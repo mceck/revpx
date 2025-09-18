@@ -4,25 +4,21 @@
 #ifndef __APPLE__
 #include <sys/epoll.h>
 #else
-#include <sys/types.h>
 #include <sys/event.h>
 #include <sys/time.h>
-#include <unistd.h>
-#include <errno.h>
-
 // Map epoll constants to kqueue equivalents
 #define EPOLLIN 0x001
 #define EPOLLOUT 0x004
 #define EPOLLERR 0x008
 #define EPOLLHUP 0x010
-#define EPOLLET 0x020 // just a dummy flag, EV_CLEAR handles edge-triggered
+#define EPOLLET 0x020
 
 #define EPOLL_CTL_ADD 1
 #define EPOLL_CTL_DEL 2
 #define EPOLL_CTL_MOD 3
 
 struct epoll_event {
-    uint32_t events; // EPOLLIN, EPOLLOUT, etc.
+    uint32_t events;
     union {
         void *ptr;
         int fd;
@@ -75,7 +71,6 @@ static inline int epoll_wait(int kq, struct epoll_event *evs, int maxevents, int
         if (kev[i].filter == EVFILT_READ) evs[i].events |= EPOLLIN;
         if (kev[i].filter == EVFILT_WRITE) evs[i].events |= EPOLLOUT;
         if (kev[i].flags & EV_ERROR) evs[i].events |= EPOLLERR;
-        if (kev[i].flags & EV_EOF) evs[i].events |= EPOLLHUP;
     }
 
     return n;
