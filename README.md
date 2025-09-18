@@ -81,15 +81,31 @@ cc -o nob nob.c
 ```c
 #include "revpx.h"
 /**
- * Add a domain mapping to the reverse proxy.
- * Ex. revpx_add_domain("example.com", NULL, "8080", "cert.pem", "key.pem");
+ * Create a new RevPx instance.
  */
-void revpx_add_domain(const char *domain, const char *host, const char *port, const char *cert, const char *key);
+RevPx *revpx_create(const char *http_port, const char *https_port);
+/**
+ * Add a domain mapping to the reverse proxy.
+ */
+bool revpx_add_domain(RevPx *revpx, const char *domain, const char *host, const char *port, const char *cert, const char *key);
 /**
  * Start the reverse proxy server.
  * Listens on https_port for HTTPS and redirects HTTP traffic from http_port to HTTPS.
  */
-void revpx_run_server(const char *http_port, const char *https_port);
+void revpx_run_server(RevPx *revpx);
+/**
+ * Free the RevPx instance and release resources.
+ */
+void revpx_free(RevPx *revpx);
+
+// Example usage
+int main() {
+    RevPx *revpx = revpx_create("80", "443");
+    revpx_add_domain(revpx, "example.localhost", "localhost", "8080", "example.localhost.pem", "example.localhost-key.pem");
+    revpx_run_server(revpx);
+    revpx_free(revpx);
+    return 0;
+}
 ```
 
 Checkout `rust` branch for the Rust bindings.
