@@ -660,7 +660,7 @@ void revpx_add_domain(const char *domain, const char *host, const char *port, co
                                   .cert = strdup(cert),
                                   .key = strdup(key),
                                   .ctx = NULL}));
-    ds_log_info("Mapping domain %s to port %s\n", domain, port);
+    ds_log_info("%s -> %s:%s\n", domain, host, port);
 }
 
 void revpx_run_server(const char *http_port, const char *https_port) {
@@ -673,13 +673,13 @@ void revpx_run_server(const char *http_port, const char *https_port) {
 
     int https_fd = create_listener(https_port);
     ep_add(https_fd, EPOLLIN | EPOLLET);
-    ds_log_info("HTTPS on port %s\n", https_port);
+    ds_log_info("Listening https on %s\n", https_port);
 
     int http_fd = -1;
     if (http_port && *http_port) {
         http_fd = create_listener(http_port);
         ep_add(http_fd, EPOLLIN | EPOLLET);
-        ds_log_info("HTTP on port %s\n", http_port);
+        ds_log_info("Redirecting http %s -> %s\n", http_port, https_port);
     }
 
     SSL_CTX *default_ctx = SSL_CTX_new(TLS_server_method());
