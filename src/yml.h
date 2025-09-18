@@ -21,7 +21,6 @@ typedef struct YamlNode {
     int child_count;
 } YamlNode;
 
-// --- Utility
 static char *trim(char *s) {
     while (isspace((unsigned char)*s))
         s++;

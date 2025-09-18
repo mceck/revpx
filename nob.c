@@ -34,7 +34,7 @@ int main(int argc, char **argv) {
     }
 
     // BUILD
-    cmd_append(&cmd, "cc", "src/revpx-cli.c", "-o", "build/revpx", "-lssl", "-lcrypto", "-O2", "-Wall", "-Wextra");
+    cmd_append(&cmd, "cc", "src/revpx-srv.c", "-o", "build/revpx", "-lssl", "-lcrypto", "-O2", "-Wall", "-Wextra");
 #if __APPLE__
     cmd_append(&cmd, "-I/opt/homebrew/include/", "-L/opt/homebrew/lib/");
 #endif
