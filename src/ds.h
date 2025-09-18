@@ -58,10 +58,10 @@ static const char *DsLogLevelStrings[] = {
             fflush(log_file);                                                                  \
         }                                                                                      \
     } while (0)
-#define ds_log_info(FMT, ...) ds_log(INFO, FMT, __VA_ARGS__)
-#define ds_log_debug(FMT, ...) ds_log(DEBUG, FMT, __VA_ARGS__)
-#define ds_log_warn(FMT, ...) ds_log(WARN, FMT, __VA_ARGS__)
-#define ds_log_error(FMT, ...) ds_log(ERROR, FMT, __VA_ARGS__)
+#define ds_log_info(FMT, ...) ds_log(DS_INFO, FMT, __VA_ARGS__)
+#define ds_log_debug(FMT, ...) ds_log(DS_DEBUG, FMT, __VA_ARGS__)
+#define ds_log_warn(FMT, ...) ds_log(DS_WARN, FMT, __VA_ARGS__)
+#define ds_log_error(FMT, ...) ds_log(DS_ERROR, FMT, __VA_ARGS__)
 
 #define DS_TODO(msg)                                                                     \
     do {                                                                                 \
@@ -244,7 +244,7 @@ typedef struct {
 /**
  * Find an item in a dynamic array. It returns a pointer to the item, or NULL if not found.
  * Example:
- *   `ds_da_find(&a, item) { printf("%d\n", *item); }`
+ *   `int *x = ds_da_find(&a, e == 0);`
  */
 #define ds_da_find(da, expr)                                \
     ({                                                      \
@@ -295,6 +295,48 @@ void _ds_sb_append(DsStringBuilder *sb, ...) {
     ds_da_reserve(sb, sb->count + 1);
     sb->items[sb->count] = '\0';
 }
+
+/**
+ * Append formatted string to a dynamic string builder.
+ * Example:
+ *   `ds_sb_appendf(&sb, "Hello, %s!", "World");`
+ */
+void ds_sb_appendf(DsStringBuilder *sb, const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(NULL, 0, fmt, args);
+    va_end(args);
+    if (n > 0) {
+        ds_da_reserve(sb, sb->count + n + 1);
+        va_start(args, fmt);
+        vsnprintf(sb->items + sb->count, n + 1, fmt, args);
+        va_end(args);
+        sb->count += n;
+    }
+}
+
+/**
+ * Prepend formatted string to a dynamic string builder.
+ * Example:
+ *   `ds_sb_prependf(&sb, "Hello, %s!", "World");`
+ */
+void ds_sb_prependf(DsStringBuilder *sb, const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(NULL, 0, fmt, args);
+    va_end(args);
+    if (n > 0) {
+        ds_da_reserve(sb, sb->count + n + 1);
+        char c0 = sb->items[0];
+        memmove(sb->items + n, sb->items, sb->count);
+        va_start(args, fmt);
+        vsnprintf(sb->items, n + 1, fmt, args);
+        sb->items[n] = c0;
+        va_end(args);
+        sb->count += n;
+    }
+}
+
 /**
  * Append strings to a dynamic string builder.
  * Example:
@@ -921,6 +963,8 @@ bool ds_mkdir_p(const char *path) {
 #define da_find ds_da_find
 #define da_index_of ds_da_index_of
 #define sb_append ds_sb_append
+#define sb_appendf ds_sb_appendf
+#define sb_prependf ds_sb_prependf
 #define sb_insert ds_sb_insert
 #define sb_prepend ds_sb_prepend
 #define sb_include ds_sb_include
