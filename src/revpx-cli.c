@@ -1,4 +1,5 @@
 #include <stdio.h>
+#define REVPX_IMPLEMENTATION
 #include "revpx.h"
 #include "argparse.h"
 #define DEFAULT_PORT "443"
@@ -51,7 +52,7 @@ int main(int argc, const char **argv) {
         print_help();
         return 1;
     }
-    if (domains.count == 0) {
+    if (rp_domains.count == 0) {
         if (parse_monade_yaml(NULL) != 0) {
             print_help();
             return 1;
@@ -59,8 +60,8 @@ int main(int argc, const char **argv) {
     }
     if (!sec_port) sec_port = DEFAULT_PORT;
     if (!plain_port) plain_port = DEFAULT_PORT_PLAIN;
-    run_revpx_server(plain_port, sec_port);
+    revpx_run_server(plain_port, sec_port);
 
-    free_domains();
+    revpx_free_domains();
     return 0;
 }

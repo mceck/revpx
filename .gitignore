@@ -4,3 +4,4 @@ revpx
 *.key
 *.pem
 .vscode/
+build/
