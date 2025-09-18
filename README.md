@@ -1,12 +1,14 @@
 # revpx
 
 `revpx` is a lightweight, single-threaded reverse proxy server for development purposes.
+
 It supports TLS/SSL termination, SNI (Server Name Indication), and can forward traffic to multiple backend services based on the requested domain name.
+
 It is designed to be simple to configure and use.
 
 ## Usage
 
-`revpx` can be configured in several ways:
+You can generate the SSL certificate files using [mkcert](https://github.com/FiloSottile/mkcert) or openssl.
 
 ### 1. Command-Line Arguments
 
@@ -74,4 +76,20 @@ cc -o nob nob.c
 ./nob install
 ```
 
-This will create the `revpx` executable in the `build` directory.
+### C api
+
+```c
+#include "revpx.h"
+/**
+ * Add a domain mapping to the reverse proxy.
+ * Ex. revpx_add_domain("example.com", NULL, "8080", "cert.pem", "key.pem");
+ */
+void revpx_add_domain(const char *domain, const char *host, const char *port, const char *cert, const char *key);
+/**
+ * Start the reverse proxy server.
+ * Listens on https_port for HTTPS and redirects HTTP traffic from http_port to HTTPS.
+ */
+void revpx_run_server(const char *http_port, const char *https_port);
+```
+
+Checkout `rust` branch for the Rust bindings.
