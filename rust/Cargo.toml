@@ -14,3 +14,4 @@ categories = ["development-tools"]
 
 [build-dependencies]
 cc = "1.2.37"
+pkg-config = "0.3.27"
