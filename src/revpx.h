@@ -7,6 +7,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <unistd.h>
+#include <ctype.h>
 #include <signal.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -58,7 +59,9 @@ typedef enum {
     ST_SSL_HANDSHAKE,
     ST_READ_HEADER,
     ST_CONNECTING,
+    ST_UPGRADING,
     ST_PROXYING,
+    ST_TUNNELING,
     ST_SHUTTING_DOWN
 } RpConnectionState;
 
@@ -69,9 +72,10 @@ typedef struct {
     RpConnectionState state;
     unsigned char buf[RP_BUF_SIZE];
     size_t len, off;
-    int closing;
-    int write_retry;
-    int read_stalled;
+    bool closing;
+    bool write_retry;
+    bool read_stalled;
+    bool websocket;
 } RpConnection;
 
 typedef struct {
@@ -133,7 +137,7 @@ static void cleanup(RevPx *revpx, int fd) {
         RpConnection *p = revpx->conns[peer];
         p->peer = -1;
         if (p->len > 0) {
-            p->closing = 1;
+            p->closing = true;
             ep_mod(revpx, peer, EPOLLOUT | EPOLLET);
         } else {
             p->state = ST_SHUTTING_DOWN;
@@ -217,7 +221,7 @@ static void send_error(RevPx *revpx, RpConnection *c, int code, const char *stat
     memcpy(c->buf + head_len, body, body_len);
     c->len = head_len + body_len;
     c->off = 0;
-    c->closing = 1;
+    c->closing = true;
     rp_log_info("connection error: %d %s\n", code, status);
     ep_mod(revpx, c->fd, EPOLLOUT | EPOLLET);
 }
@@ -233,7 +237,7 @@ static void send_redirect(RevPx *revpx, RpConnection *c, const char *host, const
     memcpy(c->buf, resp, n);
     c->len = n;
     c->off = 0;
-    c->closing = 1;
+    c->closing = true;
     ep_mod(revpx, c->fd, EPOLLOUT | EPOLLET);
 }
 
@@ -300,6 +304,49 @@ static void extract_target(const unsigned char *buf, size_t len, char *out, size
     out[n] = '\0';
 }
 
+static bool is_websocket_upgrade_request(const unsigned char *buf, size_t len) {
+    const char *p = (const char *)buf;
+    const char *end = p + len;
+    bool upgrade_header_found = false;
+    bool connection_header_found = false;
+
+    while (p < end) {
+        const char *nl = memchr(p, '\n', end - p);
+        if (!nl) break;
+
+        if (strncasecmp(p, "Upgrade:", 8) == 0) {
+            const char *value = p + 8;
+            while (value < nl && isspace(*value))
+                value++;
+            if (strncasecmp(value, "websocket", 9) == 0) {
+                upgrade_header_found = true;
+            }
+        }
+
+        if (strncasecmp(p, "Connection:", 11) == 0) {
+            const char *value = p + 11;
+            const char *nl_end = nl;
+            if (nl > p && nl[-1] == '\r') nl_end--;
+
+            const char *c = value;
+            while (c < nl_end) {
+                if (strncasecmp(c, "Upgrade", 7) == 0) {
+                    connection_header_found = true;
+                    break;
+                }
+                c++;
+            }
+        }
+
+        if (upgrade_header_found && connection_header_found) {
+            return true;
+        }
+        p = nl + 1;
+    }
+
+    return false;
+}
+
 static SSL_CTX *get_ctx(RevPx *revpx, const char *host) {
     for (int i = 0; i < revpx->domain_count; i++) {
         RpHostDomain *d = &revpx->domains[i];
@@ -331,7 +378,7 @@ static void flush_buffer(RevPx *revpx, RpConnection *c) {
         if (n > 0) {
             c->off += n;
             c->len -= n;
-            c->write_retry = 0;
+            c->write_retry = false;
         } else {
             int err = get_error(c, n);
             if (err == SSL_ERROR_WANT_WRITE) {
@@ -347,7 +394,7 @@ static void flush_buffer(RevPx *revpx, RpConnection *c) {
                 return;
             }
             if (!c->write_retry) {
-                c->write_retry = 1;
+                c->write_retry = true;
                 ep_mod(revpx, c->fd, EPOLLOUT | EPOLLET);
                 return;
             }
@@ -368,7 +415,7 @@ static void flush_buffer(RevPx *revpx, RpConnection *c) {
         } else {
             RpConnection *peer = c->peer >= 0 ? revpx->conns[c->peer] : NULL;
             if (peer && peer->read_stalled) {
-                peer->read_stalled = 0;
+                peer->read_stalled = false;
                 ep_mod(revpx, peer->fd, EPOLLIN | EPOLLET);
             }
             ep_mod(revpx, c->fd, EPOLLIN | EPOLLET);
@@ -406,7 +453,7 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
 
             if (dst_space == 0) {
                 if (!src->read_stalled) {
-                    src->read_stalled = 1;
+                    src->read_stalled = true;
                     uint32_t ev = src->len > 0 ? (EPOLLOUT | EPOLLET) : 0;
                     if (ev) ep_mod(revpx, src->fd, ev);
                 }
@@ -423,7 +470,7 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
                     int w = do_write(dst, temp + written, n - written);
                     if (w > 0) {
                         written += w;
-                        dst->write_retry = 0;
+                        dst->write_retry = false;
                     } else {
                         int err = get_error(dst, w);
                         if (err == SSL_ERROR_WANT_WRITE) break;
@@ -436,7 +483,7 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
                             return;
                         }
                         if (!dst->write_retry) {
-                            dst->write_retry = 1;
+                            dst->write_retry = true;
                             break;
                         }
                         cleanup(revpx, src->fd);
@@ -468,6 +515,64 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
                 cleanup(revpx, src->fd);
                 return;
             }
+        }
+    }
+}
+
+static void tunnel_data(RevPx *revpx, RpConnection *src, uint32_t events) {
+    if (events & EPOLLOUT) {
+        flush_buffer(revpx, src);
+        if (!revpx->conns[src->fd]) return;
+    }
+
+    if (events & EPOLLIN) {
+        RpConnection *dst = src->peer >= 0 ? revpx->conns[src->peer] : NULL;
+        if (!dst) {
+            cleanup(revpx, src->fd);
+            return;
+        }
+
+        size_t dst_space = buffer_space(dst);
+        if (dst_space == 0) {
+            src->read_stalled = 1;
+            ep_mod(revpx, dst->fd, EPOLLOUT | EPOLLET);
+            return;
+        }
+
+        unsigned char temp[RP_BUF_SIZE];
+        size_t to_read = dst_space < sizeof(temp) ? dst_space : sizeof(temp);
+        int n = do_read(src, temp, to_read);
+
+        if (n > 0) {
+            memcpy(dst->buf + dst->off + dst->len, temp, n);
+            dst->len += n;
+            ep_mod(revpx, dst->fd, EPOLLOUT | EPOLLIN | EPOLLET);
+            ep_mod(revpx, src->fd, EPOLLIN | EPOLLET);
+        } else if (n == 0) {
+            rp_log_info("WebSocket peer (fd: %d) closed connection.\n", src->fd);
+            cleanup_both(revpx, src->fd);
+        } else {
+            int err = get_error(src, n);
+
+            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                return;
+            }
+
+            if (err == SSL_ERROR_SYSCALL && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                return;
+            }
+
+            if (src->ssl) {
+                unsigned long e;
+                while ((e = ERR_get_error()) != 0) {
+                    char err_buf[256];
+                    ERR_error_string_n(e, err_buf, sizeof(err_buf));
+                    rp_log_warn("SSL error in WebSocket tunnel (fd: %d): %s\n", src->fd, err_buf);
+                }
+            }
+
+            rp_log_warn("Fatal error reading from WebSocket tunnel (fd: %d). Error: %d, errno: %d\n", src->fd, err, errno);
+            cleanup_both(revpx, src->fd);
         }
     }
 }
@@ -563,6 +668,10 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
             char host[512], target[1024] = "/";
             extract_host(c->buf, end, host, sizeof(host));
             extract_target(c->buf, end, target, sizeof(target));
+            c->websocket = is_websocket_upgrade_request(c->buf, end);
+            if (c->websocket) {
+                rp_log_info("websocket upgrade request detected\n");
+            }
 
             if (!c->ssl) {
                 send_redirect(revpx, c, host, target, revpx->https_port);
@@ -619,8 +728,14 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
             break;
         }
 
-        c->state = ST_PROXYING;
-        client->state = ST_PROXYING;
+        if (client->websocket) {
+            c->state = ST_UPGRADING;
+            client->state = ST_UPGRADING;
+            rp_log_debug("Waiting for websocket upgrade to complete\n");
+        } else {
+            c->state = ST_PROXYING;
+            client->state = ST_PROXYING;
+        }
 
         if (client->len > 0) {
             compact_buffer(c);
@@ -642,8 +757,57 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
         break;
     }
 
+    case ST_UPGRADING: {
+        RpConnection *client = revpx->conns[c->peer];
+        if (!client) {
+            cleanup(revpx, fd);
+            break;
+        }
+
+        int n = do_read(c, c->buf + c->len, sizeof(c->buf) - c->len);
+        if (n > 0) {
+            c->len = n;
+        } else if (n <= 0 && errno == EAGAIN) {
+            ep_mod(revpx, c->fd, EPOLLIN | EPOLLET);
+            break;
+        } else if (n <= 0 && get_error(c, n) != SSL_ERROR_WANT_READ) {
+            rp_log_warn("Upgrade a WebSocket failed. Backend read error: %s\n", strerror(errno));
+            send_error(revpx, client, 502, "Bad Gateway");
+            cleanup(revpx, c->fd);
+            break;
+        }
+
+        if (n >= 12 && strncasecmp((char *)c->buf, "HTTP/1.1 101", 12) == 0) {
+            rp_log_info("websocket: handshake success, start tunneling\n");
+
+            c->state = ST_TUNNELING;
+            client->state = ST_TUNNELING;
+
+            memcpy(client->buf, c->buf, n);
+            client->len = n;
+            client->off = 0;
+
+            c->len = 0;
+            c->off = 0;
+
+            rp_log_debug("Copied %d bytes (101 response) to client fd=%d buffer\n", n, client->fd);
+            ep_mod(revpx, client->fd, EPOLLOUT | EPOLLIN | EPOLLET);
+            ep_mod(revpx, c->fd, EPOLLIN | EPOLLET);
+        } else {
+            rp_log_warn("Upgrade a WebSocket failed. Backend response:\n%.*s\n", n, c->buf);
+            send_error(revpx, client, 502, "Bad Gateway: WebSocket handshake failed");
+            cleanup(revpx, c->fd);
+        }
+
+        break;
+    }
+
     case ST_PROXYING:
         proxy_data(revpx, c, events);
+        break;
+
+    case ST_TUNNELING:
+        tunnel_data(revpx, c, events);
         break;
 
     case ST_SHUTTING_DOWN: {
