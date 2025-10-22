@@ -66,6 +66,12 @@ impl RevPx {
         }
     }
 
+    pub fn add_domains(&self, configs: Vec<DomainConfig>) {
+        for config in configs {
+            self.add_domain(config);
+        }
+    }
+
     pub fn run_server(&self) -> i32 {
         unsafe {
             return revpx_run_server(self.ptr);

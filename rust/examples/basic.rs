@@ -1,14 +1,11 @@
 fn main() {
     let revpx = revpx::RevPx::default();
-    let domains = vec![revpx::DomainConfig {
+    revpx.add_domains(vec![revpx::DomainConfig {
         domain: "example.localhost".to_string(),
         host: None,
-        port: "9002".to_string(),
+        port: "8080".to_string(),
         cert: "example.localhost.pem".to_string(),
         key: "example.localhost-key.pem".to_string(),
-    }];
-    for domain in domains {
-        revpx.add_domain(domain);
-    }
+    }]);
     revpx.run_server();
 }

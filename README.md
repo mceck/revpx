@@ -75,11 +75,11 @@ cc -o nob nob.c
 
 ### Scripts
 
-`./nob`: Build the project
-`./nob update`: Update dependencies
-`./nob run [...]`: Build and run the project
-`./nob example`: Build and run with example domain `example.localhost` on port `8080`
-`./nob install`: Install the binary system-wide in /usr/local/bin
+- `./nob`: Build the project
+- `./nob update`: Update dependencies
+- `./nob run [...]`: Build and run the project
+- `./nob example`: Build and run with example domain `example.localhost` on port `8080`
+- `./nob install`: Install the binary system-wide in /usr/local/bin
 
 ### C api
 
@@ -113,4 +113,20 @@ int main() {
 }
 ```
 
-Checkout `rust` branch for the Rust bindings.
+### Rust bindings
+
+```bash
+cargo add --git https://github.com/mceck/revpx.git
+```
+
+```rust
+let revpx = revpx::RevPx::default();
+revpx.add_domains(vec![revpx::DomainConfig {
+    domain: "example.localhost".to_string(),
+    host: None,
+    port: "8080".to_string(),
+    cert: "example.localhost.pem".to_string(),
+    key: "example.localhost-key.pem".to_string(),
+}]);
+revpx.run_server();
+```
