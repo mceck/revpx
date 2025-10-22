@@ -21,6 +21,19 @@ typedef struct YamlNode {
     int child_count;
 } YamlNode;
 
+static char *unquote(char *s) {
+    if (!s || !*s) return s;
+    size_t len = strlen(s);
+    if (len >= 2) {
+        if ((s[0] == '"' && s[len - 1] == '"') ||
+            (s[0] == '\'' && s[len - 1] == '\'')) {
+            s[len - 1] = '\0';
+            return s + 1;
+        }
+    }
+    return s;
+}
+
 static char *trim(char *s) {
     while (isspace((unsigned char)*s))
         s++;
@@ -29,7 +42,7 @@ static char *trim(char *s) {
     while (end > s && isspace((unsigned char)*end))
         end--;
     end[1] = '\0';
-    return s;
+    return unquote(s);
 }
 
 static YamlNode *new_node(const char *key, const char *value, YamlType type) {
