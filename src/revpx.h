@@ -888,11 +888,31 @@ bool revpx_add_domain(RevPx *revpx, const char *domain, const char *host, const 
     d->cert = strdup(cert);
     d->key = strdup(key);
     d->ctx = NULL;
-    rp_log_info("%s -> %s:%s\n", domain, host ? host : "", port);
     return true;
 }
 
+void print_art() {
+    printf("__________            __________         \n"
+           "\\______   \\ _______  _\\______   \\___  ___\n"
+           " |       _// __ \\  \\/ /|     ___/\\  \\/  /\n"
+           " |    |   \\  ___/\\   / |    |     >    < \n"
+           " |____|_  /\\___  >\\_/  |____|    /__/\\_ \\\n"
+           "        \\/     \\/                      \\/\n");
+}
+
+void print_proxy_domains(RevPx *revpx) {
+    printf("\nDomains:\n");
+    for (int i = 0; i < revpx->domain_count; i++) {
+        RpHostDomain *d = &revpx->domains[i];
+        printf("%-32s -> %s:%s\n", d->domain, strcmp(d->host, RP_DEFAULT_BACKEND_HOST) ? d->host : "", d->port);
+    }
+    printf("\n");
+}
+
 int revpx_run_server(RevPx *revpx) {
+    print_art();
+    print_proxy_domains(revpx);
+
     signal(SIGPIPE, SIG_IGN);
     SSL_library_init();
     SSL_load_error_strings();
