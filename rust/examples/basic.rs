@@ -1,5 +1,5 @@
 fn main() {
-    let revpx = revpx::RevPx::new("80", "443");
+    let revpx = revpx::RevPx::default();
     let domains = vec![revpx::DomainConfig {
         domain: "example.localhost".to_string(),
         host: None,

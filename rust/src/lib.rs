@@ -39,6 +39,10 @@ impl RevPx {
         }
     }
 
+    pub fn default() -> Self {
+        Self::new("80", "443")
+    }
+
     pub fn as_ptr(&self) -> *mut CRevPx {
         self.ptr
     }
