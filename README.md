@@ -71,10 +71,15 @@ cc -o nob nob.c
 
 # 2. Build the project
 ./nob
-
-# 3. Install it system-wide
-./nob install
 ```
+
+### Scripts
+
+`./nob`: Build the project
+`./nob update`: Update dependencies
+`./nob run [...]`: Build and run the project
+`./nob example`: Build and run with example domain `example.localhost` on port `8080`
+`./nob install`: Install the binary system-wide in /usr/local/bin
 
 ### C api
 

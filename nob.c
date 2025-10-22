@@ -81,17 +81,26 @@ int main(int argc, char **argv) {
     }
 
     // RUN
-    if (argc > 1 && (strcmp(argv[1], "run") == 0)) {
-        cmd_append(&cmd, "mkcert", "example.localhost");
-        if (!cmd_run(&cmd)) {
-            nob_log(NOB_ERROR, "Failed to create TLS certificates");
-            return 1;
+    bool is_run = argc > 1 && strcmp(argv[1], "run") == 0;
+    bool is_example = argc > 1 && strcmp(argv[1], "example") == 0;
+    if (is_run || is_example) {
+        if (is_example) {
+            cmd_append(&cmd, "mkcert", "example.localhost");
+            if (!cmd_run(&cmd)) {
+                nob_log(NOB_ERROR, "Failed to create TLS certificates");
+                return 1;
+            }
         }
 #ifndef __APPLE__
         cmd_append(&cmd, "sudo");
 #endif
         cmd_append(&cmd, "build/revpx");
-        cmd_append(&cmd, "example.localhost", "8080", "example.localhost.pem", "example.localhost-key.pem");
+        if (is_example) {
+            cmd_append(&cmd, "example.localhost", "8080", "example.localhost.pem", "example.localhost-key.pem");
+        } else {
+            for (int i = 2; i < argc; i++)
+                cmd_append(&cmd, argv[i]);
+        }
         if (!cmd_run(&cmd)) {
             nob_log(NOB_ERROR, "Failed to start revpx");
             return 1;
