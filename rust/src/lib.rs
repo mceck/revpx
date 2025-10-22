@@ -5,14 +5,14 @@ type CRevPx = c_void;
 unsafe extern "C" {
     fn revpx_add_domain(
         revpx: *mut CRevPx,
-        domain: *const i8,
-        host: *const i8,
-        port: *const i8,
-        cert: *const i8,
-        key: *const i8,
+        domain: *const u8,
+        host: *const u8,
+        port: *const u8,
+        cert: *const u8,
+        key: *const u8,
     );
     fn revpx_run_server(revpx: *mut CRevPx) -> i32;
-    fn revpx_create(http_port: *const i8, https_port: *const i8) -> *mut CRevPx;
+    fn revpx_create(http_port: *const u8, https_port: *const u8) -> *mut CRevPx;
     fn revpx_free(revpx: *mut CRevPx);
 }
 
@@ -34,7 +34,7 @@ impl RevPx {
         let http_port_c = std::ffi::CString::new(http_port).unwrap();
         let https_port_c = std::ffi::CString::new(https_port).unwrap();
         unsafe {
-            let ptr = revpx_create(http_port_c.as_ptr(), https_port_c.as_ptr());
+            let ptr = revpx_create(http_port_c.as_ptr().cast(), https_port_c.as_ptr().cast());
             Self { ptr }
         }
     }
@@ -57,11 +57,11 @@ impl RevPx {
         unsafe {
             revpx_add_domain(
                 self.ptr,
-                domain.as_ptr(),
-                host.as_ptr(),
-                port.as_ptr(),
-                cert.as_ptr(),
-                key.as_ptr(),
+                domain.as_ptr().cast(),
+                host.as_ptr().cast(),
+                port.as_ptr().cast(),
+                cert.as_ptr().cast(),
+                key.as_ptr().cast(),
             );
         }
     }
