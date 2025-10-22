@@ -1,9 +1,9 @@
 #define REVPX_IMPLEMENTATION
 #define JSP_IMPLEMENTATION
 #include <stdio.h>
+#include <yaml.h>
 #include "revpx.h"
 #include "jsp.h"
-#include "yml.h"
 
 #define DEFAULT_PORT "443"
 #define DEFAULT_PORT_PLAIN "80"
@@ -175,55 +175,103 @@ cleanup:
 int parse_monade_yaml(RevPx *revpx, const char *yaml_file) {
     const char *home = getenv("HOME");
     int ret = 0;
-    const char *yaml_path = yaml_file && yaml_file[0] ? yaml_file : "monade.yaml";
-    YamlNode *yaml = parse_yaml(yaml_path);
-    if (!yaml) {
-        rp_log_error("Failed to parse %s\n", yaml_path);
-        ret = 1;
-        goto cleanup;
-    }
-    char project_name[256];
-    for (int i = 0; i < yaml->child_count; i++) {
-        YamlNode *services = yaml->children[i];
-        if (strcmp(services->key, "name") == 0 && services->type == YAML_SCALAR) {
-            strcpy(project_name, services->value);
-            break;
-        }
-    }
-    for (int i = 0; i < yaml->child_count; i++) {
-        YamlNode *services = yaml->children[i];
-        if (services->type != YAML_MAP || strcmp(services->key, "services") != 0) continue;
-        for (int j = 0; j < services->child_count; j++) {
-            YamlNode *service = services->children[j];
-            char domains[16][256] = {0}, port[16] = {0};
-            int domain_count = 0;
-            for (int k = 0; k < service->child_count; k++) {
-                YamlNode *c = service->children[k];
-                if (strcmp(c->key, "domains") == 0) {
-                    domain_count = c->child_count < 16 ? c->child_count : 16;
-                    for (int k = 0; k < domain_count; k++) {
-                        YamlNode *domain = c->children[k];
-                        if (domain->type == YAML_SCALAR) {
-                            strncpy(domains[k], domain->value, sizeof(domains[k]) - 1);
-                        }
-                    }
-                } else if (strcmp(c->key, "port") == 0 && c->type == YAML_SCALAR) {
-                    strncpy(port, c->value, sizeof(port) - 1);
-                }
-            }
-            if (domain_count && port[0]) {
-                for (int k = 0; k < domain_count; k++) {
-                    char key_path[512], cert_path[512];
-                    snprintf(cert_path, sizeof(cert_path), "%s/.config/monade/stacks/%s/certs/chain.pem", home, project_name);
-                    snprintf(key_path, sizeof(key_path), "%s/.config/monade/stacks/%s/certs/key.pem", home, project_name);
-                    revpx_add_domain(revpx, domains[k], NULL, port, cert_path, key_path);
-                }
-            }
-        }
+    const char *yaml_path = (yaml_file && yaml_file[0]) ? yaml_file : "monade.yaml";
+    FILE *fh = fopen(yaml_path, "r");
+    if (!fh) {
+        rp_log_error("Failed to open %s\n", yaml_path);
+        return 1;
     }
 
-cleanup:
-    free_yaml(yaml);
+    yaml_parser_t parser;
+    yaml_event_t event;
+
+    if (!yaml_parser_initialize(&parser)) {
+        rp_log_error("Failed to initialize YAML parser\n");
+        fclose(fh);
+        return 1;
+    }
+    yaml_parser_set_input_file(&parser, fh);
+
+    char current_key[256] = {0};
+    char project_name[256] = {0};
+    char service_name[256] = {0};
+    char port[16] = {0};
+    char domains[16][256] = {{0}};
+    int domain_count = 0;
+    int in_services = 0;
+    int in_service_map = 0;
+    int in_domains = 0;
+
+    while (1) {
+        if (!yaml_parser_parse(&parser, &event)) {
+            rp_log_error("YAML parse error in %s\n", yaml_path);
+            ret = 1;
+            break;
+        }
+
+        if (event.type == YAML_SCALAR_EVENT) {
+            const char *value = (const char *)event.data.scalar.value;
+            if (!in_services) {
+                if (strcmp(current_key, "name") == 0) {
+                    strncpy(project_name, value, sizeof(project_name) - 1);
+                    current_key[0] = '\0';
+                } else if (strcmp(value, "services") == 0) {
+                    in_services = 1;
+                } else {
+                    strncpy(current_key, value, sizeof(current_key) - 1);
+                }
+            } else if (in_services) {
+                if (!in_service_map) {
+                    strncpy(service_name, value, sizeof(service_name) - 1);
+                    in_service_map = 1;
+                    domain_count = 0;
+                    port[0] = '\0';
+                } else {
+                    if (strcmp(current_key, "port") == 0) {
+                        strncpy(port, value, sizeof(port) - 1);
+                        current_key[0] = '\0';
+                    } else if (in_domains) {
+                        if (domain_count < 16) {
+                            strncpy(domains[domain_count++], value, sizeof(domains[0]) - 1);
+                        }
+                    } else if (strcmp(value, "domains") == 0) {
+                        in_domains = 1;
+                    } else {
+                        strncpy(current_key, value, sizeof(current_key) - 1);
+                    }
+                }
+            }
+        } else if (event.type == YAML_SEQUENCE_END_EVENT) {
+            if (in_domains) {
+                in_domains = 0;
+            }
+        } else if (event.type == YAML_MAPPING_END_EVENT) {
+            if (in_service_map) {
+                if (domain_count && port[0]) {
+                    for (int k = 0; k < domain_count; k++) {
+                        char cert_path[512], key_path[512];
+                        snprintf(cert_path, sizeof(cert_path),
+                                 "%s/.config/monade/stacks/%s/certs/chain.pem",
+                                 home, project_name);
+                        snprintf(key_path, sizeof(key_path),
+                                 "%s/.config/monade/stacks/%s/certs/key.pem",
+                                 home, project_name);
+                        revpx_add_domain(revpx, domains[k], NULL, port, cert_path, key_path);
+                    }
+                }
+                in_service_map = 0;
+                domain_count = 0;
+            }
+        } else if (event.type == YAML_STREAM_END_EVENT) {
+            yaml_event_delete(&event);
+            break;
+        }
+
+        yaml_event_delete(&event);
+    }
+
+    yaml_parser_delete(&parser);
+    fclose(fh);
     return ret;
 }
 
