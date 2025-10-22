@@ -106,7 +106,7 @@ void revpx_free(RevPx *revpx);
 // Example usage
 int main() {
     RevPx *revpx = revpx_create("80", "443");
-    revpx_add_domain(revpx, "example.localhost", "localhost", "8080", "example.localhost.pem", "example.localhost-key.pem");
+    revpx_add_domain(revpx, "example.localhost", NULL, "8080", "example.localhost.pem", "example.localhost-key.pem");
     revpx_run_server(revpx);
     revpx_free(revpx);
     return 0;
