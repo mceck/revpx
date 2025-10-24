@@ -21,7 +21,7 @@
 
 #define RP_DEFAULT_BACKEND_HOST "127.0.0.1"
 #define RP_MAX_EVENTS 1024
-#define RP_BUF_SIZE 16384
+#define RP_BUF_SIZE 32768
 #define RP_MAX_FD 65536
 #define RP_MAX_DOMAINS 128
 
@@ -73,7 +73,7 @@ typedef struct {
     unsigned char buf[RP_BUF_SIZE];
     size_t len, off;
     bool closing;
-    bool write_retry;
+    int write_retry_count; // Changed from bool to int for multiple retries
     bool read_stalled;
     bool websocket;
 } RpConnection;
@@ -110,12 +110,16 @@ static void set_nonblock(int fd) {
 
 static void ep_add(RevPx *revpx, int fd, uint32_t events) {
     struct epoll_event ev = {.data.fd = fd, .events = events};
-    epoll_ctl(revpx->epfd, EPOLL_CTL_ADD, fd, &ev);
+    if (epoll_ctl(revpx->epfd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+        rp_log_error("epoll_ctl ADD failed for fd=%d: %s\n", fd, strerror(errno));
+    }
 }
 
 static void ep_mod(RevPx *revpx, int fd, uint32_t events) {
     struct epoll_event ev = {.data.fd = fd, .events = events};
-    epoll_ctl(revpx->epfd, EPOLL_CTL_MOD, fd, &ev);
+    if (epoll_ctl(revpx->epfd, EPOLL_CTL_MOD, fd, &ev) < 0) {
+        rp_log_error("epoll_ctl MOD failed for fd=%d: %s\n", fd, strerror(errno));
+    }
 }
 
 static void cleanup(RevPx *revpx, int fd) {
@@ -222,7 +226,7 @@ static void send_error(RevPx *revpx, RpConnection *c, int code, const char *stat
     c->len = head_len + body_len;
     c->off = 0;
     c->closing = true;
-    rp_log_info("connection error: %d %s\n", code, status);
+    rp_log_error("connection error: %d %s\n", code, status);
     ep_mod(revpx, c->fd, EPOLLOUT | EPOLLET);
 }
 
@@ -353,8 +357,28 @@ static SSL_CTX *get_ctx(RevPx *revpx, const char *host) {
         if (strcasecmp(d->domain, host) == 0) {
             if (!d->ctx) {
                 d->ctx = SSL_CTX_new(TLS_server_method());
-                SSL_CTX_use_certificate_file(d->ctx, d->cert, SSL_FILETYPE_PEM);
-                SSL_CTX_use_PrivateKey_file(d->ctx, d->key, SSL_FILETYPE_PEM);
+                if (!d->ctx) {
+                    rp_log_error("SSL_CTX_new failed for domain %s\n", host);
+                    return NULL;
+                }
+                if (SSL_CTX_use_certificate_file(d->ctx, d->cert, SSL_FILETYPE_PEM) <= 0) {
+                    rp_log_error("Failed to load certificate file %s for domain %s\n", d->cert, host);
+                    unsigned long ssl_err;
+                    while ((ssl_err = ERR_get_error()) != 0) {
+                        char err_buf[256];
+                        ERR_error_string_n(ssl_err, err_buf, sizeof(err_buf));
+                        rp_log_error("SSL error: %s\n", err_buf);
+                    }
+                }
+                if (SSL_CTX_use_PrivateKey_file(d->ctx, d->key, SSL_FILETYPE_PEM) <= 0) {
+                    rp_log_error("Failed to load private key file %s for domain %s\n", d->key, host);
+                    unsigned long ssl_err;
+                    while ((ssl_err = ERR_get_error()) != 0) {
+                        char err_buf[256];
+                        ERR_error_string_n(ssl_err, err_buf, sizeof(err_buf));
+                        rp_log_error("SSL error: %s\n", err_buf);
+                    }
+                }
                 SSL_CTX_set_mode(d->ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
             }
             return d->ctx;
@@ -378,7 +402,7 @@ static void flush_buffer(RevPx *revpx, RpConnection *c) {
         if (n > 0) {
             c->off += n;
             c->len -= n;
-            c->write_retry = false;
+            c->write_retry_count = 0;
         } else {
             int err = get_error(c, n);
             if (err == SSL_ERROR_WANT_WRITE) {
@@ -390,14 +414,19 @@ static void flush_buffer(RevPx *revpx, RpConnection *c) {
                 return;
             }
             if (err == SSL_ERROR_ZERO_RETURN || (err == SSL_ERROR_SYSCALL && errno == 0)) {
+                rp_log_error("Connection fd=%d closed during flush (SSL_ERROR_ZERO_RETURN)\n", c->fd);
                 cleanup_both(revpx, c->fd);
                 return;
             }
-            if (!c->write_retry) {
-                c->write_retry = true;
+            if (err == SSL_ERROR_SYSCALL) {
+                rp_log_error("SSL write error fd=%d: %s\n", c->fd, strerror(errno));
+            }
+            if (c->write_retry_count < 5) {
+                c->write_retry_count++;
                 ep_mod(revpx, c->fd, EPOLLOUT | EPOLLET);
                 return;
             }
+            rp_log_error("Connection fd=%d: max write retries exceeded\n", c->fd);
             cleanup(revpx, c->fd);
             return;
         }
@@ -427,6 +456,7 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
     RpConnection *dst = src->peer >= 0 ? revpx->conns[src->peer] : NULL;
 
     if (!dst && !src->closing) {
+        rp_log_error("Proxy data error: peer connection lost for fd=%d\n", src->fd);
         cleanup(revpx, src->fd);
         return;
     }
@@ -470,7 +500,7 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
                     int w = do_write(dst, temp + written, n - written);
                     if (w > 0) {
                         written += w;
-                        dst->write_retry = false;
+                        dst->write_retry_count = 0;
                     } else {
                         int err = get_error(dst, w);
                         if (err == SSL_ERROR_WANT_WRITE) break;
@@ -479,13 +509,18 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
                             break;
                         }
                         if (err == SSL_ERROR_ZERO_RETURN || (err == SSL_ERROR_SYSCALL && errno == 0)) {
+                            rp_log_error("Peer connection fd=%d closed during proxy write\n", dst->fd);
                             cleanup_both(revpx, src->fd);
                             return;
                         }
-                        if (!dst->write_retry) {
-                            dst->write_retry = true;
+                        if (err == SSL_ERROR_SYSCALL) {
+                            rp_log_error("SSL proxy write error fd=%d->%d: %s\n", src->fd, dst->fd, strerror(errno));
+                        }
+                        if (dst->write_retry_count < 5) {
+                            dst->write_retry_count++;
                             break;
                         }
+                        rp_log_error("Connection fd=%d: max write retries exceeded in proxy\n", src->fd);
                         cleanup(revpx, src->fd);
                         return;
                     }
@@ -499,6 +534,7 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
                     ep_mod(revpx, dst->fd, EPOLLOUT | EPOLLET);
                 }
             } else if (n == 0) {
+                rp_log_debug("Proxy connection closed by peer fd=%d\n", src->fd);
                 cleanup(revpx, src->fd);
                 return;
             } else {
@@ -509,9 +545,14 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
                     break;
                 }
                 if (err == SSL_ERROR_ZERO_RETURN || (err == SSL_ERROR_SYSCALL && errno == 0)) {
+                    rp_log_debug("Proxy connection fd=%d closed (SSL_ERROR_ZERO_RETURN)\n", src->fd);
                     cleanup(revpx, src->fd);
                     return;
                 }
+                if (err == SSL_ERROR_SYSCALL) {
+                    rp_log_debug("SSL proxy read error fd=%d: %s\n", src->fd, strerror(errno));
+                }
+                rp_log_debug("Fatal proxy read error fd=%d, error: %d\n", src->fd, err);
                 cleanup(revpx, src->fd);
                 return;
             }
@@ -528,6 +569,7 @@ static void tunnel_data(RevPx *revpx, RpConnection *src, uint32_t events) {
     if (events & EPOLLIN) {
         RpConnection *dst = src->peer >= 0 ? revpx->conns[src->peer] : NULL;
         if (!dst) {
+            rp_log_error("WebSocket tunnel error: peer connection lost for fd=%d\n", src->fd);
             cleanup(revpx, src->fd);
             return;
         }
@@ -582,10 +624,14 @@ static int create_backend(const char *host, const char *port) {
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
 
-    if (getaddrinfo(host, port, &hints, &res) != 0) return -1;
+    if (getaddrinfo(host, port, &hints, &res) != 0) {
+        rp_log_error("getaddrinfo failed for %s:%s: %s\n", host, port, strerror(errno));
+        return -1;
+    }
 
     int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (fd < 0) {
+        rp_log_error("socket creation failed for backend %s:%s: %s\n", host, port, strerror(errno));
         freeaddrinfo(res);
         return -1;
     }
@@ -593,6 +639,30 @@ static int create_backend(const char *host, const char *port) {
     set_nonblock(fd);
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    // // Enable TCP keepalive for long-lived streaming connections
+    // setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+
+    // #ifdef TCP_KEEPIDLE
+    // int keepidle = 60;  // Start sending keepalive probes after 60 seconds
+    // setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+    // #endif
+
+    // #ifdef TCP_KEEPINTVL
+    // int keepintvl = 10;  // Send keepalive probes every 10 seconds
+    // setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+    // #endif
+
+    // #ifdef TCP_KEEPCNT
+    // int keepcnt = 3;  // Close connection after 3 failed probes
+    // setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+    // #endif
+
+    // // Increase socket buffers for better streaming performance
+    // int rcvbuf = 256 * 1024;  // 256KB receive buffer
+    // int sndbuf = 256 * 1024;  // 256KB send buffer
+    // setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    // setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
     connect(fd, res->ai_addr, res->ai_addrlen);
     freeaddrinfo(res);
@@ -604,6 +674,7 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
     if (!c) return;
 
     if (events & EPOLLERR) {
+        rp_log_error("EPOLLERR on fd=%d, state=%d\n", fd, c->state);
         if (c->state == ST_CONNECTING) {
             RpConnection *client = revpx->conns[c->peer];
             if (client) {
@@ -626,6 +697,7 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
             return;
         }
         if (c->state != ST_SHUTTING_DOWN) {
+            rp_log_error("EPOLLHUP on fd=%d, state=%d - unexpected connection hangup\n", fd, c->state);
             cleanup(revpx, fd);
             return;
         }
@@ -648,19 +720,40 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
                 ep_mod(revpx, fd, EPOLLIN | EPOLLET);
             else if (err == SSL_ERROR_WANT_WRITE)
                 ep_mod(revpx, fd, EPOLLOUT | EPOLLET);
-            else
+            else {
+                unsigned long ssl_err;
+                while ((ssl_err = ERR_get_error()) != 0) {
+                    char err_buf[256];
+                    ERR_error_string_n(ssl_err, err_buf, sizeof(err_buf));
+                    rp_log_error("SSL handshake failed on fd=%d: %s\n", fd, err_buf);
+                }
+                if (ssl_err == 0) {
+                    rp_log_error("SSL handshake failed on fd=%d, error code: %d\n", fd, err);
+                }
                 cleanup(revpx, fd);
+            }
         }
         break;
     }
 
     case ST_READ_HEADER: {
-        int n = do_read(c, c->buf + c->len, sizeof(c->buf) - c->len);
-        if (n > 0)
-            c->len += n;
-        else if (n <= 0 && get_error(c, n) != SSL_ERROR_WANT_READ) {
-            cleanup(revpx, fd);
-            break;
+        // Only try to read if buffer has space
+        if (c->len < sizeof(c->buf)) {
+            int n = do_read(c, c->buf + c->len, sizeof(c->buf) - c->len);
+            if (n > 0) {
+                c->len += n;
+            } else if (n <= 0 && get_error(c, n) != SSL_ERROR_WANT_READ) {
+                int err = get_error(c, n);
+                if (err == SSL_ERROR_ZERO_RETURN) {
+                    rp_log_error("Connection closed during header read fd=%d\n", fd);
+                } else if (err == SSL_ERROR_SYSCALL) {
+                    rp_log_error("SSL read error during header read fd=%d: %s\n", fd, strerror(errno));
+                } else {
+                    rp_log_error("Read error during header read fd=%d, error: %d\n", fd, err);
+                }
+                cleanup(revpx, fd);
+                break;
+            }
         }
 
         int end = find_headers_end(c->buf, c->len);
@@ -686,6 +779,7 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
                 }
             }
             if (!d) {
+                rp_log_error("Domain not found: %s\n", host);
                 send_error(revpx, c, 421, "Misdirected Request");
                 break;
             }
@@ -694,6 +788,7 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
 
             int backend = create_backend(d->host, d->port);
             if (backend < 0) {
+                rp_log_error("Failed to create backend connection to %s:%s\n", d->host, d->port);
                 send_error(revpx, c, 502, "Bad Gateway");
                 break;
             }
@@ -701,26 +796,44 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
             RpConnection *b = alloc_conn(revpx, backend, NULL, ST_CONNECTING);
             c->peer = backend;
             b->peer = fd;
+            c->state = ST_CONNECTING; // Client waits for backend to connect
+
             ep_add(revpx, backend, EPOLLOUT | EPOLLET);
-        } else if (c->len == sizeof(c->buf)) {
-            send_error(revpx, c, 400, "Bad Request");
+        } else if (c->len >= sizeof(c->buf)) {
+            // Buffer full but headers not complete
+            rp_log_error("Headers too large fd=%d, buffer size: %zu\n", fd, c->len);
+            send_error(revpx, c, 431, "Request Header Fields Too Large");
         }
         break;
     }
 
     case ST_CONNECTING: {
+        // Client side: just wait, do nothing
+        if (c->ssl || !(events & EPOLLOUT)) {
+            rp_log_debug("ST_CONNECTING: Client side: just wait, do nothing\n");
+            break;
+        }
+
         int err = 0;
         socklen_t len = sizeof(err);
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) {
+                rp_log_error("getsockopt failed on fd=%d: %s\n", fd, strerror(errno));
+            } else {
+                rp_log_error("Backend connection failed on fd=%d: %s\n", fd, strerror(err));
+            }
             RpConnection *client = revpx->conns[c->peer];
             if (client) {
                 send_error(revpx, client, 502, "Bad Gateway");
                 client->peer = -1;
+                client->state = ST_READ_HEADER;
             }
             c->peer = -1;
             cleanup(revpx, fd);
             break;
         }
+
+        rp_log_debug("Backend fd=%d connected successfully\n", fd);
 
         RpConnection *client = revpx->conns[c->peer];
         if (!client) {
@@ -742,6 +855,7 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
             size_t room = buffer_space(c);
             size_t to_copy = client->len <= room ? client->len : room;
             if (to_copy > 0) {
+                rp_log_debug("Copying %zu bytes from client fd=%d to backend fd=%d buffer\n", to_copy, client->fd, fd);
                 memcpy(c->buf + c->off + c->len, client->buf + client->off, to_copy);
                 c->len += to_copy;
                 client->off += to_copy;
@@ -749,8 +863,9 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
                 if (client->len == 0) client->off = 0;
             }
             ep_mod(revpx, fd, EPOLLOUT | EPOLLIN | EPOLLET);
-            ep_mod(revpx, client->fd, EPOLLIN | EPOLLET);
+            ep_mod(revpx, client->fd, client->len > 0 ? EPOLLIN | EPOLLET : EPOLLIN | EPOLLET);
         } else {
+            rp_log_debug("Backend fd=%d ready, no data to forward yet\n", fd);
             ep_mod(revpx, fd, EPOLLIN | EPOLLET);
             ep_mod(revpx, client->fd, EPOLLIN | EPOLLET);
         }
@@ -760,6 +875,7 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
     case ST_UPGRADING: {
         RpConnection *client = revpx->conns[c->peer];
         if (!client) {
+            rp_log_error("WebSocket upgrade error: client connection lost for fd=%d\n", fd);
             cleanup(revpx, fd);
             break;
         }
@@ -771,7 +887,7 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
             ep_mod(revpx, c->fd, EPOLLIN | EPOLLET);
             break;
         } else if (n <= 0 && get_error(c, n) != SSL_ERROR_WANT_READ) {
-            rp_log_warn("Upgrade a WebSocket failed. Backend read error: %s\n", strerror(errno));
+            rp_log_error("WebSocket upgrade failed - backend read error fd=%d: %s\n", c->fd, strerror(errno));
             send_error(revpx, client, 502, "Bad Gateway");
             cleanup(revpx, c->fd);
             break;
@@ -828,8 +944,18 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
                 ep_mod(revpx, c->fd, EPOLLIN | EPOLLET);
             else if (err == SSL_ERROR_WANT_WRITE)
                 ep_mod(revpx, c->fd, EPOLLOUT | EPOLLET);
-            else
+            else {
+                unsigned long ssl_err;
+                while ((ssl_err = ERR_get_error()) != 0) {
+                    char err_buf[256];
+                    ERR_error_string_n(ssl_err, err_buf, sizeof(err_buf));
+                    rp_log_debug("SSL shutdown error on fd=%d: %s\n", c->fd, err_buf);
+                }
+                if (ssl_err == 0) {
+                    rp_log_debug("SSL shutdown error on fd=%d, error code: %d\n", c->fd, err);
+                }
                 cleanup(revpx, c->fd);
+            }
         }
         break;
     }
@@ -842,10 +968,14 @@ static int create_listener(const char *port) {
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
 
-    if (getaddrinfo(NULL, port, &hints, &res) != 0) return -1;
+    if (getaddrinfo(NULL, port, &hints, &res) != 0) {
+        rp_log_error("getaddrinfo failed for port %s: %s\n", port, strerror(errno));
+        return -1;
+    }
 
     int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (fd < 0) {
+        rp_log_error("socket creation failed for listener on port %s: %s\n", port, strerror(errno));
         freeaddrinfo(res);
         return -1;
     }
@@ -855,9 +985,9 @@ static int create_listener(const char *port) {
 
     if (bind(fd, res->ai_addr, res->ai_addrlen) < 0) {
         if (errno == EADDRINUSE) {
-            close(fd);
-            freeaddrinfo(res);
-            return -1;
+            rp_log_error("bind failed on port %s: address already in use\n", port);
+        } else {
+            rp_log_error("bind failed on port %s: %s\n", port, strerror(errno));
         }
         close(fd);
         freeaddrinfo(res);
@@ -867,6 +997,7 @@ static int create_listener(const char *port) {
     freeaddrinfo(res);
     set_nonblock(fd);
     if (listen(fd, 512) < 0) {
+        rp_log_error("listen failed on port %s: %s\n", port, strerror(errno));
         close(fd);
         return -1;
     }
@@ -918,6 +1049,10 @@ int revpx_run_server(RevPx *revpx) {
     SSL_load_error_strings();
 
     revpx->epfd = epoll_create1(0);
+    if (revpx->epfd < 0) {
+        rp_log_error("epoll_create1 failed: %s\n", strerror(errno));
+        return -1;
+    }
     memset(revpx->conns, 0, sizeof(revpx->conns));
     revpx->stop = false;
 
@@ -942,6 +1077,19 @@ int revpx_run_server(RevPx *revpx) {
     }
 
     SSL_CTX *root_ctx = SSL_CTX_new(TLS_server_method());
+    if (!root_ctx) {
+        rp_log_error("SSL_CTX_new failed for root context\n");
+        unsigned long ssl_err;
+        while ((ssl_err = ERR_get_error()) != 0) {
+            char err_buf[256];
+            ERR_error_string_n(ssl_err, err_buf, sizeof(err_buf));
+            rp_log_error("SSL error: %s\n", err_buf);
+        }
+        if (http_fd >= 0) close(http_fd);
+        close(https_fd);
+        close(revpx->epfd);
+        return -1;
+    }
     SSL_CTX_set_mode(root_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
     SSL_CTX_set_tlsext_servername_callback(root_ctx, sni_callback);
     SSL_CTX_set_tlsext_servername_arg(root_ctx, revpx);
@@ -963,11 +1111,26 @@ int revpx_run_server(RevPx *revpx) {
             if (fd == https_fd) {
                 while (1) {
                     int client = accept(https_fd, NULL, NULL);
-                    if (client < 0) break;
+                    if (client < 0) {
+                        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                            rp_log_error("accept failed on https fd: %s\n", strerror(errno));
+                        }
+                        break;
+                    }
                     set_nonblock(client);
 
                     SSL *ssl = SSL_new(root_ctx);
-                    SSL_set_fd(ssl, client);
+                    if (!ssl) {
+                        rp_log_error("SSL_new failed for client fd=%d\n", client);
+                        close(client);
+                        continue;
+                    }
+                    if (SSL_set_fd(ssl, client) != 1) {
+                        rp_log_error("SSL_set_fd failed for client fd=%d\n", client);
+                        SSL_free(ssl);
+                        close(client);
+                        continue;
+                    }
                     SSL_set_accept_state(ssl);
 
                     RpConnection *c = alloc_conn(revpx, client, ssl, ST_SSL_HANDSHAKE);
@@ -985,7 +1148,12 @@ int revpx_run_server(RevPx *revpx) {
             } else if (http_fd >= 0 && fd == http_fd) {
                 while (1) {
                     int client = accept(http_fd, NULL, NULL);
-                    if (client < 0) break;
+                    if (client < 0) {
+                        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                            rp_log_error("accept failed on http fd: %s\n", strerror(errno));
+                        }
+                        break;
+                    }
                     set_nonblock(client);
 
                     RpConnection *c = alloc_conn(revpx, client, NULL, ST_READ_HEADER);
