@@ -725,10 +725,10 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
                 while ((ssl_err = ERR_get_error()) != 0) {
                     char err_buf[256];
                     ERR_error_string_n(ssl_err, err_buf, sizeof(err_buf));
-                    rp_log_error("SSL handshake failed on fd=%d: %s\n", fd, err_buf);
+                    rp_log_debug("SSL handshake failed on fd=%d: %s\n", fd, err_buf);
                 }
                 if (ssl_err == 0) {
-                    rp_log_error("SSL handshake failed on fd=%d, error code: %d\n", fd, err);
+                    rp_log_debug("SSL handshake failed on fd=%d, error code: %d\n", fd, err);
                 }
                 cleanup(revpx, fd);
             }
