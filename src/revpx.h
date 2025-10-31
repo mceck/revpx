@@ -65,7 +65,13 @@ typedef enum {
     ST_SHUTTING_DOWN
 } RpConnectionState;
 
+typedef enum {
+    CT_CLIENT,
+    CT_BACKEND
+} RpConnectionType;
+
 typedef struct {
+    RpConnectionType type;
     int fd;
     SSL *ssl;
     int peer;
@@ -161,7 +167,7 @@ static void cleanup_both(RevPx *revpx, int fd) {
     }
 }
 
-static RpConnection *alloc_conn(RevPx *revpx, int fd, SSL *ssl, RpConnectionState state) {
+static RpConnection *alloc_conn(RevPx *revpx, int fd, SSL *ssl, RpConnectionState state, RpConnectionType type) {
     if (fd >= RP_MAX_FD || revpx->conns[fd]) {
         if (fd >= RP_MAX_FD)
             rp_log_error("Too many connections\n");
@@ -176,6 +182,7 @@ static RpConnection *alloc_conn(RevPx *revpx, int fd, SSL *ssl, RpConnectionStat
     c->ssl = ssl;
     c->peer = -1;
     c->state = state;
+    c->type = type;
     revpx->conns[fd] = c;
     return c;
 }
@@ -247,12 +254,9 @@ static void send_redirect(RevPx *revpx, RpConnection *c, const char *host, const
 
 static int find_headers_end(const unsigned char *buf, size_t len) {
     for (size_t i = 0; i + 3 < len; i++) {
-        if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n')
+        if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n') {
             return i + 4;
-    }
-    for (size_t i = 0; i + 1 < len; i++) {
-        if (buf[i] == '\n' && buf[i + 1] == '\n')
-            return i + 2;
+        }
     }
     return -1;
 }
@@ -349,6 +353,21 @@ static bool is_websocket_upgrade_request(const unsigned char *buf, size_t len) {
     }
 
     return false;
+}
+
+static unsigned char *find_header_ci_in(const unsigned char *p, size_t header_len, const char *name) {
+    size_t name_len = strlen(name);
+    const unsigned char *cur = p;
+    const unsigned char *end = p + header_len;
+    while (cur < end) {
+        const unsigned char *nl = (const unsigned char *)memchr(cur, '\n', end - cur);
+        if (!nl) break;
+        if ((size_t)(nl - cur) >= name_len && strncasecmp((const char *)cur, name, name_len) == 0 && cur[name_len] == ':') {
+            return (unsigned char *)cur;
+        }
+        cur = nl + 1;
+    }
+    return NULL;
 }
 
 static SSL_CTX *get_ctx(RevPx *revpx, const char *host) {
@@ -539,10 +558,10 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
                 return;
             } else {
                 int err = get_error(src, n);
-                if (err == SSL_ERROR_WANT_READ) break;
+                if (err == SSL_ERROR_WANT_READ) return;
                 if (err == SSL_ERROR_WANT_WRITE) {
                     ep_mod(revpx, src->fd, EPOLLOUT | EPOLLIN | EPOLLET);
-                    break;
+                    return;
                 }
                 if (err == SSL_ERROR_ZERO_RETURN || (err == SSL_ERROR_SYSCALL && errno == 0)) {
                     rp_log_debug("Proxy connection fd=%d closed (SSL_ERROR_ZERO_RETURN)\n", src->fd);
@@ -640,33 +659,124 @@ static int create_backend(const char *host, const char *port) {
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
-    // // Enable TCP keepalive for long-lived streaming connections
-    // setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-
-    // #ifdef TCP_KEEPIDLE
-    // int keepidle = 60;  // Start sending keepalive probes after 60 seconds
-    // setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
-    // #endif
-
-    // #ifdef TCP_KEEPINTVL
-    // int keepintvl = 10;  // Send keepalive probes every 10 seconds
-    // setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
-    // #endif
-
-    // #ifdef TCP_KEEPCNT
-    // int keepcnt = 3;  // Close connection after 3 failed probes
-    // setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
-    // #endif
-
-    // // Increase socket buffers for better streaming performance
-    // int rcvbuf = 256 * 1024;  // 256KB receive buffer
-    // int sndbuf = 256 * 1024;  // 256KB send buffer
-    // setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-    // setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-
     connect(fd, res->ai_addr, res->ai_addrlen);
     freeaddrinfo(res);
     return fd;
+}
+
+static bool find_header(const unsigned char *buf, size_t len, const char *header_name,
+                        const char **value_start, size_t *value_len) {
+    const char *p = (const char *)buf;
+    const char *end = p + len;
+    size_t name_len = strlen(header_name);
+
+    while (p < end) {
+        const char *nl = memchr(p, '\n', end - p);
+        if (!nl) break;
+
+        if (strncasecmp(p, header_name, name_len) == 0 && p[name_len] == ':') {
+            const char *val = p + name_len + 1;
+            while (val < nl && (*val == ' ' || *val == '\t'))
+                val++;
+
+            const char *val_end = nl;
+            if (val_end > p && val_end[-1] == '\r') val_end--;
+            if (value_start)
+                *value_start = val;
+            if (value_len)
+                *value_len = val_end - val;
+            return true;
+        }
+        p = nl + 1;
+    }
+    return false;
+}
+
+static bool inject_forwarded_headers(RpConnection *client) {
+    const char injected_ip[] = "127.0.0.1";
+    char extra_headers[1024] = "\r\nConnection: close";
+    if (client->len == 0) return false;
+    unsigned char *p = client->buf + client->off;
+    int headers_end = find_headers_end(p, client->len);
+    if (headers_end <= 0) return false;
+
+    size_t header_len = (size_t)headers_end;
+
+    char method[16] = "GET"; // Default method
+    const char *end = memchr((char *)p, '\n', header_len);
+    if (end) {
+        const char *space = memchr((char *)p, ' ', end - (char *)p);
+        if (space) {
+            size_t method_len = (size_t)(space - (char *)p);
+            if (method_len > 0 && method_len < sizeof(method)) {
+                memset(method, 0, sizeof(method));
+                memcpy(method, p, method_len);
+                rp_log_debug("Extracted method: %s\n", method);
+            }
+        }
+    }
+
+    const char *ff_value;
+    size_t ff_len = 0;
+    char ff[256];
+    find_header((const unsigned char *)p, header_len, "X-Forwarded-For", &ff_value, &ff_len);
+    if (ff_value && ff_len > 0) {
+        strncpy(ff, ff_value, ff_len);
+        strcat(ff, ", ");
+    } else {
+        strcpy(ff, injected_ip);
+    }
+    strcat(extra_headers, "\r\nX-Forwarded-For: ");
+    strcat(extra_headers, ff);
+
+    const char *to_strip[] = {"Connection", "Proxy-Connection", "Forwarded", "X-Forwarded-For",
+                              "X-Forwarded-Proto", "X-Forwarded-Scheme", "X-Forwarded-Host", "X-Real-IP"};
+    for (size_t i = 0; i < sizeof(to_strip) / sizeof(to_strip[0]); i++) {
+        while (1) {
+            unsigned char *hs = find_header_ci_in(p, header_len, to_strip[i]);
+            if (!hs) break;
+            unsigned char *line_end = (unsigned char *)memchr(hs, '\n', (p + header_len) - hs);
+            if (!line_end) break;
+            line_end += 1; // include the '\n'
+            size_t remove_len = (size_t)(line_end - hs);
+            memmove(hs, line_end, (p + client->len) - line_end);
+            client->len -= remove_len;
+            header_len -= remove_len;
+            headers_end -= (int)remove_len;
+        }
+    }
+
+    strcat(extra_headers, "\r\nX-Real-IP: ");
+    strcat(extra_headers, injected_ip);
+    strcat(extra_headers, "\r\nX-Forwarded-Proto: https");
+    strcat(extra_headers, "\r\nX-Forwarded-Scheme: https");
+
+    const char *host_start = NULL;
+    size_t host_len;
+    find_header(p, header_len, "Host", &host_start, &host_len);
+    char hbuff[1024];
+    if (host_start) {
+        snprintf(hbuff, sizeof(hbuff), "\r\nX-Forwarded-Host: %.*s", (int)host_len, host_start);
+        strcat(extra_headers, hbuff);
+    }
+    strcat(extra_headers, "\r\nForwarded: proto=https");
+    snprintf(hbuff, sizeof(hbuff), "; for=%s", (ff_value && ff_len > 0) ? ff : injected_ip);
+    strcat(extra_headers, hbuff);
+    if (host_start) {
+        snprintf(hbuff, sizeof(hbuff), "; host=%.*s", (int)host_len, host_start);
+        strcat(extra_headers, hbuff);
+    }
+
+    size_t add_len = strlen(extra_headers);
+    // Insert before the CRLFCRLF (headers_end - 4)
+    memmove(p + headers_end - 4 + add_len,
+            p + headers_end - 4,
+            client->len - (size_t)(headers_end - 4));
+    memcpy(p + headers_end - 4, extra_headers, add_len);
+    client->len += add_len;
+    rp_log_debug("Injected buffer:\n%.*s\n", 300, p + (client->len > 300 ? client->len - 300 : 0));
+
+    return true;
 }
 
 static void handle_event(RevPx *revpx, int fd, uint32_t events) {
@@ -737,13 +847,76 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
     }
 
     case ST_READ_HEADER: {
-        // Only try to read if buffer has space
-        if (c->len < sizeof(c->buf)) {
-            int n = do_read(c, c->buf + c->len, sizeof(c->buf) - c->len);
-            if (n > 0) {
-                c->len += n;
-            } else if (n <= 0 && get_error(c, n) != SSL_ERROR_WANT_READ) {
-                int err = get_error(c, n);
+        size_t space = sizeof(c->buf) - c->len;
+        if (space == 0) {
+            rp_log_error("Header too large for fd=%d\n", fd);
+            send_error(revpx, c, 431, "Request Header Fields Too Large");
+            break;
+        }
+
+        int n = do_read(c, c->buf + c->len, space);
+        if (n > 0) {
+            c->len += n;
+            rp_log_debug("Read %d bytes, total header buffer: %zu bytes for fd=%d\n", n, c->len, fd);
+
+            int end = find_headers_end(c->buf, c->len);
+            if (end > 0) {
+                char host[512], target[1024] = "/";
+                extract_host(c->buf, end, host, sizeof(host));
+                extract_target(c->buf, end, target, sizeof(target));
+
+                c->websocket = is_websocket_upgrade_request(c->buf, end);
+                if (c->websocket) {
+                    rp_log_info("websocket upgrade request detected\n");
+                }
+
+                if (!c->ssl) {
+                    send_redirect(revpx, c, host, target, revpx->https_port);
+                    break;
+                }
+
+                RpHostDomain *d = NULL;
+                for (int i = 0; i < revpx->domain_count; i++) {
+                    if (strcasecmp(revpx->domains[i].domain, host) == 0) {
+                        d = &revpx->domains[i];
+                        break;
+                    }
+                }
+                if (!d) {
+                    rp_log_error("Domain not found: %s\n", host);
+                    send_error(revpx, c, 421, "Misdirected Request");
+                    break;
+                }
+                rp_log_info("HTTPS request: https://%s%s -> %s:%s\n", host, target, d->host, d->port);
+
+                int backend = create_backend(d->host, d->port);
+                if (backend < 0) {
+                    rp_log_error("Failed to create backend connection to %s:%s\n", d->host, d->port);
+                    send_error(revpx, c, 502, "Bad Gateway");
+                    break;
+                }
+
+                RpConnection *b = alloc_conn(revpx, backend, NULL, ST_CONNECTING, CT_BACKEND);
+                c->peer = backend;
+                b->peer = fd;
+                c->state = ST_CONNECTING;
+
+                ep_add(revpx, backend, EPOLLOUT | EPOLLET);
+            } else {
+                rp_log_debug("Headers incomplete (%zu bytes), waiting for more data on fd=%d\n", c->len, fd);
+                ep_mod(revpx, fd, EPOLLIN | EPOLLET);
+            }
+        } else if (n == 0) {
+            rp_log_debug("Connection closed during header read fd=%d\n", fd);
+            cleanup(revpx, fd);
+        } else {
+            int err = get_error(c, n);
+            if (err == SSL_ERROR_WANT_READ) {
+                rp_log_debug("SSL_ERROR_WANT_READ on fd=%d, waiting for more data\n", fd);
+            } else if (err == SSL_ERROR_WANT_WRITE) {
+                rp_log_debug("SSL_ERROR_WANT_WRITE on fd=%d\n", fd);
+                ep_mod(revpx, fd, EPOLLOUT | EPOLLIN | EPOLLET);
+            } else {
                 if (err == SSL_ERROR_ZERO_RETURN) {
                     rp_log_error("Connection closed during header read fd=%d\n", fd);
                 } else if (err == SSL_ERROR_SYSCALL) {
@@ -752,63 +925,12 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
                     rp_log_error("Read error during header read fd=%d, error: %d\n", fd, err);
                 }
                 cleanup(revpx, fd);
-                break;
             }
-        }
-
-        int end = find_headers_end(c->buf, c->len);
-        if (end > 0) {
-            char host[512], target[1024] = "/";
-            extract_host(c->buf, end, host, sizeof(host));
-            extract_target(c->buf, end, target, sizeof(target));
-            c->websocket = is_websocket_upgrade_request(c->buf, end);
-            if (c->websocket) {
-                rp_log_info("websocket upgrade request detected\n");
-            }
-
-            if (!c->ssl) {
-                send_redirect(revpx, c, host, target, revpx->https_port);
-                break;
-            }
-
-            RpHostDomain *d = NULL;
-            for (int i = 0; i < revpx->domain_count; i++) {
-                if (strcasecmp(revpx->domains[i].domain, host) == 0) {
-                    d = &revpx->domains[i];
-                    break;
-                }
-            }
-            if (!d) {
-                rp_log_error("Domain not found: %s\n", host);
-                send_error(revpx, c, 421, "Misdirected Request");
-                break;
-            }
-
-            rp_log_info("proxy: %s%s -> %s:%s\n", host, target, d->host, d->port);
-
-            int backend = create_backend(d->host, d->port);
-            if (backend < 0) {
-                rp_log_error("Failed to create backend connection to %s:%s\n", d->host, d->port);
-                send_error(revpx, c, 502, "Bad Gateway");
-                break;
-            }
-
-            RpConnection *b = alloc_conn(revpx, backend, NULL, ST_CONNECTING);
-            c->peer = backend;
-            b->peer = fd;
-            c->state = ST_CONNECTING; // Client waits for backend to connect
-
-            ep_add(revpx, backend, EPOLLOUT | EPOLLET);
-        } else if (c->len >= sizeof(c->buf)) {
-            // Buffer full but headers not complete
-            rp_log_error("Headers too large fd=%d, buffer size: %zu\n", fd, c->len);
-            send_error(revpx, c, 431, "Request Header Fields Too Large");
         }
         break;
     }
 
     case ST_CONNECTING: {
-        // Client side: just wait, do nothing
         if (c->ssl || !(events & EPOLLOUT)) {
             rp_log_debug("ST_CONNECTING: Client side: just wait, do nothing\n");
             break;
@@ -851,6 +973,10 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
         }
 
         if (client->len > 0) {
+            if (client->ssl && !client->websocket) {
+                rp_log_debug("Injecting X-Forwarded headers into SSL client fd=%d to backend fd=%d\n", client->fd, fd);
+                inject_forwarded_headers(client);
+            }
             compact_buffer(c);
             size_t room = buffer_space(c);
             size_t to_copy = client->len <= room ? client->len : room;
@@ -863,12 +989,11 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
                 if (client->len == 0) client->off = 0;
             }
             ep_mod(revpx, fd, EPOLLOUT | EPOLLIN | EPOLLET);
-            ep_mod(revpx, client->fd, client->len > 0 ? EPOLLIN | EPOLLET : EPOLLIN | EPOLLET);
         } else {
             rp_log_debug("Backend fd=%d ready, no data to forward yet\n", fd);
             ep_mod(revpx, fd, EPOLLIN | EPOLLET);
-            ep_mod(revpx, client->fd, EPOLLIN | EPOLLET);
         }
+        ep_mod(revpx, client->fd, EPOLLIN | EPOLLET);
         break;
     }
 
@@ -1133,7 +1258,7 @@ int revpx_run_server(RevPx *revpx) {
                     }
                     SSL_set_accept_state(ssl);
 
-                    RpConnection *c = alloc_conn(revpx, client, ssl, ST_SSL_HANDSHAKE);
+                    RpConnection *c = alloc_conn(revpx, client, ssl, ST_SSL_HANDSHAKE, CT_CLIENT);
                     if (!c) continue;
 
                     int ret = SSL_accept(ssl);
@@ -1156,7 +1281,7 @@ int revpx_run_server(RevPx *revpx) {
                     }
                     set_nonblock(client);
 
-                    RpConnection *c = alloc_conn(revpx, client, NULL, ST_READ_HEADER);
+                    RpConnection *c = alloc_conn(revpx, client, NULL, ST_READ_HEADER, CT_CLIENT);
                     if (c) ep_add(revpx, client, EPOLLIN | EPOLLET);
                 }
             } else {
