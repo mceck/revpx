@@ -694,9 +694,9 @@ static bool find_header(const unsigned char *buf, size_t len, const char *header
 
 static bool inject_forwarded_headers(RpConnection *client) {
     const char injected_ip[] = "127.0.0.1";
-    char extra_headers[1024] = "\r\nConnection: close";
+    char extra_headers[4096] = "\r\nConnection: close";
     if (client->len == 0) return false;
-    unsigned char *p = client->buf + client->off;
+    unsigned char *p = client->buf;
     int headers_end = find_headers_end(p, client->len);
     if (headers_end <= 0) return false;
 
@@ -718,10 +718,10 @@ static bool inject_forwarded_headers(RpConnection *client) {
 
     const char *ff_value;
     size_t ff_len = 0;
-    char ff[256];
+    char ff[512];
     find_header((const unsigned char *)p, header_len, "X-Forwarded-For", &ff_value, &ff_len);
     if (ff_value && ff_len > 0) {
-        strncpy(ff, ff_value, ff_len);
+        strncpy(ff, ff_value, ff_len > sizeof(ff) - 1 ? sizeof(ff) - 1 : ff_len);
         strcat(ff, ", ");
     } else {
         strcpy(ff, injected_ip);
@@ -754,20 +754,23 @@ static bool inject_forwarded_headers(RpConnection *client) {
     const char *host_start = NULL;
     size_t host_len;
     find_header(p, header_len, "Host", &host_start, &host_len);
-    char hbuff[1024];
     if (host_start) {
-        snprintf(hbuff, sizeof(hbuff), "\r\nX-Forwarded-Host: %.*s", (int)host_len, host_start);
-        strcat(extra_headers, hbuff);
+        strcat(extra_headers, "\r\nX-Forwarded-Host: ");
+        strncat(extra_headers, host_start, host_len);
     }
     strcat(extra_headers, "\r\nForwarded: proto=https");
-    snprintf(hbuff, sizeof(hbuff), "; for=%s", (ff_value && ff_len > 0) ? ff : injected_ip);
-    strcat(extra_headers, hbuff);
+    strcat(extra_headers, "; for=");
+    strcat(extra_headers, (ff_value && ff_len > 0) ? ff : injected_ip);
     if (host_start) {
-        snprintf(hbuff, sizeof(hbuff), "; host=%.*s", (int)host_len, host_start);
-        strcat(extra_headers, hbuff);
+        strcat(extra_headers, "; host=");
+        strncat(extra_headers, host_start, host_len);
     }
 
     size_t add_len = strlen(extra_headers);
+    if (client->len + add_len >= sizeof(client->buf)) {
+        rp_log_error("Not enough space to inject headers\n");
+        return false;
+    }
     // Insert before the CRLFCRLF (headers_end - 4)
     memmove(p + headers_end - 4 + add_len,
             p + headers_end - 4,
@@ -975,7 +978,9 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
         if (client->len > 0) {
             if (client->ssl && !client->websocket) {
                 rp_log_debug("Injecting X-Forwarded headers into SSL client fd=%d to backend fd=%d\n", client->fd, fd);
-                inject_forwarded_headers(client);
+                if (!inject_forwarded_headers(client)) {
+                    rp_log_error("Failed to inject X-Forwarded headers for fd=%d\n", client->fd);
+                }
             }
             compact_buffer(c);
             size_t room = buffer_space(c);
