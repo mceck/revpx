@@ -1,4 +1,5 @@
 # revpx
+Tis is just a POC made for fun.
 
 `revpx` is a lightweight, single-threaded reverse proxy server for development purposes.
 
