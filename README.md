@@ -3,7 +3,7 @@ Tis is just a POC made for fun.
 
 `revpx` is a lightweight, single-threaded reverse proxy server for development purposes.
 
-It supports TLS/SSL termination, SNI (Server Name Indication), and can forward traffic to multiple backend services based on the requested domain name.
+It supports TLS/SSL termination, SNI (Server Name Indication), and can forward traffic to multiple backend services based on the requested domain name. You can mount multiple backends on the same domain under different path prefixes and optionally rewrite the prefix away before forwarding.
 
 It is designed to be simple to configure and use.
 
@@ -42,16 +42,13 @@ For more complex setups, you can use a JSON file.
 ```json
 [
   {
-    "domain": "example.com",
-    "port": "8080",
-    "cert_file": "/path/to/example.com.pem",
-    "key_file": "/path/to/example.com-key.pem"
-  },
-  {
-    "domain": "api.example.com",
-    "port": "8081",
-    "cert_file": "/path/to/api.example.com.pem",
-    "key_file": "/path/to/api.example.com-key.pem"
+    "domain": "example.localhost",
+    "cert_file": "example.localhost.pem",
+    "key_file": "example.localhost-key.pem",
+    "routes": [
+      { "path": "/", "port": "8080" },
+      { "path": "/api", "port": "8081", "rewrite": true }
+    ]
   }
 ]
 ```
@@ -86,28 +83,17 @@ cc -o nob nob.c
 
 ```c
 #include "revpx.h"
-/**
- * Create a new RevPx instance.
- */
 RevPx *revpx_create(const char *http_port, const char *https_port);
-/**
- * Add a domain mapping to the reverse proxy.
- */
 bool revpx_add_domain(RevPx *revpx, const char *domain, const char *host, const char *port, const char *cert, const char *key);
-/**
- * Start the reverse proxy server.
- * Listens on https_port for HTTPS and redirects HTTP traffic from http_port to HTTPS.
- */
+bool revpx_add_domain_route(RevPx *revpx, const char *domain, const char *path, const char *host, const char *port, bool rewrite_prefix);
 void revpx_run_server(RevPx *revpx);
-/**
- * Free the RevPx instance and release resources.
- */
 void revpx_free(RevPx *revpx);
 
 // Example usage
 int main() {
     RevPx *revpx = revpx_create("80", "443");
     revpx_add_domain(revpx, "example.localhost", NULL, "8080", "example.localhost.pem", "example.localhost-key.pem");
+    revpx_add_domain_route(revpx, "example.localhost", "/api", NULL, "8081", true);
     revpx_run_server(revpx);
     revpx_free(revpx);
     return 0;
@@ -124,10 +110,16 @@ cargo add --git https://github.com/mceck/revpx.git
 let revpx = revpx::RevPx::default();
 revpx.add_domains(vec![revpx::DomainConfig {
     domain: "example.localhost".to_string(),
-    host: None,
-    port: "8080".to_string(),
+    port: Some("8080".to_string()),
     cert: "example.localhost.pem".to_string(),
     key: "example.localhost-key.pem".to_string(),
+    routes: vec![revpx::RouteConfig {
+        path: "/api".to_string(),
+        port: "8081".to_string(),
+        rewrite: true,
+        ..Default::default()
+    }],
+    ..Default::default()
 }]);
 revpx.run_server();
 ```

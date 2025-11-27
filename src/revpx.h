@@ -26,6 +26,7 @@
 #define RP_BUF_SIZE 32768
 #define RP_MAX_FD 65536
 #define RP_MAX_DOMAINS 128
+#define RP_MAX_ROUTES_PER_DOMAIN 64
 
 enum log_level {
     RP_DEBUG,
@@ -72,6 +73,9 @@ typedef enum {
     CT_BACKEND
 } RpConnectionType;
 
+typedef struct RpHostDomain RpHostDomain;
+typedef struct RpDomainRoute RpDomainRoute;
+
 typedef struct {
     RpConnectionType type;
     int fd;
@@ -95,16 +99,26 @@ typedef struct {
     bool chunk_in_trailer;
     bool chunk_in_ext;
     uint32_t chunk_trailer_window;
+    RpHostDomain *domain;
+    RpDomainRoute *route;
 } RpConnection;
 
-typedef struct {
-    char *domain;
+struct RpDomainRoute {
+    char *path;
+    size_t path_len;
     char *host;
     char *port;
+    bool rewrite;
+};
+
+struct RpHostDomain {
+    char *domain;
     char *cert;
     char *key;
     SSL_CTX *ctx;
-} RpHostDomain;
+    int route_count;
+    RpDomainRoute routes[RP_MAX_ROUTES_PER_DOMAIN];
+};
 
 typedef struct {
     int epfd;
@@ -119,6 +133,7 @@ typedef struct {
 RevPx *revpx_create(const char *http_port, const char *https_port);
 void revpx_free(RevPx *revpx);
 bool revpx_add_domain(RevPx *revpx, const char *domain, const char *host, const char *port, const char *cert, const char *key);
+bool revpx_add_domain_route(RevPx *revpx, const char *domain, const char *path, const char *host, const char *port, bool rewrite);
 int revpx_run_server(RevPx *revpx);
 
 #ifdef REVPX_IMPLEMENTATION
@@ -336,6 +351,102 @@ static void extract_target(const unsigned char *buf, size_t len, char *out, size
     if (n >= max) n = max - 1;
     memcpy(out, sp1, n);
     out[n] = '\0';
+}
+
+static char *normalize_path(const char *path) {
+    char tmp[1024];
+    const char *src = path && *path ? path : "/";
+    size_t len = strlen(src);
+    if (len >= sizeof(tmp)) len = sizeof(tmp) - 1;
+    size_t start = 0;
+    if (src[0] != '/') {
+        tmp[0] = '/';
+        start = 1;
+    }
+    memcpy(tmp + start, src, len);
+    len += start;
+    while (len > 1 && tmp[len - 1] == '/') len--;
+    tmp[len] = '\0';
+    return strdup(tmp);
+}
+
+static bool path_matches_route(const char *target, const RpDomainRoute *route) {
+    if (route->path_len == 1) return true;
+    if (strncmp(target, route->path, route->path_len) != 0) return false;
+    char next = target[route->path_len];
+    return next == '\0' || next == '/' || next == '?' || next == '#';
+}
+
+static RpDomainRoute *choose_route(RpHostDomain *domain, const char *target) {
+    if (!domain || domain->route_count == 0) return NULL;
+    RpDomainRoute *best = NULL;
+    for (int i = 0; i < domain->route_count; i++) {
+        RpDomainRoute *r = &domain->routes[i];
+        if (!path_matches_route(target, r)) continue;
+        if (!best || r->path_len > best->path_len) best = r;
+    }
+    return best;
+}
+
+static RpHostDomain *find_domain(RevPx *revpx, const char *host) {
+    for (int i = 0; i < revpx->domain_count; i++) {
+        if (strcasecmp(revpx->domains[i].domain, host) == 0) return &revpx->domains[i];
+    }
+    return NULL;
+}
+
+static bool build_rewritten_target(const RpDomainRoute *route, const char *target, char *out, size_t max) {
+    if (!route->rewrite || route->path_len == 1) {
+        strncpy(out, target, max - 1);
+        out[max - 1] = '\0';
+        return true;
+    }
+    if (!path_matches_route(target, route)) return false;
+    const char *suffix = target + route->path_len;
+    if (*suffix == '\0') {
+        strncpy(out, "/", max - 1);
+        out[max - 1] = '\0';
+        return true;
+    }
+    if (*suffix == '?' || *suffix == '#') {
+        if (max < 2) return false;
+        out[0] = '/';
+        size_t copy_len = strlen(suffix);
+        if (copy_len > max - 2) copy_len = max - 2;
+        memcpy(out + 1, suffix, copy_len);
+        out[1 + copy_len] = '\0';
+        return true;
+    }
+    strncpy(out, suffix, max - 1);
+    out[max - 1] = '\0';
+    return true;
+}
+
+static bool rewrite_request_target(RpConnection *conn, const char *new_target) {
+    unsigned char *start = conn->buf + conn->off;
+    size_t len = conn->len;
+    const unsigned char *line_end = memchr(start, '\n', len);
+    if (!line_end) return false;
+    const unsigned char *sp1 = memchr(start, ' ', line_end - start);
+    if (!sp1) return false;
+    sp1++;
+    const unsigned char *sp2 = memchr(sp1, ' ', line_end - sp1);
+    if (!sp2) return false;
+    size_t old_len = (size_t)(sp2 - sp1);
+    size_t new_len = strlen(new_target);
+    if (new_len > old_len) {
+        size_t extra = new_len - old_len;
+        if (conn->len + extra > sizeof(conn->buf)) return false;
+        memmove((unsigned char *)sp2 + extra, sp2, conn->len - (size_t)(sp2 - start));
+        conn->len += extra;
+    } else if (new_len < old_len) {
+        size_t delta = old_len - new_len;
+        memmove((unsigned char *)sp2 - delta, sp2, conn->len - (size_t)(sp2 - start));
+        conn->len -= delta;
+        sp2 -= delta;
+    }
+    memcpy((unsigned char *)sp1, new_target, new_len);
+    return true;
 }
 
 static bool is_websocket_upgrade_request(const unsigned char *buf, size_t len) {
@@ -939,6 +1050,65 @@ static bool inject_forwarded_headers(RpConnection *conn, int source_fd) {
     return true;
 }
 
+static RpConnection *switch_backend(RevPx *revpx, RpConnection *client, RpConnection *backend, RpHostDomain *domain, RpDomainRoute *route) {
+    unsigned char saved_buf[RP_BUF_SIZE];
+    size_t saved_len = backend ? backend->len : 0;
+    size_t saved_off = backend ? backend->off : 0;
+    bool req_need_header = backend ? backend->req_need_header : true;
+    bool req_parsing_header = backend ? backend->req_parsing_header : true;
+    bool req_chunked = backend ? backend->req_chunked : false;
+    size_t req_body_left = backend ? backend->req_body_left : 0;
+    size_t chunk_left = backend ? backend->chunk_left : 0;
+    size_t chunk_size_acc = backend ? backend->chunk_size_acc : 0;
+    int chunk_line_len = backend ? backend->chunk_line_len : 0;
+    bool chunk_expect_crlf = backend ? backend->chunk_expect_crlf : false;
+    bool chunk_in_trailer = backend ? backend->chunk_in_trailer : false;
+    bool chunk_in_ext = backend ? backend->chunk_in_ext : false;
+    uint32_t chunk_trailer_window = backend ? backend->chunk_trailer_window : 0;
+
+    if (backend && saved_len > 0) memcpy(saved_buf, backend->buf + saved_off, saved_len);
+
+    if (backend) {
+        int old_fd = backend->fd;
+        client->peer = -1;
+        backend->peer = -1;
+        cleanup(revpx, old_fd);
+    }
+
+    int fd = create_backend(route->host, route->port);
+    if (fd < 0) return NULL;
+
+    RpConnection *new_backend = alloc_conn(revpx, fd, NULL, ST_CONNECTING, CT_BACKEND);
+    if (!new_backend) return NULL;
+
+    new_backend->peer = client->fd;
+    client->peer = fd;
+    new_backend->domain = domain;
+    new_backend->route = route;
+    client->domain = domain;
+    client->route = route;
+
+    new_backend->req_need_header = req_need_header;
+    new_backend->req_parsing_header = req_parsing_header;
+    new_backend->req_chunked = req_chunked;
+    new_backend->req_body_left = req_body_left;
+    new_backend->chunk_left = chunk_left;
+    new_backend->chunk_size_acc = chunk_size_acc;
+    new_backend->chunk_line_len = chunk_line_len;
+    new_backend->chunk_expect_crlf = chunk_expect_crlf;
+    new_backend->chunk_in_trailer = chunk_in_trailer;
+    new_backend->chunk_in_ext = chunk_in_ext;
+    new_backend->chunk_trailer_window = chunk_trailer_window;
+
+    new_backend->off = 0;
+    new_backend->len = saved_len;
+    if (saved_len > 0) memcpy(new_backend->buf, saved_buf, saved_len);
+
+    ep_add(revpx, fd, EPOLLOUT | EPOLLET);
+    client->state = ST_CONNECTING;
+    return new_backend;
+}
+
 static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnection *backend, const unsigned char *data, size_t n) {
     while (n > 0) {
         if (backend->req_need_header && !backend->req_parsing_header) backend->req_parsing_header = true;
@@ -976,6 +1146,48 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
                     backend->off = 0;
                 }
                 end = find_headers_end(backend->buf, backend->len);
+                char host[512], target[1024] = "/";
+                extract_host(backend->buf, end, host, sizeof(host));
+                extract_target(backend->buf, end, target, sizeof(target));
+                RpHostDomain *domain = client->domain;
+                if (host[0]) domain = find_domain(revpx, host);
+                if (!domain && revpx->domain_count > 0) domain = &revpx->domains[0];
+                if (!domain) {
+                    send_error(revpx, client, 421, "Misdirected Request");
+                    cleanup(revpx, backend->fd);
+                    return false;
+                }
+                RpDomainRoute *route = choose_route(domain, target);
+                if (!route) {
+                    send_error(revpx, client, 404, "Not Found");
+                    cleanup(revpx, backend->fd);
+                    return false;
+                }
+                if (route->rewrite) {
+                    char rewritten[1024];
+                    if (!build_rewritten_target(route, target, rewritten, sizeof(rewritten)) || !rewrite_request_target(backend, rewritten)) {
+                        send_error(revpx, client, 400, "Bad Request");
+                        cleanup(revpx, backend->fd);
+                        return false;
+                    }
+                    strncpy(target, rewritten, sizeof(target) - 1);
+                    target[sizeof(target) - 1] = '\0';
+                    end = find_headers_end(backend->buf, backend->len);
+                }
+                if (backend->route != route || backend->domain != domain) {
+                    backend = switch_backend(revpx, client, backend, domain, route);
+                    if (!backend) {
+                        send_error(revpx, client, 502, "Bad Gateway");
+                        cleanup(revpx, client->fd);
+                        return false;
+                    }
+                    end = find_headers_end(backend->buf, backend->len);
+                } else {
+                    backend->domain = domain;
+                    backend->route = route;
+                    client->domain = domain;
+                    client->route = route;
+                }
                 if (!inject_forwarded_headers(backend, client->fd)) {
                     send_error(revpx, client, 400, "Bad Request");
                     cleanup(revpx, backend->fd);
@@ -1233,23 +1445,23 @@ skip_flush:
                     break;
                 }
 
-                RpHostDomain *d = NULL;
-                for (int i = 0; i < revpx->domain_count; i++) {
-                    if (strcasecmp(revpx->domains[i].domain, host) == 0) {
-                        d = &revpx->domains[i];
-                        break;
-                    }
-                }
+                RpHostDomain *d = find_domain(revpx, host);
                 if (!d) {
                     rp_log_error("Domain not found: %s\n", host);
                     send_error(revpx, c, 421, "Misdirected Request");
                     break;
                 }
-                rp_log_info("HTTPS request: https://%s%s -> %s:%s\n", host, target, d->host, d->port);
+                RpDomainRoute *route = choose_route(d, target);
+                if (!route) {
+                    rp_log_error("No route matched for %s%s\n", host, target);
+                    send_error(revpx, c, 404, "Not Found");
+                    break;
+                }
+                rp_log_info("HTTPS request: https://%s%s -> %s:%s (%s, %s)\n", host, target, route->host, route->port, route->path, route->rewrite ? "rewrite" : "preserve");
 
-                int backend = create_backend(d->host, d->port);
+                int backend = create_backend(route->host, route->port);
                 if (backend < 0) {
-                    rp_log_error("Failed to create backend connection to %s:%s\n", d->host, d->port);
+                    rp_log_error("Failed to create backend connection to %s:%s\n", route->host, route->port);
                     send_error(revpx, c, 502, "Bad Gateway");
                     break;
                 }
@@ -1258,6 +1470,10 @@ skip_flush:
                 c->peer = backend;
                 b->peer = fd;
                 c->state = ST_CONNECTING;
+                c->domain = d;
+                c->route = route;
+                b->domain = d;
+                b->route = route;
 
                 ep_add(revpx, backend, EPOLLOUT | EPOLLET);
             } else {
@@ -1515,22 +1731,82 @@ static int create_listener(const char *port) {
     return fd;
 }
 
+static bool add_route_to_domain(RpHostDomain *d, const char *path, const char *host, const char *port, bool rewrite) {
+    if (!port || !*port) {
+        rp_log_error("Route for %s requires a port\n", d->domain);
+        return false;
+    }
+    if (d->route_count >= RP_MAX_ROUTES_PER_DOMAIN) {
+        rp_log_error("Maximum number of routes reached for %s\n", d->domain);
+        return false;
+    }
+    char *norm = normalize_path(path);
+    if (!norm) return false;
+    RpDomainRoute *r = &d->routes[d->route_count];
+    r->path = norm;
+    r->path_len = strlen(norm);
+    r->host = strdup(host && host[0] ? host : RP_DEFAULT_BACKEND_HOST);
+    r->port = strdup(port);
+    r->rewrite = rewrite;
+    if (!r->host || !r->port) {
+        if (r->path) free(r->path);
+        if (r->host) free(r->host);
+        if (r->port) free(r->port);
+        r->path = NULL;
+        r->host = NULL;
+        r->port = NULL;
+        return false;
+    }
+    d->route_count++;
+    return true;
+}
+
 bool revpx_add_domain(RevPx *revpx, const char *domain, const char *host, const char *port, const char *cert, const char *key) {
     if (revpx->domain_count >= RP_MAX_DOMAINS) {
         rp_log_error("Maximum number of domains reached\n");
         return false;
     }
-    RpHostDomain *d = &revpx->domains[revpx->domain_count++];
+    for (int i = 0; i < revpx->domain_count; i++) {
+        if (strcasecmp(revpx->domains[i].domain, domain) == 0) {
+            rp_log_error("Domain already configured: %s\n", domain);
+            return false;
+        }
+    }
+    RpHostDomain *d = &revpx->domains[revpx->domain_count];
+    memset(d, 0, sizeof(*d));
     d->domain = strdup(domain);
-    if (host && host[0])
-        d->host = strdup(host);
-    else
-        d->host = strdup(RP_DEFAULT_BACKEND_HOST);
-    d->port = strdup(port);
     d->cert = strdup(cert);
     d->key = strdup(key);
     d->ctx = NULL;
+    d->route_count = 0;
+    if (!d->domain || !d->cert || !d->key) {
+        if (d->domain) free(d->domain);
+        if (d->cert) free(d->cert);
+        if (d->key) free(d->key);
+        return false;
+    }
+    if (port && *port) {
+        if (!add_route_to_domain(d, "/", host && host[0] ? host : RP_DEFAULT_BACKEND_HOST, port, false)) {
+            free(d->domain);
+            free(d->cert);
+            free(d->key);
+            d->domain = NULL;
+            d->cert = NULL;
+            d->key = NULL;
+            return false;
+        }
+    }
+    revpx->domain_count++;
     return true;
+}
+
+bool revpx_add_domain_route(RevPx *revpx, const char *domain, const char *path, const char *host, const char *port, bool rewrite) {
+    RpHostDomain *d = find_domain(revpx, domain);
+    if (!d) {
+        rp_log_error("Domain not found for route: %s\n", domain);
+        return false;
+    }
+    return add_route_to_domain(d, path, host, port, rewrite);
 }
 
 void print_art() {
@@ -1546,7 +1822,15 @@ void print_proxy_domains(RevPx *revpx) {
     printf("\nDomains:\n");
     for (int i = 0; i < revpx->domain_count; i++) {
         RpHostDomain *d = &revpx->domains[i];
-        printf("https://%-32s -> %s:%s\n", d->domain, strcmp(d->host, RP_DEFAULT_BACKEND_HOST) ? d->host : "", d->port);
+        if (d->route_count == 0) {
+            printf("https://%-32s -> <no routes>\n", d->domain);
+            continue;
+        }
+        for (int r = 0; r < d->route_count; r++) {
+            RpDomainRoute *route = &d->routes[r];
+            const char *host = strcmp(route->host, RP_DEFAULT_BACKEND_HOST) ? route->host : "";
+            printf("https://%s%-24s -> %s:%s [%s]\n", d->domain, route->path, host, route->port, route->rewrite ? "rewrite" : "preserve");
+        }
     }
     printf("\n");
 }
@@ -1554,6 +1838,13 @@ void print_proxy_domains(RevPx *revpx) {
 int revpx_run_server(RevPx *revpx) {
     print_art();
     print_proxy_domains(revpx);
+
+    for (int i = 0; i < revpx->domain_count; i++) {
+        if (revpx->domains[i].route_count == 0) {
+            rp_log_error("Domain %s has no routes configured\n", revpx->domains[i].domain);
+            return -1;
+        }
+    }
 
     signal(SIGPIPE, SIG_IGN);
     SSL_library_init();
@@ -1727,10 +2018,14 @@ void revpx_free(RevPx *revpx) {
         RpHostDomain *d = &revpx->domains[i];
         if (d->ctx) SSL_CTX_free(d->ctx);
         if (d->domain) free(d->domain);
-        if (d->port) free(d->port);
         if (d->cert) free(d->cert);
         if (d->key) free(d->key);
-        if (d->host) free(d->host);
+        for (int r = 0; r < d->route_count; r++) {
+            RpDomainRoute *route = &d->routes[r];
+            if (route->path) free(route->path);
+            if (route->host) free(route->host);
+            if (route->port) free(route->port);
+        }
     }
     free(revpx);
 }

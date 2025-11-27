@@ -115,7 +115,16 @@ int parse_config_file(RevPx *revpx, const char *config_file) {
             ret = 1;
             goto cleanup;
         }
-        char domain[256], host[256], port[16], cert_file[512], key_file[512];
+        char domain[256] = "";
+        char host[256] = "";
+        char port[16] = "";
+        char cert_file[512] = "";
+        char key_file[512] = "";
+        char route_paths[RP_MAX_ROUTES_PER_DOMAIN][256] = {{0}};
+        char route_hosts[RP_MAX_ROUTES_PER_DOMAIN][256] = {{0}};
+        char route_ports[RP_MAX_ROUTES_PER_DOMAIN][16] = {{0}};
+        bool route_rewrite[RP_MAX_ROUTES_PER_DOMAIN] = {0};
+        int route_count = 0;
         while (jsp_key(&jsp) == 0) {
             if (strcmp(jsp.string, "domain") == 0) {
                 if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) {
@@ -123,31 +132,124 @@ int parse_config_file(RevPx *revpx, const char *config_file) {
                     ret = 1;
                     goto cleanup;
                 }
-                strcpy(domain, jsp.string);
+                strncpy(domain, jsp.string, sizeof(domain) - 1);
+                domain[sizeof(domain) - 1] = '\0';
             } else if (strcmp(jsp.string, "port") == 0) {
                 if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) {
                     rp_log_error("Invalid 'port' value in object %d in config file %s\n", i, config_file);
                     ret = 1;
                     goto cleanup;
                 }
-                strcpy(port, jsp.string);
+                strncpy(port, jsp.string, sizeof(port) - 1);
+                port[sizeof(port) - 1] = '\0';
             } else if (strcmp(jsp.string, "cert_file") == 0) {
                 if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) {
                     rp_log_error("Invalid 'cert_file' value in object %d in config file %s\n", i, config_file);
                     ret = 1;
                     goto cleanup;
                 }
-                strcpy(cert_file, jsp.string);
+                strncpy(cert_file, jsp.string, sizeof(cert_file) - 1);
+                cert_file[sizeof(cert_file) - 1] = '\0';
             } else if (strcmp(jsp.string, "key_file") == 0) {
                 if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) {
                     rp_log_error("Invalid 'key_file' value in object %d in config file %s\n", i, config_file);
                     ret = 1;
                     goto cleanup;
                 }
-                strcpy(key_file, jsp.string);
+                strncpy(key_file, jsp.string, sizeof(key_file) - 1);
+                key_file[sizeof(key_file) - 1] = '\0';
             } else if (strcmp(jsp.string, "host") == 0) {
                 if (jsp_value(&jsp) == 0 && jsp.type == JSP_TYPE_STRING) {
-                    strcpy(host, jsp.string);
+                    strncpy(host, jsp.string, sizeof(host) - 1);
+                    host[sizeof(host) - 1] = '\0';
+                }
+            } else if (strcmp(jsp.string, "routes") == 0) {
+                if (jsp_begin_array(&jsp) != 0) {
+                    rp_log_error("Invalid 'routes' array in object %d in config file %s\n", i, config_file);
+                    ret = 1;
+                    goto cleanup;
+                }
+                int rlen = jsp_array_length(&jsp);
+                if (rlen < 0) {
+                    rp_log_error("Invalid 'routes' array length in object %d in config file %s\n", i, config_file);
+                    ret = 1;
+                    goto cleanup;
+                }
+                for (int r = 0; r < rlen; r++) {
+                    if (jsp_begin_object(&jsp) != 0) {
+                        rp_log_error("Invalid route %d in object %d in config file %s\n", r, i, config_file);
+                        ret = 1;
+                        goto cleanup;
+                    }
+                    char rpath[256] = "/";
+                    char rhost[256] = "";
+                    char rport[16] = "";
+                    bool rewrite = false;
+                    while (jsp_key(&jsp) == 0) {
+                        if (strcmp(jsp.string, "path") == 0) {
+                            if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) {
+                                rp_log_error("Invalid route 'path' in object %d in config file %s\n", i, config_file);
+                                ret = 1;
+                                goto cleanup;
+                            }
+                            strncpy(rpath, jsp.string, sizeof(rpath) - 1);
+                            rpath[sizeof(rpath) - 1] = '\0';
+                        } else if (strcmp(jsp.string, "port") == 0) {
+                            if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) {
+                                rp_log_error("Invalid route 'port' in object %d in config file %s\n", i, config_file);
+                                ret = 1;
+                                goto cleanup;
+                            }
+                            strncpy(rport, jsp.string, sizeof(rport) - 1);
+                            rport[sizeof(rport) - 1] = '\0';
+                        } else if (strcmp(jsp.string, "host") == 0) {
+                            if (jsp_value(&jsp) == 0 && jsp.type == JSP_TYPE_STRING) {
+                                strncpy(rhost, jsp.string, sizeof(rhost) - 1);
+                                rhost[sizeof(rhost) - 1] = '\0';
+                            }
+                        } else if (strcmp(jsp.string, "rewrite") == 0) {
+                            if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_BOOLEAN) {
+                                rp_log_error("Invalid route 'rewrite' in object %d in config file %s\n", i, config_file);
+                                ret = 1;
+                                goto cleanup;
+                            }
+                            rewrite = jsp.boolean;
+                        } else {
+                            if (jsp_skip(&jsp) != 0) {
+                                rp_log_error("Failed to skip unknown route key '%s' in object %d in config file %s\n", jsp.string, i, config_file);
+                                ret = 1;
+                                goto cleanup;
+                            }
+                        }
+                    }
+                    if (jsp_end_object(&jsp) != 0) {
+                        rp_log_error("Failed to end route %d in object %d in config file %s\n", r, i, config_file);
+                        ret = 1;
+                        goto cleanup;
+                    }
+                    if (!rport[0]) {
+                        rp_log_error("Missing route port in object %d in config file %s\n", i, config_file);
+                        ret = 1;
+                        goto cleanup;
+                    }
+                    if (route_count >= RP_MAX_ROUTES_PER_DOMAIN) {
+                        rp_log_error("Too many routes in object %d in config file %s\n", i, config_file);
+                        ret = 1;
+                        goto cleanup;
+                    }
+                    strncpy(route_paths[route_count], rpath, sizeof(route_paths[route_count]) - 1);
+                    route_paths[route_count][sizeof(route_paths[route_count]) - 1] = '\0';
+                    strncpy(route_hosts[route_count], rhost, sizeof(route_hosts[route_count]) - 1);
+                    route_hosts[route_count][sizeof(route_hosts[route_count]) - 1] = '\0';
+                    strncpy(route_ports[route_count], rport, sizeof(route_ports[route_count]) - 1);
+                    route_ports[route_count][sizeof(route_ports[route_count]) - 1] = '\0';
+                    route_rewrite[route_count] = rewrite;
+                    route_count++;
+                }
+                if (jsp_end_array(&jsp) != 0) {
+                    rp_log_error("Failed to end 'routes' array in object %d in config file %s\n", i, config_file);
+                    ret = 1;
+                    goto cleanup;
                 }
             } else {
                 // Unknown key; skip its value
@@ -163,7 +265,35 @@ int parse_config_file(RevPx *revpx, const char *config_file) {
             ret = 1;
             goto cleanup;
         }
-        revpx_add_domain(revpx, domain, host, port, cert_file, key_file);
+        if (!domain[0] || !cert_file[0] || !key_file[0]) {
+            rp_log_error("Missing required fields in object %d in config file %s\n", i, config_file);
+            ret = 1;
+            goto cleanup;
+        }
+        bool add_default_route = port[0] != '\0';
+        if (add_default_route) {
+            for (int r = 0; r < route_count; r++) {
+                if (strcmp(route_paths[r], "/") == 0 || route_paths[r][0] == '\0') {
+                    add_default_route = false;
+                    break;
+                }
+            }
+        }
+        if (!revpx_add_domain(revpx, domain, add_default_route ? host : "", add_default_route ? port : "", cert_file, key_file)) {
+            ret = 1;
+            goto cleanup;
+        }
+        if (!add_default_route && route_count == 0) {
+            rp_log_error("Domain %s has no routes in config file %s\n", domain, config_file);
+            ret = 1;
+            goto cleanup;
+        }
+        for (int r = 0; r < route_count; r++) {
+            if (!revpx_add_domain_route(revpx, domain, route_paths[r], route_hosts[r], route_ports[r], route_rewrite[r])) {
+                ret = 1;
+                goto cleanup;
+            }
+        }
     }
     jsp_end_array(&jsp);
 cleanup:
@@ -283,7 +413,7 @@ int parse_args(RevPx *revpx, int argc, const char **argv) {
         if (positional_arg(&args)) {
             buf[idx++] = args.value;
             if (idx == 4) {
-                revpx_add_domain(revpx, buf[0], NULL, buf[1], buf[2], buf[3]);
+                if (!revpx_add_domain(revpx, buf[0], NULL, buf[1], buf[2], buf[3])) return 1;
                 idx = 0;
             }
         }

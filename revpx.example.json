@@ -1,8 +1,11 @@
 [
   {
     "domain": "example.localhost",
-    "port": "8080",
     "cert_file": "example.localhost.pem",
-    "key_file": "example.localhost-key.pem"
+    "key_file": "example.localhost-key.pem",
+    "routes": [
+      { "path": "/", "port": "8080" },
+      { "path": "/api", "port": "8081", "rewrite": true }
+    ]
   }
 ]
