@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <ctype.h>
 #include <signal.h>
@@ -84,12 +85,16 @@ typedef struct {
     bool read_stalled;
     bool websocket;
     bool req_need_header;
+    bool req_parsing_header;
     bool req_chunked;
     size_t req_body_left;
     size_t chunk_left;
     size_t chunk_size_acc;
     int chunk_line_len;
     bool chunk_expect_crlf;
+    bool chunk_in_trailer;
+    bool chunk_in_ext;
+    uint32_t chunk_trailer_window;
 } RpConnection;
 
 typedef struct {
@@ -292,8 +297,18 @@ static void extract_host(const unsigned char *buf, size_t len, char *out, size_t
             memcpy(out, p, n);
             out[n] = '\0';
 
-            char *colon = strchr(out, ':');
-            if (colon) *colon = '\0';
+            if (n > 0 && out[0] == '[') {
+                char *endb = memchr(out, ']', n);
+                if (endb && endb > out + 1) {
+                    size_t host_len = (size_t)(endb - out - 1);
+                    if (host_len >= max) host_len = max - 1;
+                    memmove(out, out + 1, host_len);
+                    out[host_len] = '\0';
+                    return;
+                }
+            }
+            char *colon = strrchr(out, ':');
+            if (colon && !strchr(colon + 1, ':')) *colon = '\0';
             return;
         }
         p = nl + 1;
@@ -399,6 +414,9 @@ static SSL_CTX *get_ctx(RevPx *revpx, const char *host) {
                         ERR_error_string_n(ssl_err, err_buf, sizeof(err_buf));
                         rp_log_error("SSL error: %s\n", err_buf);
                     }
+                    SSL_CTX_free(d->ctx);
+                    d->ctx = NULL;
+                    return NULL;
                 }
                 if (SSL_CTX_use_PrivateKey_file(d->ctx, d->key, SSL_FILETYPE_PEM) <= 0) {
                     rp_log_error("Failed to load private key file %s for domain %s\n", d->key, host);
@@ -408,6 +426,15 @@ static SSL_CTX *get_ctx(RevPx *revpx, const char *host) {
                         ERR_error_string_n(ssl_err, err_buf, sizeof(err_buf));
                         rp_log_error("SSL error: %s\n", err_buf);
                     }
+                    SSL_CTX_free(d->ctx);
+                    d->ctx = NULL;
+                    return NULL;
+                }
+                if (SSL_CTX_check_private_key(d->ctx) != 1) {
+                    rp_log_error("Invalid private key for domain %s\n", host);
+                    SSL_CTX_free(d->ctx);
+                    d->ctx = NULL;
+                    return NULL;
                 }
                 SSL_CTX_set_mode(d->ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
             }
@@ -422,6 +449,9 @@ static int sni_callback(SSL *ssl, int *ad, void *arg) {
     RevPx *revpx = (RevPx *)arg;
     const char *name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
     SSL_CTX *ctx = name ? get_ctx(revpx, name) : NULL;
+    if (!ctx && revpx->domain_count > 0) {
+        ctx = get_ctx(revpx, revpx->domains[0].domain);
+    }
     if (ctx) SSL_set_SSL_CTX(ssl, ctx);
     return SSL_TLSEXT_ERR_OK;
 }
@@ -717,6 +747,95 @@ static bool has_chunked_encoding(const unsigned char *buf, size_t len) {
     return false;
 }
 
+static int hex_value(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static ssize_t advance_chunked(RpConnection *backend, const unsigned char *data, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        if (backend->chunk_expect_crlf) {
+            unsigned char expected = backend->chunk_line_len == 0 ? '\r' : '\n';
+            if (data[i] != expected) return -1;
+            backend->chunk_line_len++;
+            i++;
+            if (backend->chunk_line_len == 2) {
+                backend->chunk_expect_crlf = false;
+                backend->chunk_line_len = 0;
+            }
+            continue;
+        }
+
+        if (backend->chunk_left > 0) {
+            size_t take = backend->chunk_left < n - i ? backend->chunk_left : n - i;
+            backend->chunk_left -= take;
+            i += take;
+            if (backend->chunk_left == 0) {
+                backend->chunk_expect_crlf = true;
+                backend->chunk_line_len = 0;
+            }
+            continue;
+        }
+
+        if (backend->chunk_in_trailer) {
+            backend->chunk_trailer_window = (backend->chunk_trailer_window << 8) | data[i];
+            backend->chunk_trailer_window &= 0xffffffffu;
+            i++;
+            if (backend->chunk_trailer_window == 0x0d0a0d0a) {
+                backend->req_chunked = false;
+                backend->req_need_header = true;
+                backend->chunk_in_trailer = false;
+                backend->chunk_trailer_window = 0;
+                backend->chunk_size_acc = 0;
+                backend->chunk_line_len = 0;
+                backend->chunk_expect_crlf = false;
+                backend->chunk_in_ext = false;
+                backend->chunk_left = 0;
+                return (ssize_t)i;
+            }
+            continue;
+        }
+
+        unsigned char ch = data[i++];
+        if (ch == '\r') continue;
+        if (ch == '\n') {
+            backend->chunk_left = backend->chunk_size_acc;
+            backend->chunk_size_acc = 0;
+            backend->chunk_line_len = 0;
+            backend->chunk_in_ext = false;
+            if (backend->chunk_left == 0) {
+                backend->chunk_in_trailer = true;
+                backend->chunk_trailer_window = 0;
+            }
+            continue;
+        }
+        if (ch == ';' || ch == ' ' || ch == '\t') {
+            backend->chunk_in_ext = true;
+            continue;
+        }
+        if (backend->chunk_in_ext) continue;
+        if (backend->chunk_line_len >= 16) return -1;
+        int hv = hex_value(ch);
+        if (hv < 0) return -1;
+        backend->chunk_size_acc = (backend->chunk_size_acc << 4) | (size_t)hv;
+        backend->chunk_line_len++;
+    }
+    return (ssize_t)n;
+}
+
+static bool append_header(char *dst, size_t dst_size, size_t *used, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(dst + *used, dst_size - *used, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= dst_size - *used) return false;
+    *used += (size_t)n;
+    return true;
+}
+
 static void fill_peer_ip(int fd, char *out, size_t max) {
     if (max == 0) return;
     out[0] = '\0';
@@ -741,26 +860,13 @@ static bool inject_forwarded_headers(RpConnection *conn, int source_fd) {
     char injected_ip[INET6_ADDRSTRLEN];
     fill_peer_ip(source_fd, injected_ip, sizeof(injected_ip));
     char extra_headers[4096] = "";
+    size_t extra_len = 0;
     if (conn->len == 0) return false;
     unsigned char *p = conn->buf;
     int headers_end = find_headers_end(p, conn->len);
     if (headers_end <= 0) return false;
 
     size_t header_len = (size_t)headers_end;
-
-    char method[16] = "GET"; // Default method
-    const char *end = memchr((char *)p, '\n', header_len);
-    if (end) {
-        const char *space = memchr((char *)p, ' ', end - (char *)p);
-        if (space) {
-            size_t method_len = (size_t)(space - (char *)p);
-            if (method_len > 0 && method_len < sizeof(method)) {
-                memset(method, 0, sizeof(method));
-                memcpy(method, p, method_len);
-                rp_log_debug("Extracted method: %s\n", method);
-            }
-        }
-    }
 
     const char *ff_value;
     size_t ff_len = 0;
@@ -770,13 +876,20 @@ static bool inject_forwarded_headers(RpConnection *conn, int source_fd) {
         size_t copy_len = ff_len >= sizeof(ff) ? sizeof(ff) - 1 : ff_len;
         memcpy(ff, ff_value, copy_len);
         ff[copy_len] = '\0';
-        size_t cur_len = strlen(ff);
-        if (cur_len < sizeof(ff) - 3) strcat(ff, ", ");
+        size_t used = strlen(ff);
+        if (used < sizeof(ff) - 2) {
+            ff[used++] = ',';
+            ff[used++] = ' ';
+        }
+        size_t ip_len = strlen(injected_ip);
+        if (used + ip_len >= sizeof(ff)) ip_len = sizeof(ff) - used - 1;
+        memcpy(ff + used, injected_ip, ip_len);
+        ff[used + ip_len] = '\0';
     } else {
-        strcpy(ff, injected_ip);
+        strncpy(ff, injected_ip, sizeof(ff) - 1);
+        ff[sizeof(ff) - 1] = '\0';
     }
-    strcat(extra_headers, "\r\nX-Forwarded-For: ");
-    strcat(extra_headers, ff);
+    if (!append_header(extra_headers, sizeof(extra_headers), &extra_len, "\r\nX-Forwarded-For: %s", ff)) return false;
 
     const char *to_strip[] = {"Forwarded", "X-Forwarded-For",
                               "X-Forwarded-Proto", "X-Forwarded-Scheme", "X-Forwarded-Host", "X-Real-IP"};
@@ -795,47 +908,48 @@ static bool inject_forwarded_headers(RpConnection *conn, int source_fd) {
         }
     }
 
-    strcat(extra_headers, "\r\nX-Real-IP: ");
-    strcat(extra_headers, injected_ip);
-    strcat(extra_headers, "\r\nX-Forwarded-Proto: https");
-    strcat(extra_headers, "\r\nX-Forwarded-Scheme: https");
+    if (!append_header(extra_headers, sizeof(extra_headers), &extra_len, "\r\nX-Real-IP: %s", injected_ip)) return false;
+    if (!append_header(extra_headers, sizeof(extra_headers), &extra_len, "\r\nX-Forwarded-Proto: https")) return false;
+    if (!append_header(extra_headers, sizeof(extra_headers), &extra_len, "\r\nX-Forwarded-Scheme: https")) return false;
 
     const char *host_start = NULL;
     size_t host_len;
     find_header(p, header_len, "Host", &host_start, &host_len);
-    if (host_start) {
-        strcat(extra_headers, "\r\nX-Forwarded-Host: ");
-        strncat(extra_headers, host_start, host_len);
+    if (host_start && host_len > 0) {
+        int host_copy = (int)(host_len > 1024 ? 1024 : host_len);
+        if (!append_header(extra_headers, sizeof(extra_headers), &extra_len, "\r\nX-Forwarded-Host: %.*s", host_copy, host_start)) return false;
     }
-    strcat(extra_headers, "\r\nForwarded: proto=https");
-    strcat(extra_headers, "; for=");
-    strcat(extra_headers, (ff_value && ff_len > 0) ? ff : injected_ip);
-    if (host_start) {
-        strcat(extra_headers, "; host=");
-        strncat(extra_headers, host_start, host_len);
+    if (!append_header(extra_headers, sizeof(extra_headers), &extra_len, "\r\nForwarded: proto=https; for=%s", (ff_value && ff_len > 0) ? ff : injected_ip)) return false;
+    if (host_start && host_len > 0) {
+        int host_copy = (int)(host_len > 1024 ? 1024 : host_len);
+        if (!append_header(extra_headers, sizeof(extra_headers), &extra_len, "; host=%.*s", host_copy, host_start)) return false;
     }
 
-    size_t add_len = strlen(extra_headers);
-    if (conn->len + add_len >= sizeof(conn->buf)) {
+    if (conn->len + extra_len >= sizeof(conn->buf)) {
         rp_log_error("Not enough space to inject headers\n");
         return false;
     }
     // Insert before the CRLFCRLF (headers_end - 4)
-    memmove(p + headers_end - 4 + add_len,
+    memmove(p + headers_end - 4 + extra_len,
             p + headers_end - 4,
             conn->len - (size_t)(headers_end - 4));
-    memcpy(p + headers_end - 4, extra_headers, add_len);
-    conn->len += add_len;
-    rp_log_debug("Injected buffer:\n%.*s\n", 300, p + (conn->len > 300 ? conn->len - 300 : 0));
+    memcpy(p + headers_end - 4, extra_headers, extra_len);
+    conn->len += extra_len;
 
     return true;
 }
 
 static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnection *backend, const unsigned char *data, size_t n) {
     while (n > 0) {
-        if (backend->req_need_header) compact_buffer(backend);
+        if (backend->req_need_header && !backend->req_parsing_header) backend->req_parsing_header = true;
+        if (backend->req_parsing_header) compact_buffer(backend);
         size_t space = buffer_space(backend);
         if (space == 0) {
+            if (backend->req_parsing_header) {
+                send_error(revpx, client, 431, "Request Header Fields Too Large");
+                cleanup(revpx, backend->fd);
+                return false;
+            }
             if (!client->read_stalled) {
                 client->read_stalled = true;
                 uint32_t ev = client->len > 0 ? (EPOLLOUT | EPOLLET) : 0;
@@ -845,12 +959,16 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
             return true;
         }
         size_t to_copy = n < space ? n : space;
+        if (!backend->req_parsing_header && !backend->req_chunked && backend->req_body_left > 0 && to_copy > backend->req_body_left) {
+            to_copy = backend->req_body_left;
+        }
+        unsigned char *dst_pos = backend->buf + backend->off + backend->len;
         memcpy(backend->buf + backend->off + backend->len, data, to_copy);
         backend->len += to_copy;
         data += to_copy;
         n -= to_copy;
 
-        if (backend->req_need_header) {
+        if (backend->req_parsing_header) {
             int end = find_headers_end(backend->buf + backend->off, backend->len);
             if (end > 0) {
                 if (backend->off > 0) {
@@ -878,14 +996,80 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
                     backend->req_body_left = strtoull(tmp, NULL, 10);
                 }
 
-                backend->req_need_header = backend->req_chunked ? false : backend->req_body_left == 0;
+                backend->req_need_header = false;
+                backend->req_parsing_header = false;
                 size_t body_avail = backend->len > header_end ? backend->len - header_end : 0;
-                if (!backend->req_chunked) {
-                    if (backend->req_body_left > body_avail) {
-                        backend->req_body_left -= body_avail;
-                    } else {
-                        backend->req_body_left = 0;
+                if (backend->req_chunked) {
+                    backend->chunk_left = 0;
+                    backend->chunk_size_acc = 0;
+                    backend->chunk_line_len = 0;
+                    backend->chunk_expect_crlf = false;
+                    backend->chunk_in_trailer = false;
+                    backend->chunk_in_ext = false;
+                    backend->chunk_trailer_window = 0;
+                    if (body_avail) {
+                        ssize_t consumed = advance_chunked(backend, backend->buf + header_end, body_avail);
+                        if (consumed < 0) {
+                            send_error(revpx, client, 400, "Bad Request");
+                            cleanup(revpx, backend->fd);
+                            return false;
+                        }
+                        if ((size_t)consumed < body_avail) {
+                            size_t leftover = body_avail - (size_t)consumed;
+                            if (backend->len >= leftover) backend->len -= leftover;
+                            unsigned char tmpbuf[RP_BUF_SIZE];
+                            if (leftover > sizeof(tmpbuf)) {
+                                send_error(revpx, client, 413, "Request Entity Too Large");
+                                cleanup(revpx, backend->fd);
+                                return false;
+                            }
+                            memcpy(tmpbuf, backend->buf + header_end + consumed, leftover);
+                            flush_buffer(revpx, backend);
+                            if (!revpx->conns[backend->fd]) return false;
+                            if (backend->len > 0) {
+                                send_error(revpx, client, 400, "Bad Request");
+                                cleanup(revpx, backend->fd);
+                                return false;
+                            }
+                            backend->off = 0;
+                            backend->len = 0;
+                            backend->req_parsing_header = true;
+                            backend->req_need_header = true;
+                            if (!forward_client_bytes(revpx, client, backend, tmpbuf, leftover)) return false;
+                            return revpx->conns[backend->fd] != NULL;
+                        }
+                    }
+                    if (backend->req_chunked == false) backend->req_parsing_header = false;
+                } else {
+                    size_t body_used = body_avail < backend->req_body_left ? body_avail : backend->req_body_left;
+                    if (backend->req_body_left > 0) backend->req_body_left -= body_used;
+                    size_t leftover = body_avail > body_used ? body_avail - body_used : 0;
+                    if (backend->req_body_left == 0) {
                         backend->req_need_header = true;
+                        backend->req_parsing_header = false;
+                    }
+                    if (leftover > 0) {
+                        if (backend->len >= leftover) backend->len -= leftover;
+                        unsigned char tmpbuf[RP_BUF_SIZE];
+                        if (leftover > sizeof(tmpbuf)) {
+                            send_error(revpx, client, 413, "Request Entity Too Large");
+                            cleanup(revpx, backend->fd);
+                            return false;
+                        }
+                        memcpy(tmpbuf, backend->buf + header_end + body_used, leftover);
+                        flush_buffer(revpx, backend);
+                        if (!revpx->conns[backend->fd]) return false;
+                        if (backend->len > 0) {
+                            send_error(revpx, client, 400, "Bad Request");
+                            cleanup(revpx, backend->fd);
+                            return false;
+                        }
+                        backend->off = 0;
+                        backend->len = 0;
+                        backend->req_parsing_header = true;
+                        backend->req_need_header = true;
+                        if (!forward_client_bytes(revpx, client, backend, tmpbuf, leftover)) return false;
+                        return revpx->conns[backend->fd] != NULL;
                     }
                 }
             }
@@ -895,12 +1079,46 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
             } else {
                 backend->req_body_left = 0;
                 backend->req_need_header = true;
+                backend->req_parsing_header = false;
+            }
+        } else {
+            ssize_t consumed = advance_chunked(backend, dst_pos, to_copy);
+            if (consumed < 0) {
+                send_error(revpx, client, 400, "Bad Request");
+                cleanup(revpx, backend->fd);
+                return false;
+            }
+            if ((size_t)consumed < to_copy) {
+                size_t leftover = to_copy - (size_t)consumed;
+                if (backend->len >= leftover) backend->len -= leftover;
+                unsigned char tmpbuf[RP_BUF_SIZE];
+                if (leftover > sizeof(tmpbuf)) {
+                    send_error(revpx, client, 413, "Request Entity Too Large");
+                    cleanup(revpx, backend->fd);
+                    return false;
+                }
+                memcpy(tmpbuf, dst_pos + consumed, leftover);
+                flush_buffer(revpx, backend);
+                if (!revpx->conns[backend->fd]) return false;
+                if (backend->len > 0) {
+                    send_error(revpx, client, 400, "Bad Request");
+                    cleanup(revpx, backend->fd);
+                    return false;
+                }
+                backend->off = 0;
+                backend->len = 0;
+                backend->req_parsing_header = true;
+                backend->req_need_header = true;
+                if (!forward_client_bytes(revpx, client, backend, tmpbuf, leftover)) return false;
+                return revpx->conns[backend->fd] != NULL;
             }
         }
     }
 
-    flush_buffer(revpx, backend);
-    if (revpx->conns[backend->fd] && backend->len > 0) ep_mod(revpx, backend->fd, EPOLLOUT | EPOLLIN | EPOLLET);
+    if (!backend->req_parsing_header) {
+        flush_buffer(revpx, backend);
+        if (revpx->conns[backend->fd] && backend->len > 0) ep_mod(revpx, backend->fd, EPOLLOUT | EPOLLIN | EPOLLET);
+    }
     return revpx->conns[backend->fd] != NULL;
 }
 
@@ -991,6 +1209,19 @@ skip_flush:
                 char host[512], target[1024] = "/";
                 extract_host(c->buf, end, host, sizeof(host));
                 extract_target(c->buf, end, target, sizeof(target));
+                const char *sni_name = c->ssl ? SSL_get_servername(c->ssl, TLSEXT_NAMETYPE_host_name) : NULL;
+                if (host[0] == '\0' && sni_name && *sni_name) {
+                    strncpy(host, sni_name, sizeof(host) - 1);
+                    host[sizeof(host) - 1] = '\0';
+                }
+                if (!c->ssl && host[0] == '\0') {
+                    send_error(revpx, c, 400, "Bad Request");
+                    break;
+                }
+                if (host[0] == '\0' && revpx->domain_count > 0) {
+                    strncpy(host, revpx->domains[0].domain, sizeof(host) - 1);
+                    host[sizeof(host) - 1] = '\0';
+                }
 
                 c->websocket = is_websocket_upgrade_request(c->buf, end);
                 if (c->websocket) {
@@ -1118,12 +1349,16 @@ skip_flush:
         }
 
         c->req_need_header = true;
+        c->req_parsing_header = true;
         c->req_chunked = false;
         c->req_body_left = 0;
         c->chunk_left = 0;
         c->chunk_size_acc = 0;
         c->chunk_line_len = 0;
         c->chunk_expect_crlf = false;
+        c->chunk_in_trailer = false;
+        c->chunk_in_ext = false;
+        c->chunk_trailer_window = 0;
 
         if (client->websocket) {
             c->state = ST_UPGRADING;
@@ -1366,9 +1601,33 @@ int revpx_run_server(RevPx *revpx) {
         close(revpx->epfd);
         return -1;
     }
+    if (revpx->domain_count == 0) {
+        rp_log_error("No domains configured\n");
+        if (http_fd >= 0) close(http_fd);
+        close(https_fd);
+        close(revpx->epfd);
+        SSL_CTX_free(root_ctx);
+        return -1;
+    }
     SSL_CTX_set_mode(root_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
     SSL_CTX_set_tlsext_servername_callback(root_ctx, sni_callback);
     SSL_CTX_set_tlsext_servername_arg(root_ctx, revpx);
+    RpHostDomain *default_domain = &revpx->domains[0];
+    if (SSL_CTX_use_certificate_file(root_ctx, default_domain->cert, SSL_FILETYPE_PEM) <= 0 ||
+        SSL_CTX_use_PrivateKey_file(root_ctx, default_domain->key, SSL_FILETYPE_PEM) <= 0 ||
+        SSL_CTX_check_private_key(root_ctx) != 1) {
+        unsigned long ssl_err;
+        while ((ssl_err = ERR_get_error()) != 0) {
+            char err_buf[256];
+            ERR_error_string_n(ssl_err, err_buf, sizeof(err_buf));
+            rp_log_error("SSL error: %s\n", err_buf);
+        }
+        if (http_fd >= 0) close(http_fd);
+        if (https_fd >= 0) close(https_fd);
+        if (revpx->epfd >= 0) close(revpx->epfd);
+        SSL_CTX_free(root_ctx);
+        return -1;
+    }
 
     struct epoll_event events[RP_MAX_EVENTS];
     int ret = 0;
