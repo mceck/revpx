@@ -14,6 +14,7 @@
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
@@ -82,6 +83,13 @@ typedef struct {
     int write_retry_count; // Changed from bool to int for multiple retries
     bool read_stalled;
     bool websocket;
+    bool req_need_header;
+    bool req_chunked;
+    size_t req_body_left;
+    size_t chunk_left;
+    size_t chunk_size_acc;
+    int chunk_line_len;
+    bool chunk_expect_crlf;
 } RpConnection;
 
 typedef struct {
@@ -109,6 +117,9 @@ bool revpx_add_domain(RevPx *revpx, const char *domain, const char *host, const 
 int revpx_run_server(RevPx *revpx);
 
 #ifdef REVPX_IMPLEMENTATION
+
+static void fill_peer_ip(int fd, char *out, size_t max);
+static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnection *backend, const unsigned char *data, size_t n);
 
 static void set_nonblock(int fd) {
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
@@ -514,6 +525,10 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
             int n = do_read(src, temp, to_read);
 
             if (n > 0) {
+                if (src->type == CT_CLIENT && dst->type == CT_BACKEND && !src->websocket && !dst->websocket) {
+                    if (!forward_client_bytes(revpx, src, dst, temp, (size_t)n)) return;
+                    continue;
+                }
                 size_t written = 0;
                 while (written < (size_t)n) {
                     int w = do_write(dst, temp + written, n - written);
@@ -692,12 +707,43 @@ static bool find_header(const unsigned char *buf, size_t len, const char *header
     return false;
 }
 
-static bool inject_forwarded_headers(RpConnection *client) {
-    const char injected_ip[] = "127.0.0.1";
-    char extra_headers[4096] = "\r\nConnection: close";
-    if (client->len == 0) return false;
-    unsigned char *p = client->buf;
-    int headers_end = find_headers_end(p, client->len);
+static bool has_chunked_encoding(const unsigned char *buf, size_t len) {
+    const char *te = NULL;
+    size_t te_len = 0;
+    if (!find_header(buf, len, "Transfer-Encoding", &te, &te_len)) return false;
+    for (size_t i = 0; i + 6 < te_len; i++) {
+        if (strncasecmp(te + i, "chunked", 7) == 0) return true;
+    }
+    return false;
+}
+
+static void fill_peer_ip(int fd, char *out, size_t max) {
+    if (max == 0) return;
+    out[0] = '\0';
+    struct sockaddr_storage addr;
+    socklen_t addr_len = sizeof(addr);
+    if (getpeername(fd, (struct sockaddr *)&addr, &addr_len) == 0) {
+        if (addr.ss_family == AF_INET) {
+            struct sockaddr_in *sa = (struct sockaddr_in *)&addr;
+            inet_ntop(AF_INET, &sa->sin_addr, out, max);
+        } else if (addr.ss_family == AF_INET6) {
+            struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)&addr;
+            inet_ntop(AF_INET6, &sa6->sin6_addr, out, max);
+        }
+    }
+    if (out[0] == '\0') {
+        strncpy(out, "127.0.0.1", max - 1);
+        out[max - 1] = '\0';
+    }
+}
+
+static bool inject_forwarded_headers(RpConnection *conn, int source_fd) {
+    char injected_ip[INET6_ADDRSTRLEN];
+    fill_peer_ip(source_fd, injected_ip, sizeof(injected_ip));
+    char extra_headers[4096] = "";
+    if (conn->len == 0) return false;
+    unsigned char *p = conn->buf;
+    int headers_end = find_headers_end(p, conn->len);
     if (headers_end <= 0) return false;
 
     size_t header_len = (size_t)headers_end;
@@ -721,15 +767,18 @@ static bool inject_forwarded_headers(RpConnection *client) {
     char ff[512];
     find_header((const unsigned char *)p, header_len, "X-Forwarded-For", &ff_value, &ff_len);
     if (ff_value && ff_len > 0) {
-        strncpy(ff, ff_value, ff_len > sizeof(ff) - 1 ? sizeof(ff) - 1 : ff_len);
-        strcat(ff, ", ");
+        size_t copy_len = ff_len >= sizeof(ff) ? sizeof(ff) - 1 : ff_len;
+        memcpy(ff, ff_value, copy_len);
+        ff[copy_len] = '\0';
+        size_t cur_len = strlen(ff);
+        if (cur_len < sizeof(ff) - 3) strcat(ff, ", ");
     } else {
         strcpy(ff, injected_ip);
     }
     strcat(extra_headers, "\r\nX-Forwarded-For: ");
     strcat(extra_headers, ff);
 
-    const char *to_strip[] = {"Connection", "Proxy-Connection", "Forwarded", "X-Forwarded-For",
+    const char *to_strip[] = {"Forwarded", "X-Forwarded-For",
                               "X-Forwarded-Proto", "X-Forwarded-Scheme", "X-Forwarded-Host", "X-Real-IP"};
     for (size_t i = 0; i < sizeof(to_strip) / sizeof(to_strip[0]); i++) {
         while (1) {
@@ -739,8 +788,8 @@ static bool inject_forwarded_headers(RpConnection *client) {
             if (!line_end) break;
             line_end += 1; // include the '\n'
             size_t remove_len = (size_t)(line_end - hs);
-            memmove(hs, line_end, (p + client->len) - line_end);
-            client->len -= remove_len;
+            memmove(hs, line_end, (p + conn->len) - line_end);
+            conn->len -= remove_len;
             header_len -= remove_len;
             headers_end -= (int)remove_len;
         }
@@ -767,19 +816,92 @@ static bool inject_forwarded_headers(RpConnection *client) {
     }
 
     size_t add_len = strlen(extra_headers);
-    if (client->len + add_len >= sizeof(client->buf)) {
+    if (conn->len + add_len >= sizeof(conn->buf)) {
         rp_log_error("Not enough space to inject headers\n");
         return false;
     }
     // Insert before the CRLFCRLF (headers_end - 4)
     memmove(p + headers_end - 4 + add_len,
             p + headers_end - 4,
-            client->len - (size_t)(headers_end - 4));
+            conn->len - (size_t)(headers_end - 4));
     memcpy(p + headers_end - 4, extra_headers, add_len);
-    client->len += add_len;
-    rp_log_debug("Injected buffer:\n%.*s\n", 300, p + (client->len > 300 ? client->len - 300 : 0));
+    conn->len += add_len;
+    rp_log_debug("Injected buffer:\n%.*s\n", 300, p + (conn->len > 300 ? conn->len - 300 : 0));
 
     return true;
+}
+
+static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnection *backend, const unsigned char *data, size_t n) {
+    while (n > 0) {
+        if (backend->req_need_header) compact_buffer(backend);
+        size_t space = buffer_space(backend);
+        if (space == 0) {
+            if (!client->read_stalled) {
+                client->read_stalled = true;
+                uint32_t ev = client->len > 0 ? (EPOLLOUT | EPOLLET) : 0;
+                if (ev) ep_mod(revpx, client->fd, ev);
+            }
+            ep_mod(revpx, backend->fd, EPOLLOUT | EPOLLET);
+            return true;
+        }
+        size_t to_copy = n < space ? n : space;
+        memcpy(backend->buf + backend->off + backend->len, data, to_copy);
+        backend->len += to_copy;
+        data += to_copy;
+        n -= to_copy;
+
+        if (backend->req_need_header) {
+            int end = find_headers_end(backend->buf + backend->off, backend->len);
+            if (end > 0) {
+                if (backend->off > 0) {
+                    memmove(backend->buf, backend->buf + backend->off, backend->len);
+                    backend->off = 0;
+                }
+                end = find_headers_end(backend->buf, backend->len);
+                if (!inject_forwarded_headers(backend, client->fd)) {
+                    send_error(revpx, client, 400, "Bad Request");
+                    cleanup(revpx, backend->fd);
+                    return false;
+                }
+                end = find_headers_end(backend->buf, backend->len);
+                size_t header_end = (size_t)end;
+                backend->req_chunked = has_chunked_encoding(backend->buf, header_end);
+                backend->req_body_left = 0;
+
+                const char *cl = NULL;
+                size_t cl_len = 0;
+                if (find_header(backend->buf, header_end, "Content-Length", &cl, &cl_len) && cl_len > 0) {
+                    char tmp[32];
+                    size_t copy_len = cl_len >= sizeof(tmp) ? sizeof(tmp) - 1 : cl_len;
+                    memcpy(tmp, cl, copy_len);
+                    tmp[copy_len] = '\0';
+                    backend->req_body_left = strtoull(tmp, NULL, 10);
+                }
+
+                backend->req_need_header = backend->req_chunked ? false : backend->req_body_left == 0;
+                size_t body_avail = backend->len > header_end ? backend->len - header_end : 0;
+                if (!backend->req_chunked) {
+                    if (backend->req_body_left > body_avail) {
+                        backend->req_body_left -= body_avail;
+                    } else {
+                        backend->req_body_left = 0;
+                        backend->req_need_header = true;
+                    }
+                }
+            }
+        } else if (!backend->req_chunked) {
+            if (backend->req_body_left > to_copy) {
+                backend->req_body_left -= to_copy;
+            } else {
+                backend->req_body_left = 0;
+                backend->req_need_header = true;
+            }
+        }
+    }
+
+    flush_buffer(revpx, backend);
+    if (revpx->conns[backend->fd] && backend->len > 0) ep_mod(revpx, backend->fd, EPOLLOUT | EPOLLIN | EPOLLET);
+    return revpx->conns[backend->fd] != NULL;
 }
 
 static void handle_event(RevPx *revpx, int fd, uint32_t events) {
@@ -817,10 +939,12 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
     }
 
     if (c->state != ST_PROXYING && c->len > 0 && (events & EPOLLOUT)) {
+        if (c->state == ST_CONNECTING) goto skip_flush;
         flush_buffer(revpx, c);
         if (!revpx->conns[fd]) return;
     }
 
+skip_flush:
     switch (c->state) {
     case ST_SSL_HANDSHAKE: {
         int ret = SSL_accept(c->ssl);
@@ -934,10 +1058,37 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
     }
 
     case ST_CONNECTING: {
-        if (c->ssl || !(events & EPOLLOUT)) {
-            rp_log_debug("ST_CONNECTING: Client side: just wait, do nothing\n");
+        if (c->ssl) {
+            if (events & EPOLLIN) {
+                while (1) {
+                    size_t space = buffer_space(c);
+                    if (space == 0) {
+                        send_error(revpx, c, 413, "Request Entity Too Large");
+                        break;
+                    }
+                    int n = do_read(c, c->buf + c->off + c->len, space);
+                    if (n > 0) {
+                        c->len += n;
+                        continue;
+                    } else if (n == 0) {
+                        cleanup_both(revpx, fd);
+                        break;
+                    } else {
+                        int err = get_error(c, n);
+                        if (err == SSL_ERROR_WANT_READ) break;
+                        if (err == SSL_ERROR_WANT_WRITE) {
+                            ep_mod(revpx, fd, EPOLLIN | EPOLLOUT | EPOLLET);
+                            break;
+                        }
+                        cleanup_both(revpx, fd);
+                        break;
+                    }
+                }
+            }
             break;
         }
+
+        if (!(events & EPOLLOUT)) break;
 
         int err = 0;
         socklen_t len = sizeof(err);
@@ -966,6 +1117,14 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
             break;
         }
 
+        c->req_need_header = true;
+        c->req_chunked = false;
+        c->req_body_left = 0;
+        c->chunk_left = 0;
+        c->chunk_size_acc = 0;
+        c->chunk_line_len = 0;
+        c->chunk_expect_crlf = false;
+
         if (client->websocket) {
             c->state = ST_UPGRADING;
             client->state = ST_UPGRADING;
@@ -976,29 +1135,16 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
         }
 
         if (client->len > 0) {
-            if (client->ssl && !client->websocket) {
-                rp_log_debug("Injecting X-Forwarded headers into SSL client fd=%d to backend fd=%d\n", client->fd, fd);
-                if (!inject_forwarded_headers(client)) {
-                    rp_log_error("Failed to inject X-Forwarded headers for fd=%d\n", client->fd);
-                }
+            if (!forward_client_bytes(revpx, client, c, client->buf + client->off, client->len)) {
+                break;
             }
-            compact_buffer(c);
-            size_t room = buffer_space(c);
-            size_t to_copy = client->len <= room ? client->len : room;
-            if (to_copy > 0) {
-                rp_log_debug("Copying %zu bytes from client fd=%d to backend fd=%d buffer\n", to_copy, client->fd, fd);
-                memcpy(c->buf + c->off + c->len, client->buf + client->off, to_copy);
-                c->len += to_copy;
-                client->off += to_copy;
-                client->len -= to_copy;
-                if (client->len == 0) client->off = 0;
-            }
-            ep_mod(revpx, fd, EPOLLOUT | EPOLLIN | EPOLLET);
+            client->off = 0;
+            client->len = 0;
         } else {
             rp_log_debug("Backend fd=%d ready, no data to forward yet\n", fd);
-            ep_mod(revpx, fd, EPOLLIN | EPOLLET);
         }
-        ep_mod(revpx, client->fd, EPOLLIN | EPOLLET);
+        if (revpx->conns[fd]) ep_mod(revpx, fd, EPOLLIN | (revpx->conns[fd]->len ? EPOLLOUT : 0) | EPOLLET);
+        if (client && revpx->conns[client->fd]) ep_mod(revpx, client->fd, EPOLLIN | EPOLLET);
         break;
     }
 
