@@ -81,7 +81,7 @@ typedef struct {
     unsigned char buf[RP_BUF_SIZE];
     size_t len, off;
     bool closing;
-    int write_retry_count; // Changed from bool to int for multiple retries
+    int write_retry_count;
     bool read_stalled;
     bool websocket;
     bool req_need_header;
@@ -120,6 +120,7 @@ RevPx *revpx_create(const char *http_port, const char *https_port);
 void revpx_free(RevPx *revpx);
 bool revpx_add_domain(RevPx *revpx, const char *domain, const char *host, const char *port, const char *cert, const char *key);
 int revpx_run_server(RevPx *revpx);
+#endif // REVPX_H
 
 #ifdef REVPX_IMPLEMENTATION
 
@@ -655,7 +656,7 @@ static void tunnel_data(RevPx *revpx, RpConnection *src, uint32_t events) {
             ep_mod(revpx, dst->fd, EPOLLOUT | EPOLLIN | EPOLLET);
             ep_mod(revpx, src->fd, EPOLLIN | EPOLLET);
         } else if (n == 0) {
-            rp_log_info("WebSocket peer (fd: %d) closed connection.\n", src->fd);
+            rp_log_debug("WebSocket peer (fd: %d) closed connection.\n", src->fd);
             cleanup_both(revpx, src->fd);
         } else {
             int err = get_error(src, n);
@@ -1225,7 +1226,7 @@ skip_flush:
 
                 c->websocket = is_websocket_upgrade_request(c->buf, end);
                 if (c->websocket) {
-                    rp_log_info("websocket upgrade request detected\n");
+                    rp_log_debug("websocket upgrade request detected\n");
                 }
 
                 if (!c->ssl) {
@@ -1245,7 +1246,7 @@ skip_flush:
                     send_error(revpx, c, 421, "Misdirected Request");
                     break;
                 }
-                rp_log_info("HTTPS request: https://%s%s -> %s:%s\n", host, target, d->host, d->port);
+                rp_log_debug("HTTPS request: https://%s%s -> %s:%s\n", host, target, d->host, d->port);
 
                 int backend = create_backend(d->host, d->port);
                 if (backend < 0) {
@@ -1405,7 +1406,7 @@ skip_flush:
         }
 
         if (n >= 12 && strncasecmp((char *)c->buf, "HTTP/1.1 101", 12) == 0) {
-            rp_log_info("websocket: handshake success, start tunneling\n");
+            rp_log_debug("websocket: handshake success, start tunneling\n");
 
             c->state = ST_TUNNELING;
             client->state = ST_TUNNELING;
@@ -1736,4 +1737,3 @@ void revpx_free(RevPx *revpx) {
 }
 
 #endif // REVPX_IMPLEMENTATION
-#endif // REVPX_H
