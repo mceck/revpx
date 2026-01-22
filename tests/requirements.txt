@@ -1,0 +1,6 @@
+# No external dependencies required for basic tests
+# Python 3.7+ standard library is sufficient
+
+# Optional for extended testing:
+# pytest>=7.0.0
+# pytest-xdist>=3.0.0  # for parallel test execution
