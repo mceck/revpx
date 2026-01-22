@@ -951,15 +951,36 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
                 cleanup(revpx, backend->fd);
                 return false;
             }
-            if (!client->read_stalled) {
-                client->read_stalled = true;
-                uint32_t ev = client->len > 0 ? (EPOLLOUT | EPOLLET) : 0;
-                if (ev) ep_mod(revpx, client->fd, ev);
+            // Buffer is full - flush it to backend before continuing
+            flush_buffer(revpx, backend);
+            if (!revpx->conns[backend->fd]) return false;
+            compact_buffer(backend);
+            space = buffer_space(backend);
+            // If still no space after flush, keep trying with small delays
+            int retry_count = 0;
+            while (space == 0 && retry_count < 100) {
+                usleep(1000);  // 1ms delay
+                flush_buffer(revpx, backend);
+                if (!revpx->conns[backend->fd]) return false;
+                compact_buffer(backend);
+                space = buffer_space(backend);
+                retry_count++;
             }
-            ep_mod(revpx, backend->fd, EPOLLOUT | EPOLLET);
-            return true;
+            if (space == 0) {
+                rp_log_error("forward_client_bytes: buffer full after retries\n");
+                send_error(revpx, client, 503, "Service Unavailable");
+                cleanup(revpx, backend->fd);
+                return false;
+            }
         }
         size_t to_copy = n < space ? n : space;
+        // When parsing headers, reserve 512 bytes for header injection
+        if (backend->req_parsing_header) {
+            size_t max_buffer = RP_BUF_SIZE - 512;
+            if (backend->len + to_copy > max_buffer && max_buffer > backend->len) {
+                to_copy = max_buffer - backend->len;
+            }
+        }
         if (!backend->req_parsing_header && !backend->req_chunked && backend->req_body_left > 0 && to_copy > backend->req_body_left) {
             to_copy = backend->req_body_left;
         }
@@ -1295,7 +1316,8 @@ skip_flush:
                 while (1) {
                     size_t space = buffer_space(c);
                     if (space == 0) {
-                        send_error(revpx, c, 413, "Request Entity Too Large");
+                        // Buffer full - don't error, just stop reading and wait for backend
+                        rp_log_debug("ST_CONNECTING: buffer full, waiting for backend to connect\n");
                         break;
                     }
                     int n = do_read(c, c->buf + c->off + c->len, space);
