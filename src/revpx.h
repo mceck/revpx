@@ -95,6 +95,13 @@ typedef struct {
     bool chunk_in_trailer;
     bool chunk_in_ext;
     uint32_t chunk_trailer_window;
+    bool res_need_header;
+    bool res_parsing_header;
+    bool res_chunked;
+    size_t res_content_length;
+    size_t res_body_sent;
+    bool res_complete;
+    int res_status_code;
 } RpConnection;
 
 typedef struct {
@@ -126,6 +133,8 @@ int revpx_run_server(RevPx *revpx);
 
 static void fill_peer_ip(int fd, char *out, size_t max);
 static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnection *backend, const unsigned char *data, size_t n);
+static void send_error(RevPx *revpx, RpConnection *c, int code, const char *status);
+static bool parse_response_headers(RpConnection *client, const unsigned char *buf, size_t header_len);
 
 static void set_nonblock(int fd) {
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
@@ -149,6 +158,7 @@ static void cleanup(RevPx *revpx, int fd) {
     if (fd < 0 || fd >= RP_MAX_FD || !revpx->conns[fd]) return;
     RpConnection *c = revpx->conns[fd];
     int peer = c->peer;
+    RpConnectionType conn_type = c->type;
 
     epoll_ctl(revpx->epfd, EPOLL_CTL_DEL, fd, NULL);
     revpx->conns[fd] = NULL;
@@ -163,6 +173,34 @@ static void cleanup(RevPx *revpx, int fd) {
     if (peer >= 0 && revpx->conns[peer]) {
         RpConnection *p = revpx->conns[peer];
         p->peer = -1;
+
+        // Handle incomplete response when backend closes
+        if (conn_type == CT_BACKEND && p->type == CT_CLIENT &&
+            !p->websocket && p->state == ST_PROXYING) {
+            if (!p->res_complete && p->res_content_length != SIZE_MAX) {
+                rp_log_debug("Backend closed with incomplete response: "
+                           "sent %zu of %zu bytes\n",
+                           p->res_body_sent, p->res_content_length);
+
+                if (p->res_body_sent == 0 && p->res_parsing_header) {
+                    send_error(revpx, p, 502, "Bad Gateway");
+                    return;
+                }
+
+                struct linger sl = { .l_onoff = 1, .l_linger = 0 };
+                setsockopt(p->fd, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
+
+                epoll_ctl(revpx->epfd, EPOLL_CTL_DEL, p->fd, NULL);
+                revpx->conns[p->fd] = NULL;
+                if (p->ssl) {
+                    SSL_free(p->ssl);  // No shutdown, we want RST
+                }
+                close(p->fd);
+                free(p);
+                return;
+            }
+        }
+
         if (p->len > 0) {
             p->closing = true;
             ep_mod(revpx, peer, EPOLLOUT | EPOLLET);
@@ -560,6 +598,76 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
                     if (!forward_client_bytes(revpx, src, dst, temp, (size_t)n)) return;
                     continue;
                 }
+                if (src->type == CT_BACKEND && dst->type == CT_CLIENT && !src->websocket && !dst->websocket) {
+                    const unsigned char *data = temp;
+                    size_t remaining = (size_t)n;
+
+                    if (dst->res_need_header || dst->res_parsing_header) {
+                        if (!dst->res_parsing_header) {
+                            dst->res_parsing_header = true;
+                        }
+                        size_t space = buffer_space(dst);
+                        size_t to_copy = remaining < space ? remaining : space;
+                        memcpy(dst->buf + dst->off + dst->len, data, to_copy);
+                        dst->len += to_copy;
+                        data += to_copy;
+                        remaining -= to_copy;
+
+                        int end = find_headers_end(dst->buf + dst->off, dst->len);
+                        if (end > 0) {
+                            if (!parse_response_headers(dst, dst->buf + dst->off, (size_t)end)) {
+                                rp_log_error("Failed to parse response headers\n");
+                                cleanup_both(revpx, src->fd);
+                                return;
+                            }
+                            size_t body_in_buffer = dst->len - (size_t)end;
+                            dst->res_body_sent = body_in_buffer;
+                            if (!dst->res_chunked && dst->res_content_length != SIZE_MAX &&
+                                dst->res_body_sent >= dst->res_content_length) {
+                                dst->res_complete = true;
+                                dst->res_need_header = true; 
+                            }
+                            // Flush headers + initial body
+                            flush_buffer(revpx, dst);
+                            if (!revpx->conns[dst->fd]) return;
+                        }
+                    }
+
+                    // Forward remaining body data
+                    while (remaining > 0 && revpx->conns[dst->fd]) {
+                        int w = do_write(dst, data, remaining);
+                        if (w > 0) {
+                            data += w;
+                            remaining -= w;
+                            dst->res_body_sent += w;
+                            dst->write_retry_count = 0;
+                            // Check if response is complete
+                            if (!dst->res_chunked && dst->res_content_length != SIZE_MAX &&
+                                dst->res_body_sent >= dst->res_content_length) {
+                                dst->res_complete = true;
+                                dst->res_need_header = true;
+                            }
+                        } else {
+                            int err = get_error(dst, w);
+                            if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
+                                // Buffer remaining data
+                                if (remaining > 0) {
+                                    size_t space = buffer_space(dst);
+                                    if (space < remaining) compact_buffer(dst);
+                                    space = buffer_space(dst);
+                                    size_t to_buf = remaining < space ? remaining : space;
+                                    memcpy(dst->buf + dst->off + dst->len, data, to_buf);
+                                    dst->len += to_buf;
+                                }
+                                ep_mod(revpx, dst->fd, EPOLLOUT | EPOLLET);
+                                break;
+                            }
+                            cleanup_both(revpx, src->fd);
+                            return;
+                        }
+                    }
+                    continue;
+                }
                 size_t written = 0;
                 while (written < (size_t)n) {
                     int w = do_write(dst, temp + written, n - written);
@@ -746,6 +854,56 @@ static bool has_chunked_encoding(const unsigned char *buf, size_t len) {
         if (strncasecmp(te + i, "chunked", 7) == 0) return true;
     }
     return false;
+}
+
+static bool parse_response_headers(RpConnection *client, const unsigned char *buf, size_t header_len) {
+    // Extract status code from status line: HTTP/1.1 200 OK\r\n
+    const char *p = (const char *)buf;
+    if (header_len < 12 || strncmp(p, "HTTP/1.", 7) != 0) return false;
+
+    const char *sp = memchr(p, ' ', header_len);
+    if (!sp) return false;
+    sp++;
+
+    client->res_status_code = atoi(sp);
+
+    // Responses without body: 1xx, 204, 304
+    if (client->res_status_code < 200 ||
+        client->res_status_code == 204 ||
+        client->res_status_code == 304) {
+        client->res_complete = true;
+        client->res_content_length = 0;
+        client->res_body_sent = 0;
+        return true;
+    }
+
+    // Check Transfer-Encoding: chunked
+    client->res_chunked = has_chunked_encoding(buf, header_len);
+
+    // If not chunked, look for Content-Length
+    if (!client->res_chunked) {
+        const char *cl = NULL;
+        size_t cl_len = 0;
+        if (find_header(buf, header_len, "Content-Length", &cl, &cl_len) && cl_len > 0) {
+            char tmp[32];
+            size_t copy_len = cl_len >= sizeof(tmp) ? sizeof(tmp) - 1 : cl_len;
+            memcpy(tmp, cl, copy_len);
+            tmp[copy_len] = '\0';
+            client->res_content_length = strtoull(tmp, NULL, 10);
+        } else {
+            // No Content-Length, no chunked: read until close
+            client->res_content_length = SIZE_MAX;
+        }
+    } else {
+        client->res_content_length = SIZE_MAX; // Chunked: unknown length
+    }
+
+    client->res_body_sent = 0;
+    client->res_complete = false;
+    client->res_need_header = false;
+    client->res_parsing_header = false;
+
+    return true;
 }
 
 static int hex_value(int c) {
@@ -1382,6 +1540,15 @@ skip_flush:
         c->chunk_in_trailer = false;
         c->chunk_in_ext = false;
         c->chunk_trailer_window = 0;
+
+        // Initialize response tracking on client
+        client->res_need_header = true;
+        client->res_parsing_header = false;
+        client->res_chunked = false;
+        client->res_content_length = 0;
+        client->res_body_sent = 0;
+        client->res_complete = false;
+        client->res_status_code = 0;
 
         if (client->websocket) {
             c->state = ST_UPGRADING;
