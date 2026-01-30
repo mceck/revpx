@@ -23,9 +23,11 @@
 
 #define RP_DEFAULT_BACKEND_HOST "127.0.0.1"
 #define RP_MAX_EVENTS 1024
-#define RP_BUF_SIZE 32768
-#define RP_MAX_FD 65536
+#define RP_BUF_SIZE (32 * 1024)
+#define RP_MAX_FD (64 * 1024)
 #define RP_MAX_DOMAINS 128
+#define RP_INITIAL_RESP_HEADER 1024
+#define RP_MAX_RESP_HEADER (64 * 1024)
 
 enum log_level {
     RP_DEBUG,
@@ -79,6 +81,21 @@ typedef struct {
     bool chunk_in_trailer;
     bool chunk_in_ext;
     uint32_t chunk_trailer_window;
+    bool resp_need_header;
+    bool resp_parsing_header;
+    bool resp_chunked;
+    size_t resp_content_length;
+    size_t resp_body_sent;
+    unsigned char *resp_header_buf;
+    size_t resp_header_len;
+    size_t resp_header_cap;
+    size_t resp_chunk_left;
+    size_t resp_chunk_size_acc;
+    int resp_chunk_line_len;
+    bool resp_chunk_expect_crlf;
+    bool resp_chunk_in_trailer;
+    bool resp_chunk_in_ext;
+    uint32_t resp_chunk_trailer_window;
 } RpConnection;
 
 typedef struct {
@@ -133,6 +150,7 @@ void rp_log(int level, const char *fmt, ...) {
 
 static void fill_peer_ip(int fd, char *out, size_t max);
 static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnection *backend, const unsigned char *data, size_t n);
+static bool handle_backend_response_bytes(RevPx *revpx, RpConnection *backend, const unsigned char *data, size_t n);
 
 static void set_nonblock(int fd) {
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
@@ -157,12 +175,25 @@ static void cleanup(RevPx *revpx, int fd) {
     RpConnection *c = revpx->conns[fd];
     int peer = c->peer;
 
+    if (c->type == CT_BACKEND && c->resp_content_length > 0 && !c->resp_chunked) {
+        if (c->resp_body_sent < c->resp_content_length) {
+            rp_log_warn("Backend fd=%d closed early: sent %zu/%zu response bytes\n",
+                        fd, c->resp_body_sent, c->resp_content_length);
+        }
+    }
+
     epoll_ctl(revpx->epfd, EPOLL_CTL_DEL, fd, NULL);
     revpx->conns[fd] = NULL;
 
     if (c->ssl) {
         SSL_shutdown(c->ssl);
         SSL_free(c->ssl);
+    }
+    if (c->resp_header_buf) {
+        free(c->resp_header_buf);
+        c->resp_header_buf = NULL;
+        c->resp_header_cap = 0;
+        c->resp_header_len = 0;
     }
     close(fd);
     free(c);
@@ -189,6 +220,22 @@ static void cleanup_both(RevPx *revpx, int fd) {
         revpx->conns[peer]->peer = -1;
         cleanup(revpx, peer);
     }
+}
+
+static void reset_response_state(RpConnection *backend) {
+    backend->resp_need_header = true;
+    backend->resp_parsing_header = false;
+    backend->resp_chunked = false;
+    backend->resp_content_length = 0;
+    backend->resp_body_sent = 0;
+    backend->resp_chunk_left = 0;
+    backend->resp_chunk_size_acc = 0;
+    backend->resp_chunk_line_len = 0;
+    backend->resp_chunk_expect_crlf = false;
+    backend->resp_chunk_in_trailer = false;
+    backend->resp_chunk_in_ext = false;
+    backend->resp_chunk_trailer_window = 0;
+    backend->resp_header_len = 0;
 }
 
 static RpConnection *alloc_conn(RevPx *revpx, int fd, SSL *ssl, RpConnectionState state, RpConnectionType type) {
@@ -274,6 +321,13 @@ static void send_redirect(RevPx *revpx, RpConnection *c, const char *host, const
     c->off = 0;
     c->closing = true;
     ep_mod(revpx, c->fd, EPOLLOUT | EPOLLET);
+}
+
+static int hex_value(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
 }
 
 static int find_headers_end(const unsigned char *buf, size_t len) {
@@ -567,6 +621,9 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
                     if (!forward_client_bytes(revpx, src, dst, temp, (size_t)n)) return;
                     continue;
                 }
+                if (src->type == CT_BACKEND && dst->type == CT_CLIENT && !src->websocket && !dst->websocket) {
+                    if (!handle_backend_response_bytes(revpx, src, temp, (size_t)n)) return;
+                }
                 size_t written = 0;
                 while (written < (size_t)n) {
                     int w = do_write(dst, temp + written, n - written);
@@ -755,11 +812,197 @@ static bool has_chunked_encoding(const unsigned char *buf, size_t len) {
     return false;
 }
 
-static int hex_value(int c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
+static bool ensure_response_header_capacity(RpConnection *backend, size_t needed) {
+    if (needed > RP_MAX_RESP_HEADER) return false;
+    size_t cap = backend->resp_header_cap ? backend->resp_header_cap : RP_INITIAL_RESP_HEADER;
+    while (cap < needed && cap < RP_MAX_RESP_HEADER) {
+        cap *= 2;
+        if (cap > RP_MAX_RESP_HEADER) cap = RP_MAX_RESP_HEADER;
+    }
+    if (cap < needed) return false;
+    unsigned char *buf = realloc(backend->resp_header_buf, cap);
+    if (!buf) return false;
+    backend->resp_header_buf = buf;
+    backend->resp_header_cap = cap;
+    return true;
+}
+
+static bool finalize_response_headers(RpConnection *backend) {
+    if (!backend->resp_header_buf || backend->resp_header_len == 0) return false;
+    int headers_end = find_headers_end(backend->resp_header_buf, backend->resp_header_len);
+    if (headers_end <= 0) return false;
+
+    size_t header_len = (size_t)headers_end;
+    backend->resp_chunked = has_chunked_encoding(backend->resp_header_buf, header_len);
+
+    const char *cl = NULL;
+    size_t cl_len = 0;
+    if (find_header(backend->resp_header_buf, header_len, "Content-Length", &cl, &cl_len) && cl_len > 0) {
+        char tmp[32];
+        size_t copy_len = cl_len >= sizeof(tmp) ? sizeof(tmp) - 1 : cl_len;
+        memcpy(tmp, cl, copy_len);
+        tmp[copy_len] = '\0';
+        backend->resp_content_length = strtoull(tmp, NULL, 10);
+    } else {
+        backend->resp_content_length = 0;
+    }
+
+    backend->resp_need_header = false;
+    backend->resp_parsing_header = false;
+    backend->resp_body_sent = 0;
+    backend->resp_chunk_left = 0;
+    backend->resp_chunk_size_acc = 0;
+    backend->resp_chunk_line_len = 0;
+    backend->resp_chunk_expect_crlf = false;
+    backend->resp_chunk_in_trailer = false;
+    backend->resp_chunk_in_ext = false;
+    backend->resp_chunk_trailer_window = 0;
+    rp_log_debug("Response headers parsed: fd=%d, Content-Length=%zu, chunked=%d, header_len=%zu\n",
+                 backend->fd, backend->resp_content_length, backend->resp_chunked, header_len);
+    backend->resp_header_len = 0;
+    return true;
+}
+
+static ssize_t advance_response_chunked(RpConnection *backend, const unsigned char *data, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        if (backend->resp_chunk_expect_crlf) {
+            unsigned char expected = backend->resp_chunk_line_len == 0 ? '\r' : '\n';
+            if (data[i] != expected) return -1;
+            backend->resp_chunk_line_len++;
+            i++;
+            if (backend->resp_chunk_line_len == 2) {
+                backend->resp_chunk_expect_crlf = false;
+                backend->resp_chunk_line_len = 0;
+            }
+            continue;
+        }
+
+        if (backend->resp_chunk_left > 0) {
+            size_t take = backend->resp_chunk_left < (n - i) ? backend->resp_chunk_left : (n - i);
+            backend->resp_chunk_left -= take;
+            backend->resp_body_sent += take;
+            i += take;
+            if (backend->resp_chunk_left == 0) {
+                backend->resp_chunk_expect_crlf = true;
+                backend->resp_chunk_line_len = 0;
+            }
+            continue;
+        }
+
+        if (backend->resp_chunk_in_trailer) {
+            backend->resp_chunk_trailer_window = (backend->resp_chunk_trailer_window << 8) | data[i];
+            backend->resp_chunk_trailer_window &= 0xffffffffu;
+            i++;
+            if (backend->resp_chunk_trailer_window == 0x0d0a0d0a) {
+                reset_response_state(backend);
+                return (ssize_t)i;
+            }
+            continue;
+        }
+
+        unsigned char ch = data[i++];
+        if (ch == '\r') continue;
+        if (ch == '\n') {
+            backend->resp_chunk_left = backend->resp_chunk_size_acc;
+            backend->resp_chunk_size_acc = 0;
+            backend->resp_chunk_line_len = 0;
+            backend->resp_chunk_in_ext = false;
+            if (backend->resp_chunk_left == 0) {
+                backend->resp_chunk_in_trailer = true;
+                backend->resp_chunk_trailer_window = 0;
+            }
+            continue;
+        }
+        if (ch == ';' || ch == ' ' || ch == '\t') {
+            backend->resp_chunk_in_ext = true;
+            continue;
+        }
+        if (backend->resp_chunk_in_ext) continue;
+        if (backend->resp_chunk_line_len >= 16) return -1;
+        int hv = hex_value(ch);
+        if (hv < 0) return -1;
+        backend->resp_chunk_size_acc = (backend->resp_chunk_size_acc << 4) | (size_t)hv;
+        backend->resp_chunk_line_len++;
+    }
+    return (ssize_t)n;
+}
+
+static bool handle_backend_response_bytes(RevPx *revpx, RpConnection *backend, const unsigned char *data, size_t n) {
+    size_t offset = 0;
+
+    while (offset < n) {
+        if (backend->resp_need_header || backend->resp_parsing_header) {
+            backend->resp_parsing_header = true;
+            while (offset < n) {
+                if (!ensure_response_header_capacity(backend, backend->resp_header_len + 1)) {
+                    rp_log_error("Failed to allocate response header buffer for fd=%d\n", backend->fd);
+                    cleanup_both(revpx, backend->fd);
+                    return false;
+                }
+                backend->resp_header_buf[backend->resp_header_len++] = data[offset++];
+                if (backend->resp_header_len >= 4 &&
+                    backend->resp_header_buf[backend->resp_header_len - 4] == '\r' &&
+                    backend->resp_header_buf[backend->resp_header_len - 3] == '\n' &&
+                    backend->resp_header_buf[backend->resp_header_len - 2] == '\r' &&
+                    backend->resp_header_buf[backend->resp_header_len - 1] == '\n') {
+                    if (!finalize_response_headers(backend)) {
+                        rp_log_warn("Failed to finalize backend response headers for fd=%d\n", backend->fd);
+                        cleanup_both(revpx, backend->fd);
+                        return false;
+                    }
+                    break;
+                }
+                if (backend->resp_header_len >= RP_MAX_RESP_HEADER) {
+                    rp_log_warn("Backend response headers exceed limit (%zu bytes) on fd=%d\n",
+                                backend->resp_header_len, backend->fd);
+                    cleanup_both(revpx, backend->fd);
+                    return false;
+                }
+            }
+
+            if (backend->resp_need_header) {
+                return true;
+            }
+
+            if (!backend->resp_chunked && backend->resp_content_length == 0) {
+                rp_log_debug("Response with zero-length body on fd=%d\n", backend->fd);
+                reset_response_state(backend);
+                continue;
+            }
+        }
+
+        size_t body_available = n - offset;
+        if (body_available == 0) break;
+
+        if (backend->resp_chunked) {
+            ssize_t consumed = advance_response_chunked(backend, data + offset, body_available);
+            if (consumed < 0) {
+                rp_log_warn("Invalid chunked encoding from backend fd=%d\n", backend->fd);
+                cleanup_both(revpx, backend->fd);
+                return false;
+            }
+            offset += (size_t)consumed;
+            if (backend->resp_need_header) {
+                continue;
+            }
+        } else if (backend->resp_content_length > 0) {
+            size_t remaining = backend->resp_content_length - backend->resp_body_sent;
+            size_t take = body_available < remaining ? body_available : remaining;
+            backend->resp_body_sent += take;
+            offset += take;
+            if (backend->resp_body_sent == backend->resp_content_length) {
+                rp_log_debug("Response complete fd=%d (%zu bytes)\n", backend->fd, backend->resp_body_sent);
+                reset_response_state(backend);
+                continue;
+            }
+        } else {
+            backend->resp_body_sent += body_available;
+            offset = n;
+        }
+    }
+
+    return true;
 }
 
 static ssize_t advance_chunked(RpConnection *backend, const unsigned char *data, size_t n) {
@@ -1367,6 +1610,7 @@ skip_flush:
         c->chunk_in_trailer = false;
         c->chunk_in_ext = false;
         c->chunk_trailer_window = 0;
+        reset_response_state(c);
 
         if (client->websocket) {
             c->state = ST_UPGRADING;
