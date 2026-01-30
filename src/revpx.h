@@ -65,7 +65,7 @@ typedef struct {
     unsigned char buf[RP_BUF_SIZE];
     size_t len, off;
     bool closing;
-    int write_retry_count; // Changed from bool to int for multiple retries
+    int write_retry_count;
     bool read_stalled;
     bool websocket;
     bool req_need_header;
@@ -257,7 +257,7 @@ static void send_error(RevPx *revpx, RpConnection *c, int code, const char *stat
     c->len = head_len + body_len;
     c->off = 0;
     c->closing = true;
-    rp_log_error("connection error: %d %s\n", code, status);
+    rp_log_error("Connection error: %d %s\n", code, status);
     ep_mod(revpx, c->fd, EPOLLOUT | EPOLLET);
 }
 
@@ -663,7 +663,7 @@ static void tunnel_data(RevPx *revpx, RpConnection *src, uint32_t events) {
             ep_mod(revpx, dst->fd, EPOLLOUT | EPOLLIN | EPOLLET);
             ep_mod(revpx, src->fd, EPOLLIN | EPOLLET);
         } else if (n == 0) {
-            rp_log_info("WebSocket peer (fd: %d) closed connection.\n", src->fd);
+            rp_log_debug("WebSocket peer (fd: %d) closed connection.\n", src->fd);
             cleanup_both(revpx, src->fd);
         } else {
             int err = get_error(src, n);
@@ -1233,7 +1233,7 @@ skip_flush:
 
                 c->websocket = is_websocket_upgrade_request(c->buf, end);
                 if (c->websocket) {
-                    rp_log_info("websocket upgrade request detected\n");
+                    rp_log_debug("websocket upgrade request detected\n");
                 }
 
                 if (!c->ssl) {
@@ -1253,7 +1253,7 @@ skip_flush:
                     send_error(revpx, c, 421, "Misdirected Request");
                     break;
                 }
-                rp_log_info("HTTPS request: https://%s%s -> %s:%s\n", host, target, d->host, d->port);
+                rp_log_debug("HTTPS request: https://%s%s -> %s:%s\n", host, target, d->host, d->port);
 
                 int backend = create_backend(d->host, d->port);
                 if (backend < 0) {
@@ -1334,14 +1334,14 @@ skip_flush:
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
             if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) {
                 rp_log_error("getsockopt failed on fd=%d: %s\n", fd, strerror(errno));
-            } else {
-                rp_log_error("Backend connection failed on fd=%d: %s\n", fd, strerror(err));
             }
             RpConnection *client = revpx->conns[c->peer];
-            if (client) {
+            if (client && !client->websocket) {
                 send_error(revpx, client, 502, "Bad Gateway");
                 client->peer = -1;
                 client->state = ST_READ_HEADER;
+            } else {
+                rp_log_error("Backend connection failed on fd=%d: %s\n", fd, strerror(err));
             }
             c->peer = -1;
             cleanup(revpx, fd);
@@ -1413,7 +1413,7 @@ skip_flush:
         }
 
         if (n >= 12 && strncasecmp((char *)c->buf, "HTTP/1.1 101", 12) == 0) {
-            rp_log_info("websocket: handshake success, start tunneling\n");
+            rp_log_debug("websocket: handshake success, start tunneling\n");
 
             c->state = ST_TUNNELING;
             client->state = ST_TUNNELING;
