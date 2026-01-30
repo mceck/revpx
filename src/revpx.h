@@ -34,28 +34,12 @@ enum log_level {
     RP_ERROR
 };
 
-#ifndef RP_LOG_LEVEL
-#define RP_LOG_LEVEL RP_INFO
-#endif // RP_LOG_LEVEL
-
-static const char *RpLogLevelStrings[] = {
-    [RP_DEBUG] = "DEBUG",
-    [RP_INFO] = "INFO",
-    [RP_WARN] = "WARN",
-    [RP_ERROR] = "ERROR"};
-
-#define rp_log(LVL, FMT, ...)                                                                  \
-    do {                                                                                       \
-        if (RP_LOG_LEVEL <= LVL) {                                                             \
-            FILE *log_file = LVL >= RP_ERROR ? stderr : stdout;                                \
-            fprintf(log_file, "[%s] " FMT, RpLogLevelStrings[LVL] __VA_OPT__(, ) __VA_ARGS__); \
-            fflush(log_file);                                                                  \
-        }                                                                                      \
-    } while (0)
-#define rp_log_info(FMT, ...) rp_log(RP_INFO, FMT, __VA_ARGS__)
-#define rp_log_debug(FMT, ...) rp_log(RP_DEBUG, FMT, __VA_ARGS__)
-#define rp_log_warn(FMT, ...) rp_log(RP_WARN, FMT, __VA_ARGS__)
-#define rp_log_error(FMT, ...) rp_log(RP_ERROR, FMT, __VA_ARGS__)
+void revpx_set_log_level(int level);
+void rp_log(int level, const char *fmt, ...);
+#define rp_log_info(FMT, ...) rp_log(RP_INFO, FMT __VA_OPT__(,) __VA_ARGS__)
+#define rp_log_debug(FMT, ...) rp_log(RP_DEBUG, FMT __VA_OPT__(,) __VA_ARGS__)
+#define rp_log_warn(FMT, ...) rp_log(RP_WARN, FMT __VA_OPT__(,) __VA_ARGS__)
+#define rp_log_error(FMT, ...) rp_log(RP_ERROR, FMT __VA_OPT__(,) __VA_ARGS__)
 
 typedef enum {
     ST_SSL_HANDSHAKE,
@@ -120,8 +104,32 @@ RevPx *revpx_create(const char *http_port, const char *https_port);
 void revpx_free(RevPx *revpx);
 bool revpx_add_domain(RevPx *revpx, const char *domain, const char *host, const char *port, const char *cert, const char *key);
 int revpx_run_server(RevPx *revpx);
+#endif // REVPX_H
 
 #ifdef REVPX_IMPLEMENTATION
+int rp_log_level = RP_INFO;
+void revpx_set_log_level(int level){
+    rp_log_level = level;
+}
+
+void rp_log(int level, const char *fmt, ...) {
+    if (level < rp_log_level) return;
+
+    const char *level_str;
+    switch (level) {
+        case RP_DEBUG: level_str = "\033[36mDEBUG\033[0m"; break;
+        case RP_INFO: level_str = "\033[32mINFO\033[0m"; break;
+        case RP_WARN: level_str = "\033[33mWARN\033[0m"; break;
+        case RP_ERROR: level_str = "\033[31mERROR\033[0m"; break;
+        default: level_str = "LOG"; break;
+    }
+
+    va_list args;
+    va_start(args, fmt);
+    fprintf(stderr, "[%s] ", level_str);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+}
 
 static void fill_peer_ip(int fd, char *out, size_t max);
 static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnection *backend, const unsigned char *data, size_t n);
@@ -1736,4 +1744,3 @@ void revpx_free(RevPx *revpx) {
 }
 
 #endif // REVPX_IMPLEMENTATION
-#endif // REVPX_H

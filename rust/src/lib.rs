@@ -3,6 +3,7 @@ use std::os::raw::c_void;
 type CRevPx = c_void;
 
 unsafe extern "C" {
+    fn revpx_set_log_level(level: i32);
     fn revpx_add_domain(
         revpx: *mut CRevPx,
         domain: *const u8,
@@ -41,6 +42,12 @@ impl RevPx {
 
     pub fn default() -> Self {
         Self::new("80", "443")
+    }
+
+    pub fn set_log_level(level: i32) {
+        unsafe {
+            revpx_set_log_level(level);
+        }
     }
 
     pub fn as_ptr(&self) -> *mut CRevPx {

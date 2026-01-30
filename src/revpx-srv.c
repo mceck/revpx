@@ -59,7 +59,7 @@ bool flag_arg(Args *args, ...) {
 }
 
 #define named_arg(args, ...) \
-    (flag_arg(args, __VA_ARGS__) && ((args)->value = (args)->index < (args)->argc ? (args)->argv[(args)->index++] : ""))
+    (flag_arg(args, __VA_ARGS__, NULL) && ((args)->value = (args)->index < (args)->argc ? (args)->argv[(args)->index++] : ""))
 
 bool positional_arg(Args *args) {
     return args->type == ARG_POSITIONAL;
@@ -115,7 +115,7 @@ int parse_config_file(RevPx *revpx, const char *config_file) {
             ret = 1;
             goto cleanup;
         }
-        char domain[256], host[256], port[16], cert_file[512], key_file[512];
+        char domain[256] = {0}, host[256] = {0}, port[16] = {0}, cert_file[512] = {0}, key_file[512] = {0};
         while (jsp_key(&jsp) == 0) {
             if (strcmp(jsp.string, "domain") == 0) {
                 if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) {
