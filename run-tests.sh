@@ -1,3 +1,5 @@
 #!/bin/bash
-# Run all tests
+
+set -e
+mkcert test.localhost
 python3 -m pytest tests/test_revpx.py -v
