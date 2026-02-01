@@ -152,6 +152,7 @@ void jsp_free(Jsp *jsp);
  * Returns 0 on success, -1 on failure.
  */
 int jsp_skip(Jsp *jsp);
+#endif // JSP_H_
 
 #ifdef JSP_IMPLEMENTATION
 
@@ -487,4 +488,3 @@ void jsp_free(Jsp *jsp) {
     }
 }
 #endif // JSP_IMPLEMENTATION
-#endif // JSP_H_

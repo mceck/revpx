@@ -83,12 +83,31 @@ int main(int argc, char **argv) {
         }
     }
 
+    // TEST
+    if (argc > 1 && (strcmp(argv[1], "test") == 0)) {
+        cmd_append(&cmd, "mkcert", "test.localhost");
+        if (!cmd_run(&cmd)) {
+            nob_log(NOB_ERROR, "Failed to create TLS certificates");
+            return 1;
+        }
+        cmd_append(&cmd, "pip", "install", "pytest");
+        if (!cmd_run(&cmd)) {
+            nob_log(NOB_ERROR, "Failed to install pytest");
+            return 1;
+        }
+        cmd_append(&cmd, "python", "-m", "pytest", "tests/", "-v");
+        if (!cmd_run(&cmd)) {
+            nob_log(NOB_ERROR, "Tests failed");
+            return 1;
+        }
+        return 0;
+    }
     // RUN
     bool is_run = argc > 1 && strcmp(argv[1], "run") == 0;
     bool is_example = argc > 1 && strcmp(argv[1], "example") == 0;
     if (is_run || is_example) {
         if (is_example) {
-            cmd_append(&cmd, "mkcert", "example.localhost");
+            cmd_append(&cmd, "mkcert", "test.localhost");
             if (!cmd_run(&cmd)) {
                 nob_log(NOB_ERROR, "Failed to create TLS certificates");
                 return 1;
@@ -99,7 +118,7 @@ int main(int argc, char **argv) {
 #endif
         cmd_append(&cmd, "build/revpx");
         if (is_example) {
-            cmd_append(&cmd, "example.localhost", "8080", "example.localhost.pem", "example.localhost-key.pem");
+            cmd_append(&cmd, "test.localhost", "8080", "test.localhost.pem", "test.localhost-key.pem");
         } else {
             for (int i = 2; i < argc; i++)
                 cmd_append(&cmd, argv[i]);

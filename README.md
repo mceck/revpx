@@ -1,5 +1,5 @@
 # revpx
-Tis is just a POC made for fun.
+This is just a POC made for fun.
 
 `revpx` is a lightweight, single-threaded reverse proxy server for development purposes.
 
@@ -78,6 +78,7 @@ cc -o nob nob.c
 
 - `./nob`: Build the project
 - `./nob update`: Update dependencies
+- `./nob test`: Build and run the tests
 - `./nob run [...]`: Build and run the project
 - `./nob example`: Build and run with example domain `example.localhost` on port `8080`
 - `./nob install`: Install the binary system-wide in /usr/local/bin
