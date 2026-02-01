@@ -163,6 +163,7 @@ void rp_log(int level, const char *fmt, ...) {
 static void fill_peer_ip(int fd, char *out, size_t max);
 static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnection *backend, const unsigned char *data, size_t n);
 static bool handle_backend_response_bytes(RevPx *revpx, RpConnection *backend, const unsigned char *data, size_t n);
+static bool ensure_pending_capacity(RpConnection *conn, size_t additional);
 
 static void set_nonblock(int fd) {
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
@@ -635,6 +636,21 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
 
     if (events & EPOLLOUT) {
         flush_buffer(revpx, src);
+        if (!revpx->conns[src->fd]) return;
+        /* Client writable: try to drain backend's pending response data to the client */
+        if (src->type == CT_CLIENT && dst && dst->type == CT_BACKEND && dst->pending_len > 0) {
+            size_t space = buffer_space(src);
+            if (space > 0) {
+                size_t to_send = space < dst->pending_len ? space : dst->pending_len;
+                int w = do_write(src, dst->pending_data, to_send);
+                if (w > 0) {
+                    if ((size_t)w < dst->pending_len)
+                        memmove(dst->pending_data, dst->pending_data + w, dst->pending_len - (size_t)w);
+                    dst->pending_len -= (size_t)w;
+                    if (dst->pending_len > 0) ep_mod(revpx, src->fd, EPOLLOUT | EPOLLIN | EPOLLET);
+                }
+            }
+        }
     }
 
     if ((events & EPOLLIN) && dst) {
@@ -653,17 +669,43 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
                 dst_space = buffer_space(dst);
             }
 
-            if (dst_space == 0) {
-                if (!src->read_stalled) {
-                    src->read_stalled = true;
-                    uint32_t ev = src->len > 0 ? (EPOLLOUT | EPOLLET) : 0;
-                    if (ev) ep_mod(revpx, src->fd, ev);
+            /* Backend->client: drain pending response data first if client has space */
+            if (src->type == CT_BACKEND && dst->type == CT_CLIENT && src->pending_len > 0 && dst_space > 0) {
+                size_t to_send = dst_space < src->pending_len ? dst_space : src->pending_len;
+                int w = do_write(dst, src->pending_data, to_send);
+                if (w > 0) {
+                    if ((size_t)w < src->pending_len)
+                        memmove(src->pending_data, src->pending_data + w, src->pending_len - (size_t)w);
+                    src->pending_len -= (size_t)w;
+                    dst->write_retry_count = 0;
+                    ep_mod(revpx, dst->fd, EPOLLOUT | EPOLLIN | EPOLLET);
+                    if (src->pending_len > 0) ep_mod(revpx, dst->fd, EPOLLOUT | EPOLLET);
+                    continue;
+                } else {
+                    int err = get_error(dst, w);
+                    if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
+                        ep_mod(revpx, dst->fd, EPOLLIN | EPOLLOUT | EPOLLET);
+                        break;
+                    }
                 }
-                ep_mod(revpx, dst->fd, EPOLLOUT | EPOLLET);
-                break;
             }
 
-            size_t to_read = dst_space < sizeof(temp) ? dst_space : sizeof(temp);
+            if (dst_space == 0) {
+                /* Client full: for backend->client we still read and buffer in backend pending */
+                if (src->type != CT_BACKEND || dst->type != CT_CLIENT) {
+                    if (!src->read_stalled) {
+                        src->read_stalled = true;
+                        uint32_t ev = src->len > 0 ? (EPOLLOUT | EPOLLET) : 0;
+                        if (ev) ep_mod(revpx, src->fd, ev);
+                    }
+                    ep_mod(revpx, dst->fd, EPOLLOUT | EPOLLET);
+                    break;
+                }
+            }
+
+            /* Backend->client: read up to full buffer so we don't leave data in kernel; else limit by client space */
+            size_t to_read = (src->type == CT_BACKEND && dst->type == CT_CLIENT) ? sizeof(temp)
+                : (dst_space < sizeof(temp) ? dst_space : sizeof(temp));
             int n = do_read(src, temp, to_read);
 
             if (n > 0) {
@@ -707,13 +749,39 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
 
                 if (written < (size_t)n) {
                     size_t remain = n - written;
-                    if (buffer_space(dst) < remain) compact_buffer(dst);
-                    memcpy(dst->buf + dst->off + dst->len, temp + written, remain);
-                    dst->len += remain;
+                    size_t space = buffer_space(dst);
+                    if (space >= remain) {
+                        memcpy(dst->buf + dst->off + dst->len, temp + written, remain);
+                        dst->len += remain;
+                    } else {
+                        if (space > 0) {
+                            memcpy(dst->buf + dst->off + dst->len, temp + written, space);
+                            dst->len += space;
+                            written += space;
+                            remain -= space;
+                        }
+                        /* Backend->client: buffer overflow in backend pending so we don't drop data */
+                        if (remain > 0 && src->type == CT_BACKEND && ensure_pending_capacity(src, remain)) {
+                            memcpy(src->pending_data + src->pending_len, temp + written, remain);
+                            src->pending_len += remain;
+                        }
+                    }
                     ep_mod(revpx, dst->fd, EPOLLOUT | EPOLLET);
                 }
             } else if (n == 0) {
                 rp_log_debug("Proxy connection closed by peer fd=%d\n", src->fd);
+                /* Backend closed: push any buffered response to client before cleanup */
+                if (src->type == CT_BACKEND && src->pending_len > 0 && dst && dst->type == CT_CLIENT) {
+                    size_t space = buffer_space(dst);
+                    if (space == 0) compact_buffer(dst);
+                    space = buffer_space(dst);
+                    size_t to_copy = space < src->pending_len ? space : src->pending_len;
+                    if (to_copy > 0) {
+                        memcpy(dst->buf + dst->off + dst->len, src->pending_data, to_copy);
+                        dst->len += to_copy;
+                        ep_mod(revpx, dst->fd, EPOLLOUT | EPOLLET);
+                    }
+                }
                 cleanup(revpx, src->fd);
                 return;
             } else {
@@ -725,6 +793,18 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
                 }
                 if (err == SSL_ERROR_ZERO_RETURN || (err == SSL_ERROR_SYSCALL && errno == 0)) {
                     rp_log_debug("Proxy connection fd=%d closed (SSL_ERROR_ZERO_RETURN)\n", src->fd);
+                    /* Same: push backend pending to client before cleanup */
+                    if (src->type == CT_BACKEND && src->pending_len > 0 && dst && dst->type == CT_CLIENT) {
+                        size_t space = buffer_space(dst);
+                        if (space == 0) compact_buffer(dst);
+                        space = buffer_space(dst);
+                        size_t to_copy = space < src->pending_len ? space : src->pending_len;
+                        if (to_copy > 0) {
+                            memcpy(dst->buf + dst->off + dst->len, src->pending_data, to_copy);
+                            dst->len += to_copy;
+                            ep_mod(revpx, dst->fd, EPOLLOUT | EPOLLET);
+                        }
+                    }
                     cleanup(revpx, src->fd);
                     return;
                 }
@@ -1735,8 +1815,9 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
     }
 
     if (events & EPOLLHUP) {
-        if (c->state == ST_PROXYING && (events & EPOLLIN)) {
-            proxy_data(revpx, c, events);
+        if (c->state == ST_PROXYING) {
+            /* Drain any remaining data before closing; treat HUP as readable */
+            proxy_data(revpx, c, events | EPOLLIN);
             return;
         }
         if (c->state != ST_SHUTTING_DOWN) {

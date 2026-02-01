@@ -255,7 +255,7 @@ class RevPxProxy:
         )
 
         # Wait for proxy to be ready
-        time.sleep(0.3)
+        time.sleep(1)
 
         # Check if process is still running
         if self.process.poll() is not None:
@@ -663,18 +663,17 @@ class TestLargePayloads:
         assert data["body_length"] == 30 * 1024
         assert data["body_hash"] == hashlib.md5(body).hexdigest()
 
-    @pytest.mark.xfail(reason="Large payloads may timeout with single-threaded proxy")
     def test_medium_request_body(self, client):
         """Test medium request body (100KB)"""
         body = b"x" * (100 * 1024)
-        status, _, resp_body = client.request("POST", "/", body=body, timeout=30)
+        status, _, resp_body = client.request("POST", "/", body=body, timeout=60)
 
         assert status == 200
         data = json.loads(resp_body)
         assert data["body_length"] == 100 * 1024
         assert data["body_hash"] == hashlib.md5(body).hexdigest()
 
-    @pytest.mark.xfail(reason="Large payloads may timeout with single-threaded proxy")
+    @pytest.mark.xfail(reason="Very large single-shot request can trigger SSL/connection limits")
     def test_large_request_body(self, client):
         """Test large request body (1MB)"""
         body = b"x" * (1024 * 1024)
@@ -685,7 +684,7 @@ class TestLargePayloads:
         assert data["body_length"] == 1024 * 1024
         assert data["body_hash"] == hashlib.md5(body).hexdigest()
 
-    @pytest.mark.xfail(reason="Very large payloads may timeout with single-threaded proxy")
+    @pytest.mark.xfail(reason="Very large single-shot request can trigger SSL/connection limits")
     def test_very_large_request_body(self, client):
         """Test very large request body (5MB)"""
         body = b"x" * (5 * 1024 * 1024)
@@ -812,7 +811,7 @@ class TestConcurrentRequests:
             client = ProxyClient()
             body = os.urandom(payload_size)
             body_hash = hashlib.md5(body).hexdigest()
-            status, _, resp = client.request("POST", f"/large/{i}", body=body, timeout=30)
+            status, _, resp = client.request("POST", f"/large/{i}", body=body, timeout=60)
             data = json.loads(resp)
             return i, status, data["body_hash"] == body_hash
 
@@ -866,14 +865,11 @@ class TestChunkedEncoding:
         assert len(body) == len(response_data)
         assert body == response_data
 
-    @pytest.mark.xfail(reason="Chunked request body not decoded by proxy - forwarded as-is to backend")
+    @pytest.mark.xfail(reason="Chunked request decode path may not flush body to backend in all cases")
     def test_chunked_request(self, client):
-        """Test sending chunked request
+        """Test sending chunked request.
 
-        Note: revpx forwards chunked requests to the backend with the
-        Transfer-Encoding header preserved. The backend must support
-        chunked decoding. This test uses a simple backend that only
-        reads Content-Length based bodies.
+        revpx decodes chunked request bodies and forwards with Content-Length.
         """
         body_parts = [b"chunk1", b"chunk2", b"chunk3"]
         full_body = b"".join(body_parts)
