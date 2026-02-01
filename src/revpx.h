@@ -23,11 +23,12 @@
 
 #define RP_DEFAULT_BACKEND_HOST "127.0.0.1"
 #define RP_MAX_EVENTS 1024
-#define RP_BUF_SIZE (32 * 1024)
+#define RP_BUF_SIZE (128 * 1024)
 #define RP_MAX_FD (64 * 1024)
 #define RP_MAX_DOMAINS 128
 #define RP_INITIAL_RESP_HEADER 1024
 #define RP_MAX_RESP_HEADER (64 * 1024)
+#define RP_MAX_DECODED_BODY (16 * 1024 * 1024)
 
 enum log_level {
     RP_DEBUG,
@@ -96,6 +97,17 @@ typedef struct {
     bool resp_chunk_in_trailer;
     bool resp_chunk_in_ext;
     uint32_t resp_chunk_trailer_window;
+    // Pending data buffer for backpressure handling
+    unsigned char *pending_data;
+    size_t pending_len;
+    size_t pending_cap;
+    // Chunked request decoding buffer
+    bool decoding_chunked;
+    unsigned char *decoded_body;
+    size_t decoded_body_len;
+    size_t decoded_body_cap;
+    unsigned char *saved_headers;
+    size_t saved_headers_len;
 } RpConnection;
 
 typedef struct {
@@ -171,6 +183,7 @@ static void ep_mod(RevPx *revpx, int fd, uint32_t events) {
 }
 
 static void cleanup(RevPx *revpx, int fd) {
+    // Close fd, release SSL/buffers, and notify the peer so it can finish pending work.
     if (fd < 0 || fd >= RP_MAX_FD || !revpx->conns[fd]) return;
     RpConnection *c = revpx->conns[fd];
     int peer = c->peer;
@@ -195,6 +208,23 @@ static void cleanup(RevPx *revpx, int fd) {
         c->resp_header_cap = 0;
         c->resp_header_len = 0;
     }
+    if (c->pending_data) {
+        free(c->pending_data);
+        c->pending_data = NULL;
+        c->pending_cap = 0;
+        c->pending_len = 0;
+    }
+    if (c->decoded_body) {
+        free(c->decoded_body);
+        c->decoded_body = NULL;
+        c->decoded_body_cap = 0;
+        c->decoded_body_len = 0;
+    }
+    if (c->saved_headers) {
+        free(c->saved_headers);
+        c->saved_headers = NULL;
+        c->saved_headers_len = 0;
+    }
     close(fd);
     free(c);
 
@@ -211,6 +241,7 @@ static void cleanup(RevPx *revpx, int fd) {
     }
 }
 
+// Tear down both halves of a proxied pair, ensuring neither side keeps dangling state.
 static void cleanup_both(RevPx *revpx, int fd) {
     if (fd < 0 || fd >= RP_MAX_FD || !revpx->conns[fd]) return;
     int peer = revpx->conns[fd]->peer;
@@ -222,6 +253,7 @@ static void cleanup_both(RevPx *revpx, int fd) {
     }
 }
 
+// Clear every bit of response bookkeeping so the backend parser can start fresh.
 static void reset_response_state(RpConnection *backend) {
     backend->resp_need_header = true;
     backend->resp_parsing_header = false;
@@ -238,6 +270,7 @@ static void reset_response_state(RpConnection *backend) {
     backend->resp_header_len = 0;
 }
 
+// Allocate and register a new RpConnection, rejecting descriptors above RP_MAX_FD.
 static RpConnection *alloc_conn(RevPx *revpx, int fd, SSL *ssl, RpConnectionState state, RpConnectionType type) {
     if (fd >= RP_MAX_FD || revpx->conns[fd]) {
         if (fd >= RP_MAX_FD)
@@ -285,6 +318,7 @@ static size_t buffer_space(RpConnection *c) {
     return used < sizeof(c->buf) ? sizeof(c->buf) - used : 0;
 }
 
+// Format and queue a tiny HTML error response, then mark the client for close.
 static void send_error(RevPx *revpx, RpConnection *c, int code, const char *status) {
     char body[1024];
     int body_len = snprintf(body, sizeof(body),
@@ -308,6 +342,7 @@ static void send_error(RevPx *revpx, RpConnection *c, int code, const char *stat
     ep_mod(revpx, c->fd, EPOLLOUT | EPOLLET);
 }
 
+// Issue an HTTP 301 redirect that pushes plain HTTP users onto the HTTPS listener.
 static void send_redirect(RevPx *revpx, RpConnection *c, const char *host, const char *target, const char *port) {
     char resp[2048];
     int n = snprintf(resp, sizeof(resp),
@@ -339,6 +374,7 @@ static int find_headers_end(const unsigned char *buf, size_t len) {
     return -1;
 }
 
+// Parse the Host header (first occurrence) out of an HTTP request buffer.
 static void extract_host(const unsigned char *buf, size_t len, char *out, size_t max) {
     const char *p = (const char *)buf;
     const char *end = p + len;
@@ -378,6 +414,7 @@ static void extract_host(const unsigned char *buf, size_t len, char *out, size_t
     out[0] = '\0';
 }
 
+// Extract the request target from the request line, defaulting to '/'.
 static void extract_target(const unsigned char *buf, size_t len, char *out, size_t max) {
     const char *p = (const char *)buf;
     const char *end = p + len;
@@ -458,6 +495,7 @@ static unsigned char *find_header_ci_in(const unsigned char *p, size_t header_le
     return NULL;
 }
 
+// Lazily build (and cache) an SSL_CTX per domain so SNI can swap certificates on demand.
 static SSL_CTX *get_ctx(RevPx *revpx, const char *host) {
     for (int i = 0; i < revpx->domain_count; i++) {
         RpHostDomain *d = &revpx->domains[i];
@@ -519,6 +557,7 @@ static int sni_callback(SSL *ssl, int *ad, void *arg) {
 }
 
 static void flush_buffer(RevPx *revpx, RpConnection *c) {
+    // Drain the write buffer for connection c, handling SSL backpressure and retries.
     while (c->len > 0) {
         int n = do_write(c, c->buf + c->off, c->len);
         if (n > 0) {
@@ -567,6 +606,16 @@ static void flush_buffer(RevPx *revpx, RpConnection *c) {
             RpConnection *peer = c->peer >= 0 ? revpx->conns[c->peer] : NULL;
             if (peer && peer->read_stalled) {
                 peer->read_stalled = false;
+                // Process any pending data from the stalled peer first
+                if (peer->pending_len > 0 && peer->type == CT_CLIENT) {
+                    unsigned char *pending = peer->pending_data;
+                    size_t pending_len = peer->pending_len;
+                    peer->pending_len = 0;  // Clear before calling to avoid infinite loop
+                    if (!forward_client_bytes(revpx, peer, c, pending, pending_len)) {
+                        return;  // Error handled in forward_client_bytes
+                    }
+                    if (!revpx->conns[c->fd]) return;  // Connection was cleaned up
+                }
                 ep_mod(revpx, peer->fd, EPOLLIN | EPOLLET);
             }
             ep_mod(revpx, c->fd, EPOLLIN | EPOLLET);
@@ -575,6 +624,7 @@ static void flush_buffer(RevPx *revpx, RpConnection *c) {
 }
 
 static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
+    // Move bytes between client/backend while respecting buffer capacity on both sides.
     RpConnection *dst = src->peer >= 0 ? revpx->conns[src->peer] : NULL;
 
     if (!dst && !src->closing) {
@@ -690,6 +740,7 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
 }
 
 static void tunnel_data(RevPx *revpx, RpConnection *src, uint32_t events) {
+    // WebSocket/CONNECT tunnel: blindly shuffle bytes until either side closes.
     if (events & EPOLLOUT) {
         flush_buffer(revpx, src);
         if (!revpx->conns[src->fd]) return;
@@ -748,6 +799,7 @@ static void tunnel_data(RevPx *revpx, RpConnection *src, uint32_t events) {
     }
 }
 
+// Resolve and open a non-blocking TCP socket to the configured upstream.
 static int create_backend(const char *host, const char *port) {
     struct addrinfo hints = {0}, *res;
     hints.ai_family = AF_UNSPEC;
@@ -812,6 +864,7 @@ static bool has_chunked_encoding(const unsigned char *buf, size_t len) {
     return false;
 }
 
+// Grow the temporary response-header buffer until it can fit 'needed' bytes (capped by RP_MAX_RESP_HEADER).
 static bool ensure_response_header_capacity(RpConnection *backend, size_t needed) {
     if (needed > RP_MAX_RESP_HEADER) return false;
     size_t cap = backend->resp_header_cap ? backend->resp_header_cap : RP_INITIAL_RESP_HEADER;
@@ -827,6 +880,116 @@ static bool ensure_response_header_capacity(RpConnection *backend, size_t needed
     return true;
 }
 
+// Expand the per-connection pending buffer used when backpressure pauses reads.
+static bool ensure_pending_capacity(RpConnection *conn, size_t additional) {
+    size_t needed = conn->pending_len + additional;
+    if (needed > RP_BUF_SIZE * 4) return false;  // Limit pending to 4x buffer
+    if (needed <= conn->pending_cap) return true;
+    size_t cap = conn->pending_cap ? conn->pending_cap : 4096;
+    while (cap < needed) cap *= 2;
+    if (cap > RP_BUF_SIZE * 4) cap = RP_BUF_SIZE * 4;
+    unsigned char *buf = realloc(conn->pending_data, cap);
+    if (!buf) return false;
+    conn->pending_data = buf;
+    conn->pending_cap = cap;
+    return true;
+}
+
+// Ensure we have enough room to accumulate a fully decoded chunked request body.
+static bool ensure_decoded_body_capacity(RpConnection *conn, size_t additional) {
+    size_t needed = conn->decoded_body_len + additional;
+    if (needed > RP_MAX_DECODED_BODY) return false;
+    if (needed <= conn->decoded_body_cap) return true;
+    size_t cap = conn->decoded_body_cap ? conn->decoded_body_cap : 4096;
+    while (cap < needed) cap *= 2;
+    if (cap > RP_MAX_DECODED_BODY) cap = RP_MAX_DECODED_BODY;
+    unsigned char *buf = realloc(conn->decoded_body, cap);
+    if (!buf) return false;
+    conn->decoded_body = buf;
+    conn->decoded_body_cap = cap;
+    return true;
+}
+
+// Decode chunked body into decoded_body buffer
+// Returns: bytes consumed on success, -1 on error, sets decoding_chunked=false when complete
+static ssize_t decode_chunked_to_buffer(RpConnection *conn, const unsigned char *data, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        if (conn->chunk_expect_crlf) {
+            unsigned char expected = conn->chunk_line_len == 0 ? '\r' : '\n';
+            if (data[i] != expected) return -1;
+            conn->chunk_line_len++;
+            i++;
+            if (conn->chunk_line_len == 2) {
+                conn->chunk_expect_crlf = false;
+                conn->chunk_line_len = 0;
+            }
+            continue;
+        }
+
+        if (conn->chunk_left > 0) {
+            size_t take = conn->chunk_left < n - i ? conn->chunk_left : n - i;
+            // Copy chunk data to decoded_body
+            if (!ensure_decoded_body_capacity(conn, take)) return -1;
+            memcpy(conn->decoded_body + conn->decoded_body_len, data + i, take);
+            conn->decoded_body_len += take;
+            conn->chunk_left -= take;
+            i += take;
+            if (conn->chunk_left == 0) {
+                conn->chunk_expect_crlf = true;
+                conn->chunk_line_len = 0;
+            }
+            continue;
+        }
+
+        if (conn->chunk_in_trailer) {
+            conn->chunk_trailer_window = (conn->chunk_trailer_window << 8) | data[i];
+            conn->chunk_trailer_window &= 0xffffffffu;
+            i++;
+            if (conn->chunk_trailer_window == 0x0d0a0d0a) {
+                // Chunked body complete
+                conn->decoding_chunked = false;
+                conn->chunk_in_trailer = false;
+                conn->chunk_trailer_window = 0;
+                conn->chunk_size_acc = 0;
+                conn->chunk_line_len = 0;
+                conn->chunk_expect_crlf = false;
+                conn->chunk_in_ext = false;
+                conn->chunk_left = 0;
+                return (ssize_t)i;
+            }
+            continue;
+        }
+
+        unsigned char ch = data[i++];
+        if (ch == '\r') continue;
+        if (ch == '\n') {
+            conn->chunk_left = conn->chunk_size_acc;
+            conn->chunk_size_acc = 0;
+            conn->chunk_line_len = 0;
+            conn->chunk_in_ext = false;
+            if (conn->chunk_left == 0) {
+                conn->chunk_in_trailer = true;
+                // Pre-populate window with the CRLF that ended the chunk size line
+                conn->chunk_trailer_window = 0x0d0a;
+            }
+            continue;
+        }
+        if (ch == ';' || ch == ' ' || ch == '\t') {
+            conn->chunk_in_ext = true;
+            continue;
+        }
+        if (conn->chunk_in_ext) continue;
+        if (conn->chunk_line_len >= 16) return -1;
+        int hv = hex_value(ch);
+        if (hv < 0) return -1;
+        conn->chunk_size_acc = (conn->chunk_size_acc << 4) | (size_t)hv;
+        conn->chunk_line_len++;
+    }
+    return (ssize_t)n;
+}
+
+// Once CRLFCRLF is seen, compute backend response metadata (chunked?, content-length, etc.).
 static bool finalize_response_headers(RpConnection *backend) {
     if (!backend->resp_header_buf || backend->resp_header_len == 0) return false;
     int headers_end = find_headers_end(backend->resp_header_buf, backend->resp_header_len);
@@ -863,6 +1026,7 @@ static bool finalize_response_headers(RpConnection *backend) {
     return true;
 }
 
+// Walk the backend chunk stream, updating resp_chunk_* bookkeeping and signaling when done.
 static ssize_t advance_response_chunked(RpConnection *backend, const unsigned char *data, size_t n) {
     size_t i = 0;
     while (i < n) {
@@ -928,6 +1092,7 @@ static ssize_t advance_response_chunked(RpConnection *backend, const unsigned ch
     return (ssize_t)n;
 }
 
+// Parse backend bytes into headers/body so we know when a response completes (for keep-alive correctness).
 static bool handle_backend_response_bytes(RevPx *revpx, RpConnection *backend, const unsigned char *data, size_t n) {
     size_t offset = 0;
 
@@ -1005,6 +1170,7 @@ static bool handle_backend_response_bytes(RevPx *revpx, RpConnection *backend, c
     return true;
 }
 
+// Track how much of a chunked *request* body has traversed the wire (before optional decoding kicks in).
 static ssize_t advance_chunked(RpConnection *backend, const unsigned char *data, size_t n) {
     size_t i = 0;
     while (i < n) {
@@ -1107,6 +1273,7 @@ static void fill_peer_ip(int fd, char *out, size_t max) {
     }
 }
 
+// Strip any user-supplied forwarding headers and replace them with ones derived from the client socket.
 static bool inject_forwarded_headers(RpConnection *conn, int source_fd) {
     char injected_ip[INET6_ADDRSTRLEN];
     fill_peer_ip(source_fd, injected_ip, sizeof(injected_ip));
@@ -1190,7 +1357,35 @@ static bool inject_forwarded_headers(RpConnection *conn, int source_fd) {
     return true;
 }
 
+static bool forward_decoded_chunked_request(RevPx *revpx, RpConnection *client, RpConnection *backend);
+
 static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnection *backend, const unsigned char *data, size_t n) {
+    // Parse the client stream, inject proxy headers, and normalize bodies before backend sees them.
+    // If we're decoding a chunked request body, continue decoding
+    if (backend->decoding_chunked) {
+        ssize_t consumed = decode_chunked_to_buffer(backend, data, n);
+        if (consumed < 0) {
+            send_error(revpx, client, 400, "Bad Request");
+            cleanup(revpx, backend->fd);
+            return false;
+        }
+        // Check if decoding is complete
+        if (!backend->decoding_chunked) {
+            // Decoding finished - forward the complete request
+            if (!forward_decoded_chunked_request(revpx, client, backend)) {
+                return false;
+            }
+            // Handle any leftover data (next pipelined request)
+            if ((size_t)consumed < n) {
+                size_t leftover = n - (size_t)consumed;
+                backend->req_need_header = true;
+                backend->req_parsing_header = true;
+                return forward_client_bytes(revpx, client, backend, data + consumed, leftover);
+            }
+        }
+        return true;
+    }
+
     while (n > 0) {
         if (backend->req_need_header && !backend->req_parsing_header) backend->req_parsing_header = true;
         if (backend->req_parsing_header) compact_buffer(backend);
@@ -1201,10 +1396,19 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
                 cleanup(revpx, backend->fd);
                 return false;
             }
+            // Store remaining data in pending buffer to avoid data loss
+            if (n > 0) {
+                if (!ensure_pending_capacity(client, n)) {
+                    send_error(revpx, client, 413, "Request Entity Too Large");
+                    cleanup(revpx, backend->fd);
+                    return false;
+                }
+                memcpy(client->pending_data + client->pending_len, data, n);
+                client->pending_len += n;
+            }
             if (!client->read_stalled) {
                 client->read_stalled = true;
-                uint32_t ev = client->len > 0 ? (EPOLLOUT | EPOLLET) : 0;
-                if (ev) ep_mod(revpx, client->fd, ev);
+                ep_mod(revpx, client->fd, 0);  // Stop reading entirely
             }
             ep_mod(revpx, backend->fd, EPOLLOUT | EPOLLET);
             return true;
@@ -1251,6 +1455,19 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
                 backend->req_parsing_header = false;
                 size_t body_avail = backend->len > header_end ? backend->len - header_end : 0;
                 if (backend->req_chunked) {
+                    // Save headers for later transformation (will add Content-Length)
+                    backend->saved_headers = malloc(header_end);
+                    if (!backend->saved_headers) {
+                        send_error(revpx, client, 500, "Internal Server Error");
+                        cleanup(revpx, backend->fd);
+                        return false;
+                    }
+                    memcpy(backend->saved_headers, backend->buf, header_end);
+                    backend->saved_headers_len = header_end;
+
+                    // Initialize chunked decoding state
+                    backend->decoding_chunked = true;
+                    backend->decoded_body_len = 0;
                     backend->chunk_left = 0;
                     backend->chunk_size_acc = 0;
                     backend->chunk_line_len = 0;
@@ -1258,39 +1475,47 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
                     backend->chunk_in_trailer = false;
                     backend->chunk_in_ext = false;
                     backend->chunk_trailer_window = 0;
+
+                    // Decode any available body data
                     if (body_avail) {
-                        ssize_t consumed = advance_chunked(backend, backend->buf + header_end, body_avail);
+                        // Copy body data before clearing buffer
+                        unsigned char body_tmp[RP_BUF_SIZE];
+                        if (body_avail > sizeof(body_tmp)) {
+                            send_error(revpx, client, 413, "Request Entity Too Large");
+                            cleanup(revpx, backend->fd);
+                            return false;
+                        }
+                        memcpy(body_tmp, backend->buf + header_end, body_avail);
+
+                        // Clear buffer - don't forward headers yet
+                        backend->off = 0;
+                        backend->len = 0;
+
+                        ssize_t consumed = decode_chunked_to_buffer(backend, body_tmp, body_avail);
                         if (consumed < 0) {
                             send_error(revpx, client, 400, "Bad Request");
                             cleanup(revpx, backend->fd);
                             return false;
                         }
-                        if ((size_t)consumed < body_avail) {
-                            size_t leftover = body_avail - (size_t)consumed;
-                            if (backend->len >= leftover) backend->len -= leftover;
-                            unsigned char tmpbuf[RP_BUF_SIZE];
-                            if (leftover > sizeof(tmpbuf)) {
-                                send_error(revpx, client, 413, "Request Entity Too Large");
-                                cleanup(revpx, backend->fd);
+                        // Check if decoding is complete
+                        if (!backend->decoding_chunked) {
+                            if (!forward_decoded_chunked_request(revpx, client, backend)) {
                                 return false;
                             }
-                            memcpy(tmpbuf, backend->buf + header_end + consumed, leftover);
-                            flush_buffer(revpx, backend);
-                            if (!revpx->conns[backend->fd]) return false;
-                            if (backend->len > 0) {
-                                send_error(revpx, client, 400, "Bad Request");
-                                cleanup(revpx, backend->fd);
-                                return false;
+                            // Handle leftover (next pipelined request)
+                            if ((size_t)consumed < body_avail) {
+                                size_t leftover = body_avail - (size_t)consumed;
+                                backend->req_need_header = true;
+                                backend->req_parsing_header = true;
+                                return forward_client_bytes(revpx, client, backend, body_tmp + consumed, leftover);
                             }
-                            backend->off = 0;
-                            backend->len = 0;
-                            backend->req_parsing_header = true;
-                            backend->req_need_header = true;
-                            if (!forward_client_bytes(revpx, client, backend, tmpbuf, leftover)) return false;
-                            return revpx->conns[backend->fd] != NULL;
                         }
+                    } else {
+                        // Clear buffer - don't forward headers yet
+                        backend->off = 0;
+                        backend->len = 0;
                     }
-                    if (backend->req_chunked == false) backend->req_parsing_header = false;
+                    return true;
                 } else {
                     size_t body_used = body_avail < backend->req_body_left ? body_avail : backend->req_body_left;
                     if (backend->req_body_left > 0) backend->req_body_left -= body_used;
@@ -1373,7 +1598,121 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
     return revpx->conns[backend->fd] != NULL;
 }
 
+// Forward a decoded chunked request to the backend
+// Called after chunked body is fully decoded in decoded_body
+static bool forward_decoded_chunked_request(RevPx *revpx, RpConnection *client, RpConnection *backend) {
+    if (!backend->saved_headers || backend->saved_headers_len == 0) {
+        send_error(revpx, client, 500, "Internal Server Error");
+        cleanup(revpx, backend->fd);
+        return false;
+    }
+
+    // Find Transfer-Encoding header in saved headers and remove it
+    unsigned char *headers = backend->saved_headers;
+    size_t headers_len = backend->saved_headers_len;
+
+    // Find headers end (should be at saved_headers_len)
+    int hdr_end = find_headers_end(headers, headers_len);
+    if (hdr_end <= 0) {
+        send_error(revpx, client, 500, "Internal Server Error");
+        cleanup(revpx, backend->fd);
+        return false;
+    }
+
+    // Build new headers without Transfer-Encoding, with Content-Length
+    // Calculate space needed
+    char cl_header[64];
+    int cl_len = snprintf(cl_header, sizeof(cl_header), "Content-Length: %zu\r\n", backend->decoded_body_len);
+
+    // Copy headers to buffer, filtering out Transfer-Encoding
+    backend->off = 0;
+    backend->len = 0;
+
+    const unsigned char *src = headers;
+    const unsigned char *src_end = headers + hdr_end - 4;  // Exclude final CRLFCRLF
+    bool first_line = true;
+
+    while (src < src_end) {
+        const unsigned char *line_end = (const unsigned char *)memchr(src, '\n', src_end - src);
+        if (!line_end) line_end = src_end;
+        else line_end++;
+
+        size_t line_len = line_end - src;
+
+        // Skip Transfer-Encoding header (case-insensitive)
+        if (!first_line && line_len > 18 &&
+            strncasecmp((const char *)src, "Transfer-Encoding:", 18) == 0) {
+            src = line_end;
+            continue;
+        }
+
+        // Copy line to buffer
+        if (backend->len + line_len >= sizeof(backend->buf)) {
+            send_error(revpx, client, 431, "Request Header Fields Too Large");
+            cleanup(revpx, backend->fd);
+            return false;
+        }
+        memcpy(backend->buf + backend->len, src, line_len);
+        backend->len += line_len;
+
+        first_line = false;
+        src = line_end;
+    }
+
+    // Add Content-Length header and final CRLFCRLF
+    if (backend->len + (size_t)cl_len + 2 >= sizeof(backend->buf)) {
+        send_error(revpx, client, 431, "Request Header Fields Too Large");
+        cleanup(revpx, backend->fd);
+        return false;
+    }
+    memcpy(backend->buf + backend->len, cl_header, cl_len);
+    backend->len += cl_len;
+
+    // Add final CRLF to end headers (cl_header already has CRLF at end)
+    memcpy(backend->buf + backend->len, "\r\n", 2);
+    backend->len += 2;
+
+    // Free saved headers - no longer needed
+    free(backend->saved_headers);
+    backend->saved_headers = NULL;
+    backend->saved_headers_len = 0;
+
+    // Set up for body forwarding
+    backend->req_chunked = false;
+    backend->req_parsing_header = false;
+
+    // Copy decoded body to buffer (assuming it fits with headers)
+    size_t space = buffer_space(backend);
+    if (backend->decoded_body_len > space) {
+        // Body too large for buffer - this shouldn't happen for reasonably sized requests
+        send_error(revpx, client, 413, "Request Entity Too Large");
+        cleanup(revpx, backend->fd);
+        return false;
+    }
+
+    if (backend->decoded_body_len > 0) {
+        memcpy(backend->buf + backend->len, backend->decoded_body, backend->decoded_body_len);
+        backend->len += backend->decoded_body_len;
+    }
+
+    // Free decoded body
+    if (backend->decoded_body) {
+        free(backend->decoded_body);
+        backend->decoded_body = NULL;
+        backend->decoded_body_len = 0;
+        backend->decoded_body_cap = 0;
+    }
+
+    backend->req_body_left = 0;
+    backend->req_need_header = true;
+
+    // Flush the complete request to backend
+    flush_buffer(revpx, backend);
+    return revpx->conns[backend->fd] != NULL;
+}
+
 static void handle_event(RevPx *revpx, int fd, uint32_t events) {
+    // Central epoll dispatcher: advance each connection's state machine based on readiness flags.
     RpConnection *c = revpx->conns[fd];
     if (!c) return;
 
@@ -1415,7 +1754,7 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
 
 skip_flush:
     switch (c->state) {
-    case ST_SSL_HANDSHAKE: {
+    case ST_SSL_HANDSHAKE: { // Finish TLS negotiation before reading HTTP bytes.
         int ret = SSL_accept(c->ssl);
         if (ret == 1) {
             c->state = ST_READ_HEADER;
@@ -1442,7 +1781,7 @@ skip_flush:
         break;
     }
 
-    case ST_READ_HEADER: {
+    case ST_READ_HEADER: { // Accumulate an HTTP request header from the client.
         size_t space = sizeof(c->buf) - c->len;
         if (space == 0) {
             rp_log_error("Header too large for fd=%d\n", fd);
@@ -1539,7 +1878,7 @@ skip_flush:
         break;
     }
 
-    case ST_CONNECTING: {
+    case ST_CONNECTING: { // Backend socket is in-flight; once ready flip to proxying/upgrading.
         if (c->ssl) {
             if (events & EPOLLIN) {
                 while (1) {
@@ -1635,7 +1974,7 @@ skip_flush:
         break;
     }
 
-    case ST_UPGRADING: {
+    case ST_UPGRADING: { // Wait for a 101 response to complete the WebSocket handshake.
         RpConnection *client = revpx->conns[c->peer];
         if (!client) {
             rp_log_error("WebSocket upgrade error: client connection lost for fd=%d\n", fd);
@@ -1681,15 +2020,15 @@ skip_flush:
         break;
     }
 
-    case ST_PROXYING:
+    case ST_PROXYING: // Normal HTTP proxy path once both sides are established.
         proxy_data(revpx, c, events);
         break;
 
-    case ST_TUNNELING:
+    case ST_TUNNELING: // After CONNECT/WebSocket upgrade, blindly tunnel bytes.
         tunnel_data(revpx, c, events);
         break;
 
-    case ST_SHUTTING_DOWN: {
+    case ST_SHUTTING_DOWN: { // Coordinate half-close so lingering SSL shutdown completes cleanly.
         if (!c->ssl) {
             shutdown(c->fd, SHUT_WR);
             cleanup(revpx, c->fd);
@@ -1725,6 +2064,7 @@ skip_flush:
     }
 }
 
+// Bind a non-blocking listening socket for either HTTP or HTTPS traffic.
 static int create_listener(const char *port) {
     struct addrinfo hints = {0}, *res;
     hints.ai_family = AF_UNSPEC;
@@ -1804,6 +2144,7 @@ void print_proxy_domains(RevPx *revpx) {
 }
 
 int revpx_run_server(RevPx *revpx) {
+    // Initialize listeners, bootstrap TLS, and drive the epoll loop until shutdown.
     print_art();
     print_proxy_domains(revpx);
 
