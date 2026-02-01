@@ -7,3 +7,4 @@ revpx
 build/
 target/
 __pycache__/
+test_config.json
