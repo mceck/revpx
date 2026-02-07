@@ -64,24 +64,21 @@ revpx --file revpx.example.json
 
 ## Building from Source
 
-This project uses `nob.c` as a build system. To build the project, you need a C compiler (like `gcc` or `clang`) and OpenSSL development libraries.
+This project depends on OpenSSL and libyaml. Make sure you have the development headers installed (e.g. `libssl-dev` and `libyaml-dev` on Debian-based systems).
 
 ```bash
-# 1. Compile the build script
-cc -o nob nob.c
-
-# 2. Build the project
-./nob
+# Compile the project
+make
+# Install the binary system-wide (optional)
+make install
 ```
 
 ### Scripts
 
-- `./nob`: Build the project
-- `./nob update`: Update dependencies
-- `./nob test`: Build and run the tests
-- `./nob run [...]`: Build and run the project
-- `./nob example`: Build and run with example domain `test.localhost` on port `8080`
-- `./nob install`: Install the binary system-wide in /usr/local/bin
+- `make`: Build the project
+- `make test`: Build and run the tests
+- `make example`: Build and run with example domain `test.localhost` on port `8080`
+- `make install`: Install the binary system-wide in /usr/local/bin
 
 ### C api
 

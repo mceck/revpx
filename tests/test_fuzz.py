@@ -22,7 +22,6 @@ import struct
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from io import BytesIO
 from typing import Optional
 
 import pytest
@@ -35,7 +34,6 @@ from test_revpx import (
     ProxyClient,
     RevPxProxy,
     HTTPS_PORT,
-    HTTP_PORT,
     BACKEND_PORT,
     TEST_DOMAIN,
 )

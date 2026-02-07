@@ -17,25 +17,20 @@ Tests cover:
 - Error conditions and edge cases
 """
 
-import asyncio
 import hashlib
 import json
 import os
-import random
-import signal
 import socket
 import ssl
-import string
 import subprocess
 import sys
 import threading
 import time
-import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from io import BytesIO
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 import pytest
 
@@ -115,7 +110,7 @@ class BackendHandler(BaseHTTPRequestHandler):
         BackendHandler.captured_requests.append(req)
         return req
 
-    def _send_response(self, status: int = 200, headers: dict = None, body: bytes = b""):
+    def _send_response(self, status: int = 200, headers: dict | None = None, body: bytes = b""):
         """Send a response with optional delay"""
         if BackendHandler.response_delay > 0:
             time.sleep(BackendHandler.response_delay)
@@ -319,8 +314,8 @@ class ProxyClient:
         self,
         method: str = "GET",
         path: str = "/",
-        headers: dict = None,
-        body: bytes = None,
+        headers: dict | None = None,
+        body: bytes | None = None,
         timeout: float = 10.0
     ) -> tuple[int, dict, bytes]:
         """Make an HTTP request and return (status, headers, body)"""
