@@ -77,10 +77,33 @@ class BackendHandler(BaseHTTPRequestHandler):
         """Suppress default logging"""
         pass
 
+    def _read_chunked_body(self):
+        """Read a chunked transfer-encoded body"""
+        body = b""
+        while True:
+            line = self.rfile.readline()
+            line = line.strip()
+            if not line:
+                break
+            try:
+                chunk_size = int(line.split(b";")[0], 16)
+            except ValueError:
+                break
+            if chunk_size == 0:
+                self.rfile.readline()  # trailing CRLF
+                break
+            body += self.rfile.read(chunk_size)
+            self.rfile.readline()  # trailing CRLF
+        return body
+
     def _capture_request(self) -> CapturedRequest:
         """Capture and store request details"""
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length) if content_length > 0 else b""
+        te = self.headers.get("Transfer-Encoding", "")
+        if "chunked" in te.lower():
+            body = self._read_chunked_body()
+        else:
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length) if content_length > 0 else b""
 
         req = CapturedRequest(
             method=self.command,
@@ -673,7 +696,6 @@ class TestLargePayloads:
         assert data["body_length"] == 100 * 1024
         assert data["body_hash"] == hashlib.md5(body).hexdigest()
 
-    @pytest.mark.xfail(reason="Very large single-shot request can trigger SSL/connection limits")
     def test_large_request_body(self, client):
         """Test large request body (1MB)"""
         body = b"x" * (1024 * 1024)
@@ -684,7 +706,6 @@ class TestLargePayloads:
         assert data["body_length"] == 1024 * 1024
         assert data["body_hash"] == hashlib.md5(body).hexdigest()
 
-    @pytest.mark.xfail(reason="Very large single-shot request can trigger SSL/connection limits")
     def test_very_large_request_body(self, client):
         """Test very large request body (5MB)"""
         body = b"x" * (5 * 1024 * 1024)
@@ -694,7 +715,6 @@ class TestLargePayloads:
         data = json.loads(resp_body)
         assert data["body_length"] == 5 * 1024 * 1024
 
-    @pytest.mark.xfail(reason="Large single-shot response may have timing issues with read loop")
     def test_large_response_body(self, client):
         """Test large response from backend (1MB)"""
         response_size = 1024 * 1024
@@ -710,6 +730,56 @@ class TestLargePayloads:
         assert status == 200
         assert len(body) == response_size
         assert body == response_data
+
+    def test_very_large_response_body(self, client):
+        """Test very large response from backend (5MB)"""
+        response_size = 5 * 1024 * 1024
+        response_data = os.urandom(response_size)
+
+        def custom_response(handler, req):
+            handler._send_response(200, {"Content-Type": "application/octet-stream"}, response_data)
+
+        BackendHandler.custom_response = custom_response
+
+        status, headers, body = client.request("GET", "/very-large-response", timeout=60)
+
+        assert status == 200
+        assert len(body) == response_size
+        assert body == response_data
+
+    def test_response_data_integrity(self, client):
+        """Test that response data arrives in correct order (not corrupted)"""
+        # Create a pattern that makes out-of-order delivery detectable
+        response_size = 256 * 1024  # 256KB
+        response_data = bytes(range(256)) * (response_size // 256)
+
+        def custom_response(handler, req):
+            handler._send_response(200, {"Content-Type": "application/octet-stream"}, response_data)
+
+        BackendHandler.custom_response = custom_response
+
+        status, _, body = client.request("GET", "/integrity", timeout=30)
+
+        assert status == 200
+        assert len(body) == len(response_data)
+        assert body == response_data, "Response data arrived corrupted or out of order"
+
+    def test_large_response_content_length_match(self, client):
+        """Test Content-Length matches actual body for large responses"""
+        for size in [64 * 1024, 256 * 1024, 1024 * 1024]:
+            response_data = b"A" * size
+
+            def custom_response(handler, req, data=response_data):
+                handler._send_response(200, {"Content-Type": "application/octet-stream"}, data)
+
+            BackendHandler.custom_response = custom_response
+
+            status, headers, body = client.request("GET", f"/cl-match/{size}", timeout=30)
+
+            assert status == 200
+            cl = int(headers.get("Content-Length", -1))
+            assert cl == size, f"Content-Length header {cl} != expected {size}"
+            assert len(body) == size, f"Body length {len(body)} != expected {size}"
 
     def test_binary_payload(self, client):
         """Test binary data with all byte values"""
@@ -871,7 +941,6 @@ class TestChunkedEncoding:
         assert len(body) == len(response_data)
         assert body == response_data
 
-    @pytest.mark.xfail(reason="Chunked request decode path may not flush body to backend in all cases")
     def test_chunked_request(self, client):
         """Test sending chunked request.
 
@@ -1201,6 +1270,259 @@ class TestHTTPRedirect:
             assert "https" in response.lower() or "Location" in response
         finally:
             sock.close()
+
+
+# ============================================================================
+# Streaming and Large Data Tests
+# ============================================================================
+
+class TestStreamingResponses:
+    """Test streaming and large data handling - targets buffer management bugs"""
+
+    def test_backend_slow_stream(self, client):
+        """Test backend that sends response body slowly in pieces"""
+        total_size = 100 * 1024  # 100KB
+        response_data = os.urandom(total_size)
+
+        def custom_response(handler, req):
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/octet-stream")
+            handler.send_header("Content-Length", str(total_size))
+            handler.end_headers()
+            # Send in small chunks with delays
+            chunk_size = 4096
+            for i in range(0, total_size, chunk_size):
+                handler.wfile.write(response_data[i:i + chunk_size])
+                handler.wfile.flush()
+                time.sleep(0.001)
+
+        BackendHandler.custom_response = custom_response
+
+        status, headers, body = client.request("GET", "/slow-stream", timeout=30)
+
+        assert status == 200
+        assert len(body) == total_size
+        assert body == response_data
+
+    def test_concurrent_large_responses(self, proxy):
+        """Test multiple clients receiving large responses simultaneously"""
+        response_size = 512 * 1024  # 512KB each
+
+        def custom_response(handler, req):
+            data = os.urandom(response_size)
+            handler._send_response(200, {
+                "Content-Type": "application/octet-stream",
+                "X-Expected-Size": str(response_size),
+            }, data)
+
+        BackendHandler.custom_response = custom_response
+
+        def make_request(i):
+            c = ProxyClient()
+            status, headers, body = c.request("GET", f"/concurrent-large/{i}", timeout=30)
+            return i, status, len(body), int(headers.get("X-Expected-Size", 0))
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(make_request, i) for i in range(5)]
+            results = [f.result() for f in as_completed(futures)]
+
+        for i, status, body_len, expected in results:
+            assert status == 200, f"Request {i}: got status {status}"
+            assert body_len == expected, f"Request {i}: body {body_len} != expected {expected}"
+
+    def test_large_request_and_response(self, client):
+        """Test large request body with large response body"""
+        req_body = os.urandom(256 * 1024)  # 256KB request
+        resp_size = 256 * 1024  # 256KB response
+        resp_data = os.urandom(resp_size)
+
+        def custom_response(handler, req):
+            handler._send_response(200, {
+                "Content-Type": "application/octet-stream",
+                "X-Req-Hash": hashlib.md5(req.body).hexdigest(),
+            }, resp_data)
+
+        BackendHandler.custom_response = custom_response
+
+        status, headers, body = client.request("POST", "/echo-large", body=req_body, timeout=30)
+
+        assert status == 200
+        assert headers.get("X-Req-Hash") == hashlib.md5(req_body).hexdigest()
+        assert len(body) == resp_size
+        assert body == resp_data
+
+    def test_many_sequential_large_responses(self, client):
+        """Test many sequential requests with large responses on different connections"""
+        response_size = 128 * 1024  # 128KB
+
+        for i in range(10):
+            response_data = bytes([i % 256]) * response_size
+
+            def custom_response(handler, req, data=response_data):
+                handler._send_response(200, {"Content-Type": "application/octet-stream"}, data)
+
+            BackendHandler.custom_response = custom_response
+
+            status, _, body = client.request("GET", f"/seq-large/{i}", timeout=15)
+
+            assert status == 200
+            assert len(body) == response_size, f"Iteration {i}: got {len(body)} bytes, expected {response_size}"
+            assert body == response_data, f"Iteration {i}: data mismatch"
+
+
+# ============================================================================
+# Connection Reuse with Payloads Tests
+# ============================================================================
+
+class TestKeepAliveWithPayloads:
+    """Test HTTP keep-alive with various payload sizes"""
+
+    def test_keepalive_multiple_large_posts(self, proxy):
+        """Test keep-alive with multiple large POST requests on same connection"""
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
+        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=15) as sock:
+            with context.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
+                for i in range(5):
+                    body = os.urandom(10 * 1024)  # 10KB
+                    body_hash = hashlib.md5(body).hexdigest()
+
+                    request = (
+                        f"POST /keepalive/{i} HTTP/1.1\r\n"
+                        f"Host: {TEST_DOMAIN}\r\n"
+                        f"Content-Length: {len(body)}\r\n"
+                        f"Connection: keep-alive\r\n"
+                        f"\r\n"
+                    ).encode() + body
+
+                    ssock.sendall(request)
+
+                    # Read response headers
+                    response = b""
+                    while b"\r\n\r\n" not in response:
+                        chunk = ssock.recv(8192)
+                        if not chunk:
+                            break
+                        response += chunk
+
+                    assert b"\r\n\r\n" in response, f"Iteration {i}: incomplete response headers"
+
+                    header_end = response.index(b"\r\n\r\n") + 4
+                    headers_part = response[:header_end].decode()
+
+                    content_length = 0
+                    for line in headers_part.split("\r\n"):
+                        if line.lower().startswith("content-length:"):
+                            content_length = int(line.split(":")[1].strip())
+
+                    body_data = response[header_end:]
+                    while len(body_data) < content_length:
+                        chunk = ssock.recv(8192)
+                        if not chunk:
+                            break
+                        body_data += chunk
+
+                    assert b"200" in response.split(b"\r\n")[0], f"Iteration {i}: not 200"
+
+                    data = json.loads(body_data[:content_length])
+                    assert data["body_hash"] == body_hash, f"Iteration {i}: body hash mismatch"
+
+    def test_keepalive_mixed_sizes(self, proxy):
+        """Test keep-alive with alternating small and large requests"""
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
+        sizes = [100, 50000, 200, 80000, 50]
+
+        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=30) as sock:
+            with context.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
+                for i, size in enumerate(sizes):
+                    body = os.urandom(size)
+                    body_hash = hashlib.md5(body).hexdigest()
+
+                    request = (
+                        f"POST /mixed-sizes/{i} HTTP/1.1\r\n"
+                        f"Host: {TEST_DOMAIN}\r\n"
+                        f"Content-Length: {len(body)}\r\n"
+                        f"Connection: keep-alive\r\n"
+                        f"\r\n"
+                    ).encode() + body
+
+                    ssock.sendall(request)
+
+                    response = b""
+                    while b"\r\n\r\n" not in response:
+                        chunk = ssock.recv(8192)
+                        if not chunk:
+                            break
+                        response += chunk
+
+                    assert b"\r\n\r\n" in response
+
+                    header_end = response.index(b"\r\n\r\n") + 4
+                    headers_part = response[:header_end].decode()
+
+                    content_length = 0
+                    for line in headers_part.split("\r\n"):
+                        if line.lower().startswith("content-length:"):
+                            content_length = int(line.split(":")[1].strip())
+
+                    body_data = response[header_end:]
+                    while len(body_data) < content_length:
+                        chunk = ssock.recv(8192)
+                        if not chunk:
+                            break
+                        body_data += chunk
+
+                    assert b"200" in response.split(b"\r\n")[0]
+                    data = json.loads(body_data[:content_length])
+                    assert data["body_hash"] == body_hash, f"Size {size}: body hash mismatch"
+
+
+# ============================================================================
+# Pipelining with Bodies Tests
+# ============================================================================
+
+class TestHTTPPipelining:
+    """Test HTTP pipelining edge cases"""
+
+    def test_pipelined_posts(self, proxy):
+        """Test pipelined POST requests with bodies"""
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
+        bodies = [b"body1", b"body22", b"body333"]
+
+        # Build all requests at once
+        all_requests = b""
+        for i, body in enumerate(bodies):
+            all_requests += (
+                f"POST /pipeline/{i} HTTP/1.1\r\n"
+                f"Host: {TEST_DOMAIN}\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                f"Connection: keep-alive\r\n"
+                f"\r\n"
+            ).encode() + body
+
+        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=15) as sock:
+            with context.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
+                ssock.sendall(all_requests)
+
+                # Read all responses
+                all_data = b""
+                responses_found = 0
+                while responses_found < len(bodies):
+                    chunk = ssock.recv(8192)
+                    if not chunk:
+                        break
+                    all_data += chunk
+                    responses_found = all_data.count(b"HTTP/1.1 200")
+
+                assert responses_found == len(bodies), f"Expected {len(bodies)} responses, got {responses_found}"
 
 
 # ============================================================================

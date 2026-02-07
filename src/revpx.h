@@ -543,6 +543,37 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
                 return;
             }
 
+            // Process any buffered data in src before reading new data from SSL
+            // (data saved by forward_client_bytes when backend was blocked)
+            if (src->len > 0 && src->type == CT_CLIENT && dst->type == CT_BACKEND
+                && !src->websocket && !dst->websocket) {
+                size_t saved = src->len;
+                unsigned char saved_buf[RP_BUF_SIZE];
+                memcpy(saved_buf, src->buf + src->off, saved);
+                src->len = 0;
+                src->off = 0;
+                if (!forward_client_bytes(revpx, src, dst, saved_buf, saved)) return;
+                dst = src->peer >= 0 ? revpx->conns[src->peer] : NULL;
+                if (!dst) { cleanup(revpx, src->fd); return; }
+                if (src->len > 0) {
+                    // Still can't forward all — wait for backend flush
+                    src->read_stalled = true;
+                    ep_mod(revpx, dst->fd, EPOLLOUT | EPOLLET);
+                    break;
+                }
+            }
+
+            // If dst has buffered data waiting to flush, don't read more from src
+            // to avoid out-of-order delivery (new direct writes would bypass buffered data)
+            if (dst->len > 0) {
+                compact_buffer(dst);
+                if (dst->len > 0) {
+                    src->read_stalled = true;
+                    ep_mod(revpx, dst->fd, EPOLLOUT | EPOLLET);
+                    break;
+                }
+            }
+
             size_t dst_space = buffer_space(dst);
             if (dst_space == 0) {
                 compact_buffer(dst);
@@ -550,11 +581,7 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
             }
 
             if (dst_space == 0) {
-                if (!src->read_stalled) {
-                    src->read_stalled = true;
-                    uint32_t ev = src->len > 0 ? (EPOLLOUT | EPOLLET) : 0;
-                    if (ev) ep_mod(revpx, src->fd, ev);
-                }
+                src->read_stalled = true;
                 ep_mod(revpx, dst->fd, EPOLLOUT | EPOLLET);
                 break;
             }
@@ -592,8 +619,8 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
                             dst->write_retry_count++;
                             break;
                         }
-                        rp_log_error("Connection fd=%d: max write retries exceeded in proxy\n", src->fd);
-                        cleanup(revpx, src->fd);
+                        rp_log_error("Connection fd=%d: max write retries exceeded in proxy\n", dst->fd);
+                        cleanup_both(revpx, dst->fd);
                         return;
                     }
                 }
@@ -601,9 +628,17 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
                 if (written < (size_t)n) {
                     size_t remain = n - written;
                     if (buffer_space(dst) < remain) compact_buffer(dst);
+                    if (buffer_space(dst) < remain) {
+                        rp_log_error("Buffer overflow: cannot store %zu bytes for fd=%d\n", remain, dst->fd);
+                        cleanup_both(revpx, src->fd);
+                        return;
+                    }
                     memcpy(dst->buf + dst->off + dst->len, temp + written, remain);
                     dst->len += remain;
+                    // Stop reading from src until dst buffer is flushed
+                    src->read_stalled = true;
                     ep_mod(revpx, dst->fd, EPOLLOUT | EPOLLET);
+                    break;
                 }
             } else if (n == 0) {
                 rp_log_debug("Proxy connection closed by peer fd=%d\n", src->fd);
@@ -958,13 +993,24 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
                 cleanup(revpx, backend->fd);
                 return false;
             }
-            if (!client->read_stalled) {
+            // Flush buffer to make space
+            flush_buffer(revpx, backend);
+            if (!revpx->conns[backend->fd]) return false;
+            compact_buffer(backend);
+            space = buffer_space(backend);
+            if (space == 0) {
+                // Backend socket blocked — save remaining input in client buffer
+                compact_buffer(client);
+                size_t cs = buffer_space(client);
+                size_t save = n < cs ? n : cs;
+                if (save > 0) {
+                    memcpy(client->buf + client->off + client->len, data, save);
+                    client->len += save;
+                }
                 client->read_stalled = true;
-                uint32_t ev = client->len > 0 ? (EPOLLOUT | EPOLLET) : 0;
-                if (ev) ep_mod(revpx, client->fd, ev);
+                ep_mod(revpx, backend->fd, EPOLLOUT | EPOLLET);
+                return true;
             }
-            ep_mod(revpx, backend->fd, EPOLLOUT | EPOLLET);
-            return true;
         }
         size_t to_copy = n < space ? n : space;
         if (!backend->req_parsing_header && !backend->req_chunked && backend->req_body_left > 0 && to_copy > backend->req_body_left) {
@@ -984,19 +1030,22 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
                     backend->off = 0;
                 }
                 end = find_headers_end(backend->buf, backend->len);
-                if (!inject_forwarded_headers(backend, client->fd)) {
-                    send_error(revpx, client, 400, "Bad Request");
-                    cleanup(revpx, backend->fd);
-                    return false;
-                }
-                end = find_headers_end(backend->buf, backend->len);
-                size_t header_end = (size_t)end;
-                backend->req_chunked = has_chunked_encoding(backend->buf, header_end);
-                backend->req_body_left = 0;
+                size_t orig_header_end = (size_t)end;
 
+                // Separate body from headers so inject_forwarded_headers has room
+                size_t saved_body_len = backend->len > orig_header_end ? backend->len - orig_header_end : 0;
+                unsigned char saved_body[RP_BUF_SIZE];
+                if (saved_body_len > 0) {
+                    memcpy(saved_body, backend->buf + orig_header_end, saved_body_len);
+                    backend->len = orig_header_end;
+                }
+
+                // Parse headers before injection (need original headers for CL/TE)
+                backend->req_chunked = has_chunked_encoding(backend->buf, orig_header_end);
+                backend->req_body_left = 0;
                 const char *cl = NULL;
                 size_t cl_len = 0;
-                if (find_header(backend->buf, header_end, "Content-Length", &cl, &cl_len) && cl_len > 0) {
+                if (find_header(backend->buf, orig_header_end, "Content-Length", &cl, &cl_len) && cl_len > 0) {
                     char tmp[32];
                     size_t copy_len = cl_len >= sizeof(tmp) ? sizeof(tmp) - 1 : cl_len;
                     memcpy(tmp, cl, copy_len);
@@ -1004,8 +1053,27 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
                     backend->req_body_left = strtoull(tmp, NULL, 10);
                 }
 
+                if (!inject_forwarded_headers(backend, client->fd)) {
+                    send_error(revpx, client, 400, "Bad Request");
+                    cleanup(revpx, backend->fd);
+                    return false;
+                }
+
                 backend->req_need_header = false;
                 backend->req_parsing_header = false;
+
+                // Flush headers, then forward saved body data
+                if (saved_body_len > 0) {
+                    flush_buffer(revpx, backend);
+                    if (!revpx->conns[backend->fd]) return false;
+                    backend->off = 0;
+                    backend->len = 0;
+                    // Forward saved body as new input
+                    if (!forward_client_bytes(revpx, client, backend, saved_body, saved_body_len)) return false;
+                    return revpx->conns[backend->fd] != NULL;
+                }
+
+                size_t header_end = (size_t)find_headers_end(backend->buf, backend->len);
                 size_t body_avail = backend->len > header_end ? backend->len - header_end : 0;
                 if (backend->req_chunked) {
                     backend->chunk_left = 0;
@@ -1300,9 +1368,10 @@ skip_flush:
         if (c->ssl) {
             if (events & EPOLLIN) {
                 while (1) {
+                    compact_buffer(c);
                     size_t space = buffer_space(c);
                     if (space == 0) {
-                        send_error(revpx, c, 413, "Request Entity Too Large");
+                        // Buffer full — stop reading until backend connects and data is forwarded
                         break;
                     }
                     int n = do_read(c, c->buf + c->off + c->len, space);
@@ -1401,7 +1470,7 @@ skip_flush:
 
         int n = do_read(c, c->buf + c->len, sizeof(c->buf) - c->len);
         if (n > 0) {
-            c->len = n;
+            c->len += n;
         } else if (n <= 0 && errno == EAGAIN) {
             ep_mod(revpx, c->fd, EPOLLIN | EPOLLET);
             break;
