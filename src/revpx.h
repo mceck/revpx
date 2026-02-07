@@ -22,10 +22,18 @@
 #include "ep.h"
 
 #define RP_DEFAULT_BACKEND_HOST "127.0.0.1"
+#ifndef RP_MAX_EVENTS
 #define RP_MAX_EVENTS 1024
-#define RP_BUF_SIZE 32768
-#define RP_MAX_FD 65536
+#endif
+#ifndef RP_BUF_SIZE
+#define RP_BUF_SIZE (32 * 1024)
+#endif
+#ifndef RP_MAX_FD
+#define RP_MAX_FD (64 * 1024)
+#endif
+#ifndef RP_MAX_DOMAINS
 #define RP_MAX_DOMAINS 128
+#endif
 
 // ==== Logging ====
 enum log_level {
