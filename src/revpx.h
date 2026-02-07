@@ -66,6 +66,21 @@ extern void (*rp_log_handler)(int level, const char *fmt, ...);
 
 // ==== RevPx API ====
 
+/**
+ * Connection state machine:
+ *
+ *  [accept] -> SSL_HANDSHAKE -> READ_HEADER -> CONNECTING -> PROXYING -> SHUTTING_DOWN
+ *                                                  |              |
+ *                                                  +-> UPGRADING -+-> TUNNELING -> SHUTTING_DOWN
+ *
+ *  SSL_HANDSHAKE:  TLS negotiation in progress (client-side only)
+ *  READ_HEADER:    Reading the initial HTTP request headers from the client
+ *  CONNECTING:     Backend TCP connect() in progress; client data is buffered meanwhile
+ *  UPGRADING:      WebSocket: waiting for backend 101 response before switching to tunnel mode
+ *  PROXYING:       Bidirectional HTTP proxy with request-boundary tracking (client→backend)
+ *  TUNNELING:      Raw bidirectional byte forwarding (WebSocket after 101 upgrade)
+ *  SHUTTING_DOWN:  Graceful SSL_shutdown / TCP shutdown in progress
+ */
 typedef enum {
     ST_SSL_HANDSHAKE,
     ST_READ_HEADER,
@@ -84,26 +99,37 @@ typedef enum {
 typedef struct {
     RpConnectionType type;
     int fd;
-    SSL *ssl;
-    int peer;
+    SSL *ssl;           // NULL for plain TCP (backends, HTTP redirect clients)
+    int peer;           // fd of the paired connection (client↔backend), -1 if none
     RpConnectionState state;
+
+    // I/O buffer: buf[off .. off+len) contains pending outbound data.
+    // For clients in ST_CONNECTING, it temporarily holds incoming request body bytes
+    // that arrived before the backend connection was established.
     unsigned char buf[RP_BUF_SIZE];
     size_t len, off;
-    bool closing;
-    int write_retry_count;
-    bool read_stalled;
-    bool websocket;
-    bool req_need_header;
-    bool req_parsing_header;
-    bool req_chunked;
-    size_t req_body_left;
-    size_t chunk_left;
-    size_t chunk_size_acc;
-    int chunk_line_len;
-    bool chunk_expect_crlf;
-    bool chunk_in_trailer;
-    bool chunk_in_ext;
-    uint32_t chunk_trailer_window;
+
+    bool closing;           // after buffer flush, close/shutdown the connection
+    int write_retry_count;  // consecutive failed writes, cleanup after 5
+    bool read_stalled;      // reading paused because peer's write buffer is full (backpressure)
+    bool websocket;         // request contained Upgrade: websocket
+
+    // Request boundary tracking (backend-side only, used in forward_client_bytes).
+    // Enables keep-alive by knowing where one request ends and the next begins,
+    // so forwarded-headers can be injected into each new request.
+    bool req_need_header;       // next bytes should be the start of a new HTTP request
+    bool req_parsing_header;    // accumulating header bytes, waiting for \r\n\r\n
+    bool req_chunked;           // current request uses Transfer-Encoding: chunked
+    size_t req_body_left;       // remaining Content-Length bytes for the current request
+
+    // Chunked transfer-encoding parser state (backend-side)
+    size_t chunk_left;          // bytes remaining in current chunk data
+    size_t chunk_size_acc;      // accumulated hex digit value for chunk size line
+    int chunk_line_len;         // hex digits parsed so far (max 16)
+    bool chunk_expect_crlf;     // expecting CRLF after chunk data
+    bool chunk_in_trailer;      // inside trailer section after final 0-size chunk
+    bool chunk_in_ext;          // inside chunk extensions (after ';')
+    uint32_t chunk_trailer_window; // sliding window to detect \r\n\r\n end of trailers
 } RpConnection;
 
 typedef struct {
@@ -253,6 +279,11 @@ static void ep_mod(RevPx *revpx, int fd, uint32_t events) {
     }
 }
 
+/**
+ * Close a connection and begin graceful shutdown of its peer.
+ * If the peer still has buffered data, it flushes first (closing=true),
+ * otherwise it enters ST_SHUTTING_DOWN immediately.
+ */
 static void cleanup(RevPx *revpx, int fd) {
     if (fd < 0 || fd >= RP_MAX_FD || !revpx->conns[fd]) return;
     RpConnection *c = revpx->conns[fd];
@@ -268,6 +299,7 @@ static void cleanup(RevPx *revpx, int fd) {
     close(fd);
     free(c);
 
+    // Signal the peer to drain its buffer and shut down
     if (peer >= 0 && revpx->conns[peer]) {
         RpConnection *p = revpx->conns[peer];
         p->peer = -1;
@@ -553,6 +585,11 @@ static SSL_CTX *get_ctx(RevPx *revpx, const char *host) {
     return NULL;
 }
 
+/**
+ * SNI callback: select the correct SSL_CTX based on the client's requested hostname.
+ * Falls back to the first configured domain if no match (or no SNI extension).
+ * Each domain's SSL_CTX is lazily initialized on first use in get_ctx().
+ */
 static int sni_callback(SSL *ssl, int *ad, void *arg) {
     (void)ad;
     RevPx *revpx = (RevPx *)arg;
@@ -565,6 +602,12 @@ static int sni_callback(SSL *ssl, int *ad, void *arg) {
     return SSL_TLSEXT_ERR_OK;
 }
 
+/**
+ * Attempt to write all buffered data (buf[off..off+len)) to the connection.
+ * Non-blocking: returns early if the socket would block (WANT_WRITE/WANT_READ),
+ * leaving remaining data in the buffer. On full flush, re-enables reading on
+ * the peer if it was stalled (backpressure relief).
+ */
 static void flush_buffer(RevPx *revpx, RpConnection *c) {
     while (c->len > 0) {
         int n = do_write(c, c->buf + c->off, c->len);
@@ -621,6 +664,19 @@ static void flush_buffer(RevPx *revpx, RpConnection *c) {
     }
 }
 
+/**
+ * Bidirectional proxy data transfer between src and its peer (dst).
+ *
+ * Key design points:
+ * - Backpressure: if dst's buffer is full, src stops reading (read_stalled) until
+ *   dst flushes, preventing unbounded memory use.
+ * - Out-of-order prevention: if dst has buffered data waiting to flush, we must NOT
+ *   read new data from src and write it directly — that would bypass the buffer and
+ *   deliver data out of order. We wait for the buffer to drain first.
+ * - Client→backend direction uses forward_client_bytes() for request boundary tracking
+ *   (Content-Length / chunked), enabling keep-alive header injection per request.
+ * - Backend→client direction is raw byte forwarding (no response parsing).
+ */
 static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
     RpConnection *dst = src->peer >= 0 ? revpx->conns[src->peer] : NULL;
 
@@ -644,8 +700,8 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
                 return;
             }
 
-            // Process any buffered data in src before reading new data from SSL
-            // (data saved by forward_client_bytes when backend was blocked)
+            // Drain any leftover bytes saved in client buffer by forward_client_bytes()
+            // when backend was blocked. Must be forwarded before reading new data.
             if (src->len > 0 && src->type == CT_CLIENT && dst->type == CT_BACKEND && !src->websocket && !dst->websocket) {
                 size_t saved = src->len;
                 unsigned char saved_buf[RP_BUF_SIZE];
@@ -666,8 +722,8 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
                 }
             }
 
-            // If dst has buffered data waiting to flush, don't read more from src
-            // to avoid out-of-order delivery (new direct writes would bypass buffered data)
+            // CRITICAL: prevent out-of-order writes. If dst has unsent buffered data,
+            // any new do_write() would leapfrog the buffer. Stall src until dst drains.
             if (dst->len > 0) {
                 compact_buffer(dst);
                 if (dst->len > 0) {
@@ -770,6 +826,11 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
     }
 }
 
+/**
+ * Raw bidirectional byte forwarding for WebSocket connections (after 101 upgrade).
+ * Unlike proxy_data, no request boundary parsing — just pass bytes through.
+ * Still respects backpressure via read_stalled when dst buffer is full.
+ */
 static void tunnel_data(RevPx *revpx, RpConnection *src, uint32_t events) {
     if (events & EPOLLOUT) {
         flush_buffer(revpx, src);
@@ -900,6 +961,17 @@ static int hex_value(int c) {
     return -1;
 }
 
+/**
+ * Chunked transfer-encoding state machine. Parses chunk framing to track
+ * request boundaries without modifying the data.
+ *
+ * Chunk format:  <hex-size>[;ext]\r\n <data>\r\n ... 0\r\n [trailers]\r\n\r\n
+ *
+ * Returns number of bytes consumed, or -1 on parse error.
+ * When the final chunk (size 0) and trailers are fully consumed, resets
+ * req_chunked=false and req_need_header=true so the next request's headers
+ * will be parsed and injected with forwarded headers.
+ */
 static ssize_t advance_chunked(RpConnection *backend, const unsigned char *data, size_t n) {
     size_t i = 0;
     while (i < n) {
@@ -1002,6 +1074,14 @@ static void fill_peer_ip(int fd, char *out, size_t max) {
     }
 }
 
+/**
+ * Inject X-Forwarded-For, X-Real-IP, X-Forwarded-Proto/Scheme/Host, and Forwarded
+ * headers into the HTTP request stored in conn->buf. Strips any pre-existing
+ * forwarded headers to prevent spoofing, then appends client IP from source_fd.
+ *
+ * The headers are inserted just before the \r\n\r\n terminator. Caller must ensure
+ * the buffer only contains headers (body separated beforehand) so there's room.
+ */
 static bool inject_forwarded_headers(RpConnection *conn, int source_fd) {
     char injected_ip[INET6_ADDRSTRLEN];
     fill_peer_ip(source_fd, injected_ip, sizeof(injected_ip));
@@ -1085,6 +1165,30 @@ static bool inject_forwarded_headers(RpConnection *conn, int source_fd) {
     return true;
 }
 
+/**
+ * Forward client data to the backend with HTTP request boundary awareness.
+ *
+ * This is the core of keep-alive support. It operates as a state machine
+ * on the backend connection, alternating between two phases:
+ *
+ * 1. HEADER PARSING (req_parsing_header=true):
+ *    Accumulate bytes until \r\n\r\n is found. Once complete:
+ *    - Parse Content-Length / Transfer-Encoding to know body boundaries
+ *    - Temporarily separate body from headers to make room for injection
+ *    - Call inject_forwarded_headers() to add X-Forwarded-For etc.
+ *    - Flush headers, then recursively forward the saved body bytes
+ *
+ * 2. BODY FORWARDING (req_parsing_header=false):
+ *    - Content-Length: decrement req_body_left, switch back to header mode at 0
+ *    - Chunked: feed bytes through advance_chunked() state machine
+ *    - When a request boundary is crossed mid-buffer, the leftover bytes
+ *      (belonging to the next request) are recursively forwarded
+ *
+ * Backpressure: if the backend socket blocks, flush first. If still blocked,
+ * save remaining input in the client's buffer and set read_stalled.
+ *
+ * Returns false if connection was closed/errored (caller should stop processing).
+ */
 static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnection *backend, const unsigned char *data, size_t n) {
     while (n > 0) {
         if (backend->req_need_header && !backend->req_parsing_header) backend->req_parsing_header = true;
@@ -1102,7 +1206,9 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
             compact_buffer(backend);
             space = buffer_space(backend);
             if (space == 0) {
-                // Backend socket blocked — save remaining input in client buffer
+                // Backend socket blocked after flush — can't write more right now.
+                // Save remaining input bytes in the client's own buffer so they
+                // aren't lost. proxy_data will drain these before reading new data.
                 compact_buffer(client);
                 size_t cs = buffer_space(client);
                 size_t save = n < cs ? n : cs;
@@ -1135,7 +1241,9 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
                 end = find_headers_end(backend->buf, backend->len);
                 size_t orig_header_end = (size_t)end;
 
-                // Separate body from headers so inject_forwarded_headers has room
+                // Temporarily remove body bytes from the buffer so that
+                // inject_forwarded_headers() has room to insert extra headers
+                // before the \r\n\r\n. Body will be re-forwarded after flush.
                 size_t saved_body_len = backend->len > orig_header_end ? backend->len - orig_header_end : 0;
                 unsigned char saved_body[RP_BUF_SIZE];
                 if (saved_body_len > 0) {
@@ -1301,6 +1409,11 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
     return revpx->conns[backend->fd] != NULL;
 }
 
+/**
+ * Main event dispatcher. Routes epoll events to the appropriate handler
+ * based on the connection's current state machine position.
+ * Handles EPOLLERR/EPOLLHUP before dispatching to state-specific logic.
+ */
 static void handle_event(RevPx *revpx, int fd, uint32_t events) {
     RpConnection *c = revpx->conns[fd];
     if (!c) return;
@@ -1335,6 +1448,8 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
         }
     }
 
+    // Flush pending outbound data for non-proxy states (proxy_data handles its own flush).
+    // Skip for ST_CONNECTING backend fds — they haven't finished connect() yet.
     if (c->state != ST_PROXYING && c->len > 0 && (events & EPOLLOUT)) {
         if (c->state == ST_CONNECTING) goto skip_flush;
         flush_buffer(revpx, c);
@@ -1468,6 +1583,10 @@ skip_flush:
     }
 
     case ST_CONNECTING: {
+        // For SSL clients: the backend TCP connect is in-flight. Meanwhile, the client
+        // may keep sending request body data. Buffer it here so it's not lost.
+        // Once the backend connects (EPOLLOUT on the backend fd), these buffered bytes
+        // are forwarded via forward_client_bytes.
         if (c->ssl) {
             if (events & EPOLLIN) {
                 while (1) {
@@ -1501,6 +1620,8 @@ skip_flush:
 
         if (!(events & EPOLLOUT)) break;
 
+        // Backend fd: EPOLLOUT means connect() completed. Check SO_ERROR to
+        // distinguish success from failure (async connect reports errors here).
         int err = 0;
         socklen_t len = sizeof(err);
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
@@ -1528,6 +1649,8 @@ skip_flush:
             break;
         }
 
+        // Initialize request boundary tracking on the backend so
+        // forward_client_bytes knows to parse the first request's headers
         c->req_need_header = true;
         c->req_parsing_header = true;
         c->req_chunked = false;
@@ -1564,6 +1687,9 @@ skip_flush:
     }
 
     case ST_UPGRADING: {
+        // WebSocket upgrade: read the backend's response. If it's "101 Switching Protocols",
+        // copy the response to the client buffer and transition both sides to ST_TUNNELING.
+        // Any other response means the upgrade failed → send 502 to client.
         RpConnection *client = revpx->conns[c->peer];
         if (!client) {
             rp_log_error("WebSocket upgrade error: client connection lost for fd=%d\n", fd);
@@ -1809,6 +1935,9 @@ int revpx_run_server(RevPx *revpx) {
         return -1;
     }
 
+    // Main event loop: dispatch epoll events to the appropriate handler.
+    // Listener fds (https_fd, http_fd) accept new connections in a loop (edge-triggered).
+    // All other fds are dispatched through handle_event() which routes by connection state.
     struct epoll_event events[RP_MAX_EVENTS];
     int ret = 0;
     while (!revpx->stop) {
