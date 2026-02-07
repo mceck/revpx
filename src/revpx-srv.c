@@ -287,6 +287,12 @@ int parse_args(RevPx *revpx, int argc, const char **argv) {
                 idx = 0;
             }
         }
+        // skip other named arguments
+        named_arg(&args, "help", "h");
+        named_arg(&args, "file", "f");
+        named_arg(&args, "monade", "m");
+        named_arg(&args, "port", "p");
+        named_arg(&args, "port-plain", "pp");
     }
     if (idx != 0) {
         rp_log_error("Incomplete domain mapping arguments\n");
