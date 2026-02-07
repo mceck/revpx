@@ -27,6 +27,7 @@
 #define RP_MAX_FD 65536
 #define RP_MAX_DOMAINS 128
 
+// ==== Logging ====
 enum log_level {
     RP_DEBUG,
     RP_INFO,
@@ -34,12 +35,28 @@ enum log_level {
     RP_ERROR
 };
 
+/**
+ * Set the log level for revpx. Messages with a level lower than this will be ignored.
+ * Default level is RP_INFO.
+ */
 void revpx_set_log_level(int level);
-void rp_log(int level, const char *fmt, ...);
-#define rp_log_info(FMT, ...) rp_log(RP_INFO, FMT __VA_OPT__(,) __VA_ARGS__)
-#define rp_log_debug(FMT, ...) rp_log(RP_DEBUG, FMT __VA_OPT__(,) __VA_ARGS__)
-#define rp_log_warn(FMT, ...) rp_log(RP_WARN, FMT __VA_OPT__(,) __VA_ARGS__)
-#define rp_log_error(FMT, ...) rp_log(RP_ERROR, FMT __VA_OPT__(,) __VA_ARGS__)
+/**
+ * Set a custom log handler for revpx. The handler will be called with the log level and formatted message.
+ * If not set, revpx will use a default log handler that prints to stdout/stderr.
+ * Look at rp_colored_log and rp_simple_log for examples of log handlers you can use or customize.
+ */
+void revpx_set_log_handler(void (*handler)(int level, const char *fmt, ...));
+void rp_colored_log(int level, const char *fmt, ...);
+void rp_simple_log(int level, const char *fmt, ...);
+void revpx_use_colored_log();
+void revpx_use_simple_log();
+extern void (*rp_log_handler)(int level, const char *fmt, ...);
+#define rp_log_info(FMT, ...) rp_log_handler(RP_INFO, FMT __VA_OPT__(, ) __VA_ARGS__)
+#define rp_log_debug(FMT, ...) rp_log_handler(RP_DEBUG, FMT __VA_OPT__(, ) __VA_ARGS__)
+#define rp_log_warn(FMT, ...) rp_log_handler(RP_WARN, FMT __VA_OPT__(, ) __VA_ARGS__)
+#define rp_log_error(FMT, ...) rp_log_handler(RP_ERROR, FMT __VA_OPT__(, ) __VA_ARGS__)
+
+// ==== RevPx API ====
 
 typedef enum {
     ST_SSL_HANDSHAKE,
@@ -100,35 +117,111 @@ typedef struct {
     RpConnection *conns[RP_MAX_FD];
 } RevPx;
 
+/**
+ * Create a new RevPx instance.
+ * @param http_port Port to listen for HTTP (will redirect to HTTPS)
+ * @param https_port Port to listen for HTTPS
+ */
 RevPx *revpx_create(const char *http_port, const char *https_port);
+/**
+ * Free a RevPx instance and all associated resources.
+ * @param revpx The RevPx instance to free
+ */
 void revpx_free(RevPx *revpx);
+/**
+ * Add a domain mapping to the reverse proxy.
+ * @param revpx The RevPx instance
+ * @param domain The domain name to match (e.g. "example.com")
+ * @param host The backend host to forward to (default: "127.0.0.1")
+ * @param port The backend port to forward to
+ * @param cert The path to the SSL certificate file
+ * @param key The path to the SSL key file
+ */
 bool revpx_add_domain(RevPx *revpx, const char *domain, const char *host, const char *port, const char *cert, const char *key);
+/**
+ * Start the reverse proxy server.
+ * Listens on https_port for HTTPS and redirects HTTP traffic from http_port to HTTPS.
+ * @param revpx The RevPx instance
+ * @return 0 on success, non-zero on failure
+ */
 int revpx_run_server(RevPx *revpx);
 #endif // REVPX_H
 
 #ifdef REVPX_IMPLEMENTATION
 int rp_log_level = RP_INFO;
-void revpx_set_log_level(int level){
+void revpx_set_log_level(int level) {
     rp_log_level = level;
 }
 
-void rp_log(int level, const char *fmt, ...) {
+void rp_colored_log(int level, const char *fmt, ...) {
     if (level < rp_log_level) return;
 
     const char *level_str;
+    FILE *fd = level >= RP_ERROR ? stderr : stdout;
     switch (level) {
-        case RP_DEBUG: level_str = "\033[36mDEBUG\033[0m"; break;
-        case RP_INFO: level_str = "\033[32mINFO\033[0m"; break;
-        case RP_WARN: level_str = "\033[33mWARN\033[0m"; break;
-        case RP_ERROR: level_str = "\033[31mERROR\033[0m"; break;
-        default: level_str = "LOG"; break;
+    case RP_DEBUG:
+        level_str = "\033[36mDEBUG\033[0m";
+        break;
+    case RP_INFO:
+        level_str = "\033[32mINFO\033[0m";
+        break;
+    case RP_WARN:
+        level_str = "\033[33mWARN\033[0m";
+        break;
+    case RP_ERROR:
+        level_str = "\033[31mERROR\033[0m";
+        break;
+    default:
+        level_str = "LOG";
+        break;
     }
 
     va_list args;
     va_start(args, fmt);
-    fprintf(stderr, "[%s] ", level_str);
-    vfprintf(stderr, fmt, args);
+    fprintf(fd, "[%s] ", level_str);
+    vfprintf(fd, fmt, args);
     va_end(args);
+}
+
+void rp_simple_log(int level, const char *fmt, ...) {
+    if (level < rp_log_level) return;
+
+    const char *level_str;
+    FILE *fd = level >= RP_ERROR ? stderr : stdout;
+    switch (level) {
+    case RP_DEBUG:
+        level_str = "DEBUG";
+        break;
+    case RP_INFO:
+        level_str = "INFO";
+        break;
+    case RP_WARN:
+        level_str = "WARN";
+        break;
+    case RP_ERROR:
+        level_str = "ERROR";
+        break;
+    default:
+        level_str = "LOG";
+        break;
+    }
+
+    va_list args;
+    va_start(args, fmt);
+    fprintf(fd, "[%s] ", level_str);
+    vfprintf(fd, fmt, args);
+    va_end(args);
+}
+
+void (*rp_log_handler)(int level, const char *fmt, ...) = rp_simple_log;
+void revpx_set_log_handler(void (*handler)(int level, const char *fmt, ...)) {
+    rp_log_handler = handler;
+}
+void revpx_use_colored_log(){
+    revpx_set_log_handler(rp_colored_log);
+}
+void revpx_use_simple_log(){
+    revpx_set_log_handler(rp_simple_log);
 }
 
 static void fill_peer_ip(int fd, char *out, size_t max);
@@ -545,8 +638,7 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
 
             // Process any buffered data in src before reading new data from SSL
             // (data saved by forward_client_bytes when backend was blocked)
-            if (src->len > 0 && src->type == CT_CLIENT && dst->type == CT_BACKEND
-                && !src->websocket && !dst->websocket) {
+            if (src->len > 0 && src->type == CT_CLIENT && dst->type == CT_BACKEND && !src->websocket && !dst->websocket) {
                 size_t saved = src->len;
                 unsigned char saved_buf[RP_BUF_SIZE];
                 memcpy(saved_buf, src->buf + src->off, saved);
@@ -554,7 +646,10 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
                 src->off = 0;
                 if (!forward_client_bytes(revpx, src, dst, saved_buf, saved)) return;
                 dst = src->peer >= 0 ? revpx->conns[src->peer] : NULL;
-                if (!dst) { cleanup(revpx, src->fd); return; }
+                if (!dst) {
+                    cleanup(revpx, src->fd);
+                    return;
+                }
                 if (src->len > 0) {
                     // Still can't forward all — wait for backend flush
                     src->read_stalled = true;

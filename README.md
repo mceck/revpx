@@ -80,7 +80,7 @@ cc -o nob nob.c
 - `./nob update`: Update dependencies
 - `./nob test`: Build and run the tests
 - `./nob run [...]`: Build and run the project
-- `./nob example`: Build and run with example domain `example.localhost` on port `8080`
+- `./nob example`: Build and run with example domain `test.localhost` on port `8080`
 - `./nob install`: Install the binary system-wide in /usr/local/bin
 
 ### C api
@@ -89,26 +89,42 @@ cc -o nob nob.c
 #include "revpx.h"
 /**
  * Create a new RevPx instance.
+ * @param http_port Port to listen for HTTP (will redirect to HTTPS)
+ * @param https_port Port to listen for HTTPS
  */
 RevPx *revpx_create(const char *http_port, const char *https_port);
 /**
+ * Free a RevPx instance and all associated resources.
+ * @param revpx The RevPx instance to free
+ */
+void revpx_free(RevPx *revpx);
+/**
  * Add a domain mapping to the reverse proxy.
+ * @param revpx The RevPx instance
+ * @param domain The domain name to match (e.g. "example.com")
+ * @param host The backend host to forward to (default: "127.0.0.1")
+ * @param port The backend port to forward to
+ * @param cert The path to the SSL certificate file
+ * @param key The path to the SSL key file
  */
 bool revpx_add_domain(RevPx *revpx, const char *domain, const char *host, const char *port, const char *cert, const char *key);
 /**
  * Start the reverse proxy server.
  * Listens on https_port for HTTPS and redirects HTTP traffic from http_port to HTTPS.
+ * @param revpx The RevPx instance
+ * @return 0 on success, non-zero on failure
  */
-void revpx_run_server(RevPx *revpx);
+int revpx_run_server(RevPx *revpx);
 /**
- * Free the RevPx instance and release resources.
+ * Set the log level for revpx. Messages with a level lower than this will be ignored.
+ * Default level is RP_INFO.
  */
-void revpx_free(RevPx *revpx);
+void revpx_set_log_level(int level);
 
 // Example usage
 int main() {
     RevPx *revpx = revpx_create("80", "443");
-    revpx_add_domain(revpx, "example.localhost", NULL, "8080", "example.localhost.pem", "example.localhost-key.pem");
+    revpx_add_domain(revpx, "test.localhost", NULL, "8080", "test.localhost.pem", "test.localhost-key.pem");
     revpx_run_server(revpx);
     revpx_free(revpx);
     return 0;
@@ -124,11 +140,11 @@ cargo add --git https://github.com/mceck/revpx.git
 ```rust
 let revpx = revpx::RevPx::default();
 revpx.add_domains(vec![revpx::DomainConfig {
-    domain: "example.localhost".to_string(),
+    domain: "test.localhost".to_string(),
     host: None,
     port: "8080".to_string(),
-    cert: "example.localhost.pem".to_string(),
-    key: "example.localhost-key.pem".to_string(),
+    cert: "test.localhost.pem".to_string(),
+    key: "test.localhost-key.pem".to_string(),
 }]);
 revpx.run_server();
 ```

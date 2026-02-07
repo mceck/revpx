@@ -4,6 +4,8 @@ type CRevPx = c_void;
 
 unsafe extern "C" {
     fn revpx_set_log_level(level: i32);
+    fn revpx_use_colored_log();
+    fn revpx_use_simple_log();
     fn revpx_add_domain(
         revpx: *mut CRevPx,
         domain: *const u8,
@@ -47,6 +49,18 @@ impl RevPx {
     pub fn set_log_level(level: i32) {
         unsafe {
             revpx_set_log_level(level);
+        }
+    }
+
+    pub fn use_colored_log() {
+        unsafe {
+            revpx_use_colored_log();
+        }
+    }
+
+    pub fn use_simple_log() {
+        unsafe {
+            revpx_use_simple_log();
         }
     }
 
