@@ -482,12 +482,12 @@ static void flush_buffer(RevPx *revpx, RpConnection *c) {
                 return;
             }
             if (err == SSL_ERROR_ZERO_RETURN || (err == SSL_ERROR_SYSCALL && errno == 0)) {
-                rp_log_error("Connection fd=%d closed during flush (SSL_ERROR_ZERO_RETURN)\n", c->fd);
+                rp_log_debug("Connection fd=%d closed during flush (SSL_ERROR_ZERO_RETURN)\n", c->fd);
                 cleanup_both(revpx, c->fd);
                 return;
             }
             if (err == SSL_ERROR_SYSCALL) {
-                rp_log_error("SSL write error fd=%d: %s\n", c->fd, strerror(errno));
+                rp_log_debug("SSL write error fd=%d: %s\n", c->fd, strerror(errno));
             }
             if (c->write_retry_count < 5) {
                 c->write_retry_count++;
@@ -608,12 +608,12 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
                             break;
                         }
                         if (err == SSL_ERROR_ZERO_RETURN || (err == SSL_ERROR_SYSCALL && errno == 0)) {
-                            rp_log_error("Peer connection fd=%d closed during proxy write\n", dst->fd);
+                            rp_log_debug("Peer connection fd=%d closed during proxy write\n", dst->fd);
                             cleanup_both(revpx, src->fd);
                             return;
                         }
                         if (err == SSL_ERROR_SYSCALL) {
-                            rp_log_error("SSL proxy write error fd=%d->%d: %s\n", src->fd, dst->fd, strerror(errno));
+                            rp_log_debug("SSL proxy write error fd=%d->%d: %s\n", src->fd, dst->fd, strerror(errno));
                         }
                         if (dst->write_retry_count < 5) {
                             dst->write_retry_count++;
