@@ -432,6 +432,7 @@ static void extract_host(const unsigned char *buf, size_t len, char *out, size_t
                 p++;
             const char *e = nl;
             if (e > p && e[-1] == '\r') e--;
+            while (e > p && (e[-1] == ' ' || e[-1] == '\t')) e--;
 
             size_t n = e - p;
             if (n >= max) n = max - 1;
@@ -1261,7 +1262,11 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
                     size_t copy_len = cl_len >= sizeof(tmp) ? sizeof(tmp) - 1 : cl_len;
                     memcpy(tmp, cl, copy_len);
                     tmp[copy_len] = '\0';
-                    backend->req_body_left = strtoull(tmp, NULL, 10);
+                    if (tmp[0] == '-') {
+                        backend->req_body_left = 0;
+                    } else {
+                        backend->req_body_left = strtoull(tmp, NULL, 10);
+                    }
                 }
 
                 if (!inject_forwarded_headers(backend, client->fd)) {
