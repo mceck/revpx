@@ -1,6 +1,4 @@
 # revpx
-This is just a POC made for fun.
-
 `revpx` is a lightweight, single-threaded reverse proxy server for development purposes.
 
 It supports TLS/SSL termination, SNI (Server Name Indication), and can forward traffic to multiple backend services based on the requested domain name.
