@@ -85,7 +85,11 @@ class BackendHandler(BaseHTTPRequestHandler):
             except ValueError:
                 break
             if chunk_size == 0:
-                self.rfile.readline()  # trailing CRLF
+                # Consume trailer headers and final blank line
+                while True:
+                    trailer_line = self.rfile.readline()
+                    if trailer_line in (b"\r\n", b"\n", b""):
+                        break
                 break
             body += self.rfile.read(chunk_size)
             self.rfile.readline()  # trailing CRLF

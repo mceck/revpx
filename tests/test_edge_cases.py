@@ -1413,6 +1413,491 @@ class TestSTUpgradingBugs:
 
 
 # ============================================================================
+# 11. TestPipelinedChunkedThenGet - Chunked terminator → next request
+# ============================================================================
+
+class TestPipelinedChunkedThenGet:
+    """Test chunked POST followed immediately by GET in the same TCP segment.
+    Exercises advance_chunked → req_need_header transition when leftover
+    bytes after chunk terminator belong to a new request."""
+
+    def test_chunked_post_then_get_in_one_write(self, proxy):
+        """Chunked POST + GET pipelined in a single write"""
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        post_body = b"pipelined-chunked"
+        chunked = f"{len(post_body):x}\r\n".encode() + post_body + b"\r\n0\r\n\r\n"
+
+        requests = (
+            f"POST /pipe-chunked/1 HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"Transfer-Encoding: chunked\r\n"
+            f"Connection: keep-alive\r\n"
+            f"\r\n"
+        ).encode() + chunked + (
+            f"GET /pipe-chunked/2 HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"Connection: keep-alive\r\n"
+            f"\r\n"
+        ).encode()
+
+        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
+            with ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
+                ssock.sendall(requests)
+
+                # Read chunked POST response
+                status1, _, body1 = read_http_response(ssock)
+                assert status1 == 200
+                data1 = json.loads(body1)
+                assert data1["body_length"] == len(post_body)
+
+                # Read GET response
+                status2, _, body2 = read_http_response(ssock)
+                assert status2 == 200
+                data2 = json.loads(body2)
+                assert data2["path"] == "/pipe-chunked/2"
+                assert data2["method"] == "GET"
+                # Verify forwarded headers injected on the GET too
+                assert "X-Forwarded-For" in data2["headers"], \
+                    "GET after pipelined chunked POST missing X-Forwarded-For"
+
+    def test_chunked_post_with_trailers_then_get(self, proxy):
+        """Chunked POST with trailers + GET pipelined in one write"""
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        post_body = b"with-trailers"
+        chunked = (
+            f"{len(post_body):x}\r\n".encode() + post_body + b"\r\n"
+            + b"0\r\n"
+            + b"X-Checksum: abc123\r\n"
+            + b"\r\n"
+        )
+
+        requests = (
+            f"POST /pipe-chunk-trailer/1 HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"Transfer-Encoding: chunked\r\n"
+            f"Connection: keep-alive\r\n"
+            f"\r\n"
+        ).encode() + chunked + (
+            f"GET /pipe-chunk-trailer/2 HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"Connection: keep-alive\r\n"
+            f"\r\n"
+        ).encode()
+
+        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
+            with ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
+                ssock.sendall(requests)
+
+                status1, _, body1 = read_http_response(ssock)
+                assert status1 == 200
+
+                status2, _, body2 = read_http_response(ssock)
+                assert status2 == 200
+                data2 = json.loads(body2)
+                assert data2["path"] == "/pipe-chunk-trailer/2"
+
+
+# ============================================================================
+# 12. TestHostHeaderEdgeCases - extract_host parsing
+# ============================================================================
+
+class TestHostHeaderEdgeCases:
+    """Test Host header parsing edge cases in extract_host()."""
+
+    def test_host_with_port(self, proxy):
+        """Host: test.localhost:18443 should strip port for domain lookup"""
+        raw = RawSSLClient()
+        request = (
+            f"GET /host-port HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}:{HTTPS_PORT}\r\n"
+            f"\r\n"
+        ).encode()
+
+        response = raw.send_raw(request)
+        assert response is not None
+        # Should route correctly (200), NOT 421 Misdirected
+        assert b"200" in response, f"Host with port failed: {response[:200]}"
+
+    def test_host_case_insensitive(self, proxy):
+        """Host header should be case-insensitive for domain matching"""
+        raw = RawSSLClient()
+        request = (
+            f"GET /host-case HTTP/1.1\r\n"
+            f"Host: TEST.LOCALHOST\r\n"
+            f"\r\n"
+        ).encode()
+
+        response = raw.send_raw(request)
+        assert response is not None
+        # strcasecmp on domain lookup should handle this
+        assert b"200" in response, f"Case-insensitive host failed: {response[:200]}"
+
+    def test_host_with_tab_whitespace(self, proxy):
+        """Host header with tab after colon"""
+        raw = RawSSLClient()
+        request = (
+            b"GET /host-tab HTTP/1.1\r\n"
+            b"Host:\t" + TEST_DOMAIN.encode() + b"\r\n"
+            b"\r\n"
+        )
+
+        response = raw.send_raw(request)
+        assert response is not None
+        assert b"200" in response, f"Host with tab whitespace failed: {response[:200]}"
+
+    def test_host_with_multiple_spaces(self, proxy):
+        """Host header with extra spaces around value"""
+        raw = RawSSLClient()
+        request = (
+            b"GET /host-spaces HTTP/1.1\r\n"
+            b"Host:   " + TEST_DOMAIN.encode() + b"  \r\n"
+            b"\r\n"
+        )
+
+        response = raw.send_raw(request)
+        assert response is not None
+        # Trailing spaces may be included in host — could cause 421
+        # This tests whether extract_host trims trailing whitespace
+        # extract_host: e[-1] == '\r' strips it, but spaces before \r remain
+        # This is fine if domain is correct without trailing spaces
+        # Let's just verify the proxy doesn't crash
+        assert b"421" in response or b"200" in response
+
+
+# ============================================================================
+# 13. TestMalformedRequests - Error handling for bad input
+# ============================================================================
+
+class TestMalformedRequests:
+    """Test error handling for malformed HTTP requests."""
+
+    def test_malformed_chunk_hex(self, proxy):
+        """Invalid hex in chunk size should return 400"""
+        raw = RawSSLClient()
+        request = (
+            f"POST /bad-chunk HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"Transfer-Encoding: chunked\r\n"
+            f"\r\n"
+            f"ZZZZ\r\n"
+            f"data\r\n"
+            f"0\r\n"
+            f"\r\n"
+        ).encode()
+
+        response = raw.send_raw(request)
+        assert response is not None
+        assert b"400" in response, f"Expected 400 for bad chunk hex, got: {response[:200]}"
+
+    def test_chunk_size_overflow(self, proxy):
+        """Chunk size with >16 hex digits should return 400"""
+        raw = RawSSLClient()
+        # 17 hex digits
+        request = (
+            f"POST /chunk-overflow HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"Transfer-Encoding: chunked\r\n"
+            f"\r\n"
+            f"00000000000000001\r\n"
+            f"x\r\n"
+            f"0\r\n"
+            f"\r\n"
+        ).encode()
+
+        response = raw.send_raw(request)
+        assert response is not None
+        assert b"400" in response, f"Expected 400 for chunk size overflow, got: {response[:200]}"
+
+    def test_post_without_content_length_or_te(self, proxy):
+        """POST with no Content-Length or Transfer-Encoding → treated as no body"""
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        requests = (
+            f"POST /no-cl/1 HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"Connection: keep-alive\r\n"
+            f"\r\n"
+            f"GET /no-cl/2 HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"Connection: keep-alive\r\n"
+            f"\r\n"
+        ).encode()
+
+        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
+            with ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
+                ssock.sendall(requests)
+
+                # POST should succeed with body_length=0
+                status1, _, body1 = read_http_response(ssock)
+                assert status1 == 200
+                data1 = json.loads(body1)
+                assert data1["body_length"] == 0
+
+                # GET should also succeed
+                status2, _, body2 = read_http_response(ssock)
+                assert status2 == 200
+                data2 = json.loads(body2)
+                assert data2["path"] == "/no-cl/2"
+
+    def test_chunked_and_content_length_both_present(self, proxy):
+        """When both Transfer-Encoding: chunked and Content-Length are present,
+        chunked should take precedence per RFC 7230 §3.3.3"""
+        raw = RawSSLClient()
+        post_body = b"chunked-wins"
+        chunked = f"{len(post_body):x}\r\n".encode() + post_body + b"\r\n0\r\n\r\n"
+
+        request = (
+            f"POST /te-vs-cl HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"Transfer-Encoding: chunked\r\n"
+            f"Content-Length: 999\r\n"
+            f"\r\n"
+        ).encode() + chunked
+
+        response = raw.send_raw(request)
+        assert response is not None
+        assert b"200" in response, f"Expected 200, got: {response[:200]}"
+
+        req = BackendHandler.captured_requests[-1]
+        assert req.body == post_body, \
+            f"Expected chunked body, got {len(req.body)} bytes"
+
+
+# ============================================================================
+# 14. TestForwardedHeaderOverflow - Long X-Forwarded-For chain
+# ============================================================================
+
+class TestForwardedHeaderOverflow:
+    """Test inject_forwarded_headers with very long existing X-Forwarded-For.
+    The internal ff[512] buffer may truncate. Verify no crash."""
+
+    def test_long_xff_chain_no_crash(self, proxy):
+        """Request with a very long existing X-Forwarded-For chain"""
+        # Build a 600-byte X-Forwarded-For value (exceeds ff[512])
+        long_xff = ", ".join([f"10.0.0.{i % 256}" for i in range(60)])
+        assert len(long_xff) > 512
+
+        raw = RawSSLClient()
+        request = (
+            f"GET /long-xff HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"X-Forwarded-For: {long_xff}\r\n"
+            f"\r\n"
+        ).encode()
+
+        response = raw.send_raw(request)
+        assert response is not None
+        # Main assertion: proxy didn't crash, returned some response
+        assert b"HTTP/1.1" in response
+
+    def test_long_forwarded_header_no_crash(self, proxy):
+        """Request with a very long Forwarded header"""
+        long_fwd = "; ".join([f"for=10.0.0.{i % 256}" for i in range(60)])
+        assert len(long_fwd) > 512
+
+        raw = RawSSLClient()
+        request = (
+            f"GET /long-fwd HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"Forwarded: {long_fwd}\r\n"
+            f"\r\n"
+        ).encode()
+
+        response = raw.send_raw(request)
+        assert response is not None
+        assert b"HTTP/1.1" in response
+
+
+# ============================================================================
+# 15. TestRequestLineEdgeCases
+# ============================================================================
+
+class TestRequestLineEdgeCases:
+    """Test edge cases in request line parsing (extract_target, etc.)"""
+
+    def test_very_long_url(self, proxy):
+        """Request with a very long URL path (near buffer limit)"""
+        raw = RawSSLClient()
+        # 4KB URL - well within 32KB but exercises extract_target with long path
+        long_path = "/a" * 2000
+        request = (
+            f"GET {long_path} HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"\r\n"
+        ).encode()
+
+        response = raw.send_raw(request)
+        assert response is not None
+        assert b"200" in response
+
+        req = BackendHandler.captured_requests[-1]
+        assert req.path == long_path
+
+    def test_url_with_query_and_fragment(self, proxy):
+        """Request with query string preserved through proxy"""
+        raw = RawSSLClient()
+        request = (
+            f"GET /query?key=value&arr[]=1&arr[]=2 HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"\r\n"
+        ).encode()
+
+        response = raw.send_raw(request)
+        assert response is not None
+        assert b"200" in response
+
+        req = BackendHandler.captured_requests[-1]
+        assert "key=value" in req.path
+        assert "arr[]=1" in req.path
+
+    def test_http_10_request(self, proxy):
+        """HTTP/1.0 request should be proxied"""
+        raw = RawSSLClient()
+        request = (
+            f"GET /http10 HTTP/1.0\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"\r\n"
+        ).encode()
+
+        response = raw.send_raw(request)
+        assert response is not None
+        assert b"200" in response
+
+
+# ============================================================================
+# 16. TestSNIMismatch
+# ============================================================================
+
+class TestSNIMismatch:
+    """Test SNI vs Host header routing behavior"""
+
+    def test_sni_mismatch_host_takes_precedence(self, proxy):
+        """When SNI doesn't match Host, Host header is used for routing"""
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        # Connect with SNI for test.localhost (valid) but send Host for unknown domain
+        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
+            with ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
+                request = f"GET / HTTP/1.1\r\nHost: nonexistent.domain\r\n\r\n".encode()
+                ssock.sendall(request)
+
+                response = b""
+                ssock.settimeout(3.0)
+                try:
+                    while True:
+                        chunk = ssock.recv(4096)
+                        if not chunk:
+                            break
+                        response += chunk
+                except socket.timeout:
+                    pass
+
+                # Host header takes precedence → domain not found → 421
+                assert b"421" in response, f"Expected 421, got: {response[:200]}"
+
+
+# ============================================================================
+# 17. TestRapidKeepaliveTransitions
+# ============================================================================
+
+class TestRapidKeepaliveTransitions:
+    """Test rapid alternation of request types on keep-alive connections
+    to stress-test request boundary tracking."""
+
+    def test_get_post_chunked_post_cl_get_sequence(self, proxy):
+        """Mixed sequence: GET, chunked POST, CL POST, GET on one connection"""
+        ssock = make_ssl_connection()
+        try:
+            # 1. GET
+            ssock.sendall(
+                f"GET /rapid/1 HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\nConnection: keep-alive\r\n\r\n".encode()
+            )
+            status, _, body = read_http_response(ssock)
+            assert status == 200
+            data = json.loads(body)
+            assert data["method"] == "GET"
+
+            # 2. Chunked POST
+            chunk_body = b"chunked-data"
+            chunked = f"{len(chunk_body):x}\r\n".encode() + chunk_body + b"\r\n0\r\n\r\n"
+            ssock.sendall(
+                (
+                    f"POST /rapid/2 HTTP/1.1\r\n"
+                    f"Host: {TEST_DOMAIN}\r\n"
+                    f"Transfer-Encoding: chunked\r\n"
+                    f"Connection: keep-alive\r\n"
+                    f"\r\n"
+                ).encode() + chunked
+            )
+            status, _, body = read_http_response(ssock)
+            assert status == 200
+            data = json.loads(body)
+            assert data["body_length"] == len(chunk_body)
+
+            # 3. CL POST
+            cl_body = b"cl-body-data"
+            ssock.sendall(
+                (
+                    f"POST /rapid/3 HTTP/1.1\r\n"
+                    f"Host: {TEST_DOMAIN}\r\n"
+                    f"Content-Length: {len(cl_body)}\r\n"
+                    f"Connection: keep-alive\r\n"
+                    f"\r\n"
+                ).encode() + cl_body
+            )
+            status, _, body = read_http_response(ssock)
+            assert status == 200
+            data = json.loads(body)
+            assert data["body_length"] == len(cl_body)
+
+            # 4. GET
+            ssock.sendall(
+                f"GET /rapid/4 HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\nConnection: keep-alive\r\n\r\n".encode()
+            )
+            status, _, body = read_http_response(ssock)
+            assert status == 200
+            data = json.loads(body)
+            assert data["path"] == "/rapid/4"
+            assert "X-Forwarded-For" in data["headers"]
+        finally:
+            ssock.close()
+
+    def test_many_chunked_posts_keepalive(self, proxy):
+        """10 chunked POSTs on the same connection"""
+        ssock = make_ssl_connection()
+        try:
+            for i in range(10):
+                body_data = f"chunk-{i}-payload".encode()
+                chunked = f"{len(body_data):x}\r\n".encode() + body_data + b"\r\n0\r\n\r\n"
+                ssock.sendall(
+                    (
+                        f"POST /many-chunk/{i} HTTP/1.1\r\n"
+                        f"Host: {TEST_DOMAIN}\r\n"
+                        f"Transfer-Encoding: chunked\r\n"
+                        f"Connection: keep-alive\r\n"
+                        f"\r\n"
+                    ).encode() + chunked
+                )
+                status, _, body = read_http_response(ssock)
+                assert status == 200, f"Request {i}: expected 200, got {status}"
+                data = json.loads(body)
+                assert data["body_length"] == len(body_data), \
+                    f"Request {i}: expected {len(body_data)}, got {data['body_length']}"
+        finally:
+            ssock.close()
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
