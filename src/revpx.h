@@ -1026,7 +1026,7 @@ static ssize_t advance_chunked(RpConnection *backend, const unsigned char *data,
             backend->chunk_in_ext = false;
             if (backend->chunk_left == 0) {
                 backend->chunk_in_trailer = true;
-                backend->chunk_trailer_window = 0;
+                backend->chunk_trailer_window = 0x0d0a; // pre-seed with CRLF from chunk-size line
             }
             continue;
         }
