@@ -1279,6 +1279,9 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
                     if (!revpx->conns[backend->fd]) return false;
                     backend->off = 0;
                     backend->len = 0;
+                    // No body expected → saved bytes are the next request
+                    if (backend->req_body_left == 0 && !backend->req_chunked)
+                        backend->req_need_header = true;
                     // Forward saved body as new input
                     if (!forward_client_bytes(revpx, client, backend, saved_body, saved_body_len)) return false;
                     return revpx->conns[backend->fd] != NULL;
@@ -1710,24 +1713,24 @@ skip_flush:
             break;
         }
 
-        if (n >= 12 && strncasecmp((char *)c->buf, "HTTP/1.1 101", 12) == 0) {
+        if (c->len >= 12 && strncasecmp((char *)c->buf, "HTTP/1.1 101", 12) == 0) {
             rp_log_debug("websocket: handshake success, start tunneling\n");
 
             c->state = ST_TUNNELING;
             client->state = ST_TUNNELING;
 
-            memcpy(client->buf, c->buf, n);
-            client->len = n;
+            memcpy(client->buf, c->buf, c->len);
+            client->len = c->len;
             client->off = 0;
 
             c->len = 0;
             c->off = 0;
 
-            rp_log_debug("Copied %d bytes (101 response) to client fd=%d buffer\n", n, client->fd);
+            rp_log_debug("Copied %zu bytes (101 response) to client fd=%d buffer\n", client->len, client->fd);
             ep_mod(revpx, client->fd, EPOLLOUT | EPOLLIN | EPOLLET);
             ep_mod(revpx, c->fd, EPOLLIN | EPOLLET);
         } else {
-            rp_log_warn("Upgrade a WebSocket failed. Backend response:\n%.*s\n", n, c->buf);
+            rp_log_warn("Upgrade a WebSocket failed. Backend response:\n%.*s\n", (int)c->len, c->buf);
             send_error(revpx, client, 502, "Bad Gateway: WebSocket handshake failed");
             cleanup(revpx, c->fd);
         }
