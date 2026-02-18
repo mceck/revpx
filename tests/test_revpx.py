@@ -1532,7 +1532,7 @@ if __name__ == "__main__":
     # Check if revpx binary exists
     if not os.path.exists(REVPX_BINARY):
         print(f"Error: revpx binary not found at {REVPX_BINARY}")
-        print("Please build the project first with: ./nob")
+        print("Please build the project first with: make")
         sys.exit(1)
 
     # Check if certificates exist

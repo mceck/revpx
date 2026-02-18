@@ -5,10 +5,10 @@ SRV_LDFLAGS=$(shell pkg-config --libs openssl yaml-0.1)
 
 all: revpx revpx_lib
 
-build/revpx.o: src/revpx-lib.c src/revpx.h
+build/revpx.o: src/revpx-lib.c src/revpx.h src/ep.h
 	$(CC) $(CFLAGS) -c src/revpx-lib.c -o build/revpx.o
 	
-build/librevpx.so: src/revpx-lib.c src/revpx.h
+build/librevpx.so: src/revpx-lib.c src/revpx.h src/ep.h
 	$(CC) $(CFLAGS) -shared src/revpx-lib.c -o build/librevpx.so -fPIC $(LDFLAGS)
 
 revpx_lib: build/revpx.o build/librevpx.so

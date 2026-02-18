@@ -1,0 +1,9 @@
+name: revpx_dart_tests
+description: Dart HTTP client tests for revpx reverse proxy
+
+environment:
+  sdk: ^3.0.0
+
+dependencies:
+  http: ^1.2.0
+  test: ^1.25.0

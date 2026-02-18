@@ -36,13 +36,22 @@ static inline int epoll_ctl(int kq, int op, int fd, struct epoll_event *ev) {
     struct kevent kev[2];
     int n = 0;
 
-    if (op == EPOLL_CTL_ADD || op == EPOLL_CTL_MOD) {
-        if (ev->events & EPOLLIN) {
+    if (op == EPOLL_CTL_ADD) {
+        if (ev->events & EPOLLIN)
             EV_SET(&kev[n++], fd, EVFILT_READ, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0, NULL);
-        }
-        if (ev->events & EPOLLOUT) {
+        if (ev->events & EPOLLOUT)
             EV_SET(&kev[n++], fd, EVFILT_WRITE, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0, NULL);
-        }
+    } else if (op == EPOLL_CTL_MOD) {
+        // On MOD, delete both filters first, then re-add only the requested ones.
+        // Ignore errors from deleting non-existent filters.
+        struct kevent del[2];
+        EV_SET(&del[0], fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+        EV_SET(&del[1], fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+        kevent(kq, del, 2, NULL, 0, NULL); // ignore errors
+        if (ev->events & EPOLLIN)
+            EV_SET(&kev[n++], fd, EVFILT_READ, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0, NULL);
+        if (ev->events & EPOLLOUT)
+            EV_SET(&kev[n++], fd, EVFILT_WRITE, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0, NULL);
     } else if (op == EPOLL_CTL_DEL) {
         EV_SET(&kev[n++], fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
         EV_SET(&kev[n++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);

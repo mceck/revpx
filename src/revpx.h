@@ -113,6 +113,7 @@ typedef struct {
     int write_retry_count;  // consecutive failed writes, cleanup after 5
     bool read_stalled;      // reading paused because peer's write buffer is full (backpressure)
     bool websocket;         // request contained Upgrade: websocket
+    bool resp_hdr_done;     // response headers fully forwarded (backend-side only)
 
     // Request boundary tracking (backend-side only, used in forward_client_bytes).
     // Enables keep-alive by knowing where one request ends and the next begins,
@@ -288,6 +289,7 @@ static void cleanup(RevPx *revpx, int fd) {
     if (fd < 0 || fd >= RP_MAX_FD || !revpx->conns[fd]) return;
     RpConnection *c = revpx->conns[fd];
     int peer = c->peer;
+    RpConnectionType closed_type = c->type;
 
     epoll_ctl(revpx->epfd, EPOLL_CTL_DEL, fd, NULL);
     revpx->conns[fd] = NULL;
@@ -299,10 +301,28 @@ static void cleanup(RevPx *revpx, int fd) {
     close(fd);
     free(c);
 
-    // Signal the peer to drain its buffer and shut down
     if (peer >= 0 && revpx->conns[peer]) {
         RpConnection *p = revpx->conns[peer];
         p->peer = -1;
+
+        // When a backend disconnects (Connection: close, keepalive limit, etc.)
+        // and the client is still proxying, transition back to READ_HEADER so it
+        // can accept new requests on the same keep-alive connection.
+        if (closed_type == CT_BACKEND && p->type == CT_CLIENT && p->state == ST_PROXYING) {
+            p->read_stalled = false;
+            p->state = ST_READ_HEADER;
+            if (p->len > 0) {
+                // Flush remaining response data, then accept next request.
+                // handle_event's non-proxy flush path will drain the buffer.
+                ep_mod(revpx, peer, EPOLLOUT | EPOLLET);
+            } else {
+                p->off = 0;
+                ep_mod(revpx, peer, EPOLLIN | EPOLLET);
+            }
+            return;
+        }
+
+        // All other cases: drain buffer and shut down
         if (p->len > 0) {
             p->closing = true;
             ep_mod(revpx, peer, EPOLLOUT | EPOLLET);
@@ -665,6 +685,33 @@ static void flush_buffer(RevPx *revpx, RpConnection *c) {
     }
 }
 
+// Strip hop-by-hop Connection header from HTTP response headers in-place (RFC 7230 §6.1).
+// Scans for "\r\nConnection: ...\r\n" lines within the header region and removes them.
+// Returns the new buffer length. Sets *hdr_done when end-of-headers is found.
+static size_t strip_resp_connection_hdr(unsigned char *buf, size_t len, bool *hdr_done) {
+    unsigned char *end_marker = memmem(buf, len, "\r\n\r\n", 4);
+    size_t hdr_len = end_marker ? (size_t)(end_marker - buf + 4) : len;
+    if (end_marker) *hdr_done = true;
+
+    size_t i = 0;
+    while (i + 14 < hdr_len) { // "\r\nConnection:x" = 14 chars minimum
+        if (buf[i] == '\r' && buf[i + 1] == '\n' &&
+            strncasecmp((char *)buf + i + 2, "connection:", 11) == 0) {
+            // Find end of this header line
+            unsigned char *lf = memmem(buf + i + 2, len - i - 2, "\r\n", 2);
+            if (!lf) break; // incomplete line
+            size_t line_end = (size_t)(lf - buf) + 2;
+            size_t cut = line_end - i - 2;
+            memmove(buf + i + 2, buf + line_end, len - line_end);
+            len -= cut;
+            hdr_len -= cut;
+        } else {
+            i++;
+        }
+    }
+    return len;
+}
+
 /**
  * Bidirectional proxy data transfer between src and its peer (dst).
  *
@@ -682,7 +729,6 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
     RpConnection *dst = src->peer >= 0 ? revpx->conns[src->peer] : NULL;
 
     if (!dst && !src->closing) {
-        rp_log_error("Proxy data error: peer connection lost for fd=%d\n", src->fd);
         cleanup(revpx, src->fd);
         return;
     }
@@ -754,6 +800,11 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
                     if (!forward_client_bytes(revpx, src, dst, temp, (size_t)n)) return;
                     continue;
                 }
+                // Strip hop-by-hop Connection header from backend responses
+                if (src->type == CT_BACKEND && !src->resp_hdr_done) {
+                    n = (int)strip_resp_connection_hdr(temp, (size_t)n, &src->resp_hdr_done);
+                    if (n == 0) continue;
+                }
                 size_t written = 0;
                 while (written < (size_t)n) {
                     int w = do_write(dst, temp + written, n - written);
@@ -801,7 +852,6 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
                     break;
                 }
             } else if (n == 0) {
-                rp_log_debug("Proxy connection closed by peer fd=%d\n", src->fd);
                 cleanup(revpx, src->fd);
                 return;
             } else {
@@ -1277,6 +1327,7 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
 
                 backend->req_need_header = false;
                 backend->req_parsing_header = false;
+                backend->resp_hdr_done = false;
 
                 // Flush headers, then forward saved body data
                 if (saved_body_len > 0) {
@@ -1427,7 +1478,7 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
     if (!c) return;
 
     if (events & EPOLLERR) {
-        rp_log_error("EPOLLERR on fd=%d, state=%d\n", fd, c->state);
+        rp_log_error("EPOLLERR on fd=%d, state=%d, type=%d, peer=%d\n", fd, c->state, c->type, c->peer);
         if (c->state == ST_CONNECTING) {
             RpConnection *client = revpx->conns[c->peer];
             if (client) {
