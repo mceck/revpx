@@ -70,13 +70,13 @@ char *read_entire_file(const char *path, size_t *size) {
     FILE *f = fopen(path, "rb");
     if (f == NULL) goto cleanup;
     if (fseek(f, 0, SEEK_END) < 0) goto cleanup;
-    *size = ftell(f);
-    if (*size < 0) goto cleanup;
+    long fsize = ftell(f);
+    if (fsize < 0) goto cleanup;
+    *size = (size_t)fsize;
     if (fseek(f, 0, SEEK_SET) < 0) goto cleanup;
 
     new_items = malloc(*size);
-    fread(new_items, *size, 1, f);
-    if (ferror(f) && new_items) {
+    if (fread(new_items, *size, 1, f) != 1) {
         free(new_items);
         new_items = NULL;
         goto cleanup;
@@ -288,11 +288,11 @@ int parse_args(RevPx *revpx, int argc, const char **argv) {
             }
         }
         // skip other named arguments
-        named_arg(&args, "help", "h");
-        named_arg(&args, "file", "f");
-        named_arg(&args, "monade", "m");
-        named_arg(&args, "port", "p");
-        named_arg(&args, "port-plain", "pp");
+        (void)named_arg(&args, "help", "h");
+        (void)named_arg(&args, "file", "f");
+        (void)named_arg(&args, "monade", "m");
+        (void)named_arg(&args, "port", "p");
+        (void)named_arg(&args, "port-plain", "pp");
     }
     if (idx != 0) {
         rp_log_error("Incomplete domain mapping arguments\n");
