@@ -913,7 +913,12 @@ static int create_backend(const char *host, const char *port) {
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
-    connect(fd, res->ai_addr, res->ai_addrlen);
+    if (connect(fd, res->ai_addr, res->ai_addrlen) < 0 && errno != EINPROGRESS) {
+        rp_log_error("connect failed for backend %s:%s: %s\n", host, port, strerror(errno));
+        close(fd);
+        freeaddrinfo(res);
+        return -1;
+    }
     freeaddrinfo(res);
     return fd;
 }
@@ -1434,6 +1439,7 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
             if (client) {
                 send_error(revpx, client, 502, "Bad Gateway");
                 client->peer = -1;
+                client->state = ST_READ_HEADER;
             }
             c->peer = -1;
             cleanup(revpx, fd);
@@ -1448,6 +1454,17 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
     if (events & EPOLLHUP) {
         if (c->state == ST_PROXYING && (events & EPOLLIN)) {
             proxy_data(revpx, c, events);
+            return;
+        }
+        if (c->state == ST_CONNECTING && c->type == CT_BACKEND) {
+            RpConnection *client = revpx->conns[c->peer];
+            if (client) {
+                send_error(revpx, client, 502, "Bad Gateway");
+                client->peer = -1;
+                client->state = ST_READ_HEADER;
+            }
+            c->peer = -1;
+            cleanup(revpx, fd);
             return;
         }
         if (c->state != ST_SHUTTING_DOWN) {
