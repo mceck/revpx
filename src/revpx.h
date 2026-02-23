@@ -295,6 +295,7 @@ static void cleanup(RevPx *revpx, int fd) {
     if (c->ssl) {
         SSL_shutdown(c->ssl);
         SSL_free(c->ssl);
+        ERR_clear_error();
     }
     close(fd);
     free(c);
