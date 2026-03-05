@@ -248,6 +248,32 @@ class RevPxProxy:
         self.process: Optional[subprocess.Popen] = None
         self.config_file: Optional[str] = None
 
+    def _wait_until_ready(self, timeout: float = 10.0):
+        """Wait until the HTTPS listener is accepting TCP connections."""
+        deadline = time.time() + timeout
+        last_connect_error = None
+
+        while time.time() < deadline:
+            if self.process and self.process.poll() is not None:
+                stdout, stderr = self.process.communicate()
+                raise RuntimeError(
+                    f"revpx exited before becoming ready:\n"
+                    f"stdout: {stdout.decode()}\n"
+                    f"stderr: {stderr.decode()}"
+                )
+
+            try:
+                with socket.create_connection(("127.0.0.1", self.https_port), timeout=0.25):
+                    return
+            except OSError as exc:
+                last_connect_error = exc
+                time.sleep(0.05)
+
+        raise RuntimeError(
+            f"revpx did not become ready on 127.0.0.1:{self.https_port} within {timeout}s "
+            f"(last error: {last_connect_error})"
+        )
+
     def start(self):
         """Start the reverse proxy"""
         # Create a temporary config file to avoid arg parsing issues
@@ -276,15 +302,7 @@ class RevPxProxy:
             env=env
         )
 
-        # Wait for proxy to be ready
-        time.sleep(1)
-
-        # Check if process is still running
-        if self.process.poll() is not None:
-            stdout, stderr = self.process.communicate()
-            raise RuntimeError(
-                f"revpx failed to start:\nstdout: {stdout.decode()}\nstderr: {stderr.decode()}"
-            )
+        self._wait_until_ready()
 
     def stop(self):
         """Stop the reverse proxy"""

@@ -187,28 +187,26 @@ void revpx_set_log_level(int level) {
     rp_log_level = level;
 }
 
+static const char *rp_log_level_label(int level, bool colored) {
+    switch (level) {
+    case RP_DEBUG:
+        return colored ? "\033[36mDEBUG\033[0m" : "DEBUG";
+    case RP_INFO:
+        return colored ? "\033[32mINFO\033[0m" : "INFO";
+    case RP_WARN:
+        return colored ? "\033[33mWARN\033[0m" : "WARN";
+    case RP_ERROR:
+        return colored ? "\033[31mERROR\033[0m" : "ERROR";
+    default:
+        return "LOG";
+    }
+}
+
 void rp_colored_log(int level, const char *fmt, ...) {
     if (level < rp_log_level) return;
 
-    const char *level_str;
+    const char *level_str = rp_log_level_label(level, true);
     FILE *fd = level >= RP_ERROR ? stderr : stdout;
-    switch (level) {
-    case RP_DEBUG:
-        level_str = "\033[36mDEBUG\033[0m";
-        break;
-    case RP_INFO:
-        level_str = "\033[32mINFO\033[0m";
-        break;
-    case RP_WARN:
-        level_str = "\033[33mWARN\033[0m";
-        break;
-    case RP_ERROR:
-        level_str = "\033[31mERROR\033[0m";
-        break;
-    default:
-        level_str = "LOG";
-        break;
-    }
 
     va_list args;
     va_start(args, fmt);
@@ -220,25 +218,8 @@ void rp_colored_log(int level, const char *fmt, ...) {
 void rp_simple_log(int level, const char *fmt, ...) {
     if (level < rp_log_level) return;
 
-    const char *level_str;
+    const char *level_str = rp_log_level_label(level, false);
     FILE *fd = level >= RP_ERROR ? stderr : stdout;
-    switch (level) {
-    case RP_DEBUG:
-        level_str = "DEBUG";
-        break;
-    case RP_INFO:
-        level_str = "INFO";
-        break;
-    case RP_WARN:
-        level_str = "WARN";
-        break;
-    case RP_ERROR:
-        level_str = "ERROR";
-        break;
-    default:
-        level_str = "LOG";
-        break;
-    }
 
     va_list args;
     va_start(args, fmt);
@@ -260,9 +241,14 @@ void revpx_use_simple_log(){
 
 static void fill_peer_ip(int fd, char *out, size_t max);
 static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnection *backend, const unsigned char *data, size_t n);
+static bool log_ssl_error_queue(int level, const char *prefix);
 
 static void set_nonblock(int fd) {
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+}
+
+static void close_if_valid(int fd) {
+    if (fd >= 0) close(fd);
 }
 
 static void ep_add(RevPx *revpx, int fd, uint32_t events) {
@@ -551,24 +537,14 @@ static SSL_CTX *get_ctx(RevPx *revpx, const char *host) {
                 }
                 if (SSL_CTX_use_certificate_file(d->ctx, d->cert, SSL_FILETYPE_PEM) <= 0) {
                     rp_log_error("Failed to load certificate file %s for domain %s\n", d->cert, host);
-                    unsigned long ssl_err;
-                    while ((ssl_err = ERR_get_error()) != 0) {
-                        char err_buf[256];
-                        ERR_error_string_n(ssl_err, err_buf, sizeof(err_buf));
-                        rp_log_error("SSL error: %s\n", err_buf);
-                    }
+                    log_ssl_error_queue(RP_ERROR, "SSL error");
                     SSL_CTX_free(d->ctx);
                     d->ctx = NULL;
                     return NULL;
                 }
                 if (SSL_CTX_use_PrivateKey_file(d->ctx, d->key, SSL_FILETYPE_PEM) <= 0) {
                     rp_log_error("Failed to load private key file %s for domain %s\n", d->key, host);
-                    unsigned long ssl_err;
-                    while ((ssl_err = ERR_get_error()) != 0) {
-                        char err_buf[256];
-                        ERR_error_string_n(ssl_err, err_buf, sizeof(err_buf));
-                        rp_log_error("SSL error: %s\n", err_buf);
-                    }
+                    log_ssl_error_queue(RP_ERROR, "SSL error");
                     SSL_CTX_free(d->ctx);
                     d->ctx = NULL;
                     return NULL;
@@ -849,7 +825,7 @@ static void tunnel_data(RevPx *revpx, RpConnection *src, uint32_t events) {
 
         size_t dst_space = buffer_space(dst);
         if (dst_space == 0) {
-            src->read_stalled = 1;
+            src->read_stalled = true;
             ep_mod(revpx, dst->fd, EPOLLOUT | EPOLLET);
             return;
         }
@@ -878,12 +854,9 @@ static void tunnel_data(RevPx *revpx, RpConnection *src, uint32_t events) {
             }
 
             if (src->ssl) {
-                unsigned long e;
-                while ((e = ERR_get_error()) != 0) {
-                    char err_buf[256];
-                    ERR_error_string_n(e, err_buf, sizeof(err_buf));
-                    rp_log_warn("SSL error in WebSocket tunnel (fd: %d): %s\n", src->fd, err_buf);
-                }
+                char ssl_ctx[96];
+                snprintf(ssl_ctx, sizeof(ssl_ctx), "SSL error in WebSocket tunnel (fd: %d)", src->fd);
+                log_ssl_error_queue(RP_WARN, ssl_ctx);
             }
 
             rp_log_warn("Fatal error reading from WebSocket tunnel (fd: %d). Error: %d, errno: %d\n", src->fd, err, errno);
@@ -968,6 +941,64 @@ static int hex_value(int c) {
     return -1;
 }
 
+static void reset_chunk_parser_state(RpConnection *conn) {
+    conn->chunk_left = 0;
+    conn->chunk_size_acc = 0;
+    conn->chunk_line_len = 0;
+    conn->chunk_expect_crlf = false;
+    conn->chunk_in_trailer = false;
+    conn->chunk_in_ext = false;
+    conn->chunk_trailer_window = 0;
+}
+
+static void backend_reset_buffer(RpConnection *backend) {
+    backend->off = 0;
+    backend->len = 0;
+}
+
+static void backend_expect_next_header(RpConnection *backend) {
+    backend->req_need_header = true;
+    backend->req_parsing_header = true;
+}
+
+static void backend_maybe_resume_header_parse(RpConnection *backend) {
+    if (backend->req_need_header && !backend->req_parsing_header) {
+        backend->req_parsing_header = true;
+    }
+}
+
+static void init_backend_request_state(RpConnection *backend) {
+    backend_expect_next_header(backend);
+    backend->req_chunked = false;
+    backend->req_body_left = 0;
+    reset_chunk_parser_state(backend);
+}
+
+static bool log_ssl_error_queue(int level, const char *prefix) {
+    unsigned long ssl_err;
+    bool had_errors = false;
+    while ((ssl_err = ERR_get_error()) != 0) {
+        char err_buf[256];
+        ERR_error_string_n(ssl_err, err_buf, sizeof(err_buf));
+        switch (level) {
+        case RP_DEBUG:
+            rp_log_debug("%s: %s\n", prefix, err_buf);
+            break;
+        case RP_WARN:
+            rp_log_warn("%s: %s\n", prefix, err_buf);
+            break;
+        case RP_ERROR:
+            rp_log_error("%s: %s\n", prefix, err_buf);
+            break;
+        default:
+            rp_log_info("%s: %s\n", prefix, err_buf);
+            break;
+        }
+        had_errors = true;
+    }
+    return had_errors;
+}
+
 /**
  * Chunked transfer-encoding state machine. Parses chunk framing to track
  * request boundaries without modifying the data.
@@ -1012,13 +1043,7 @@ static ssize_t advance_chunked(RpConnection *backend, const unsigned char *data,
             if (backend->chunk_trailer_window == 0x0d0a0d0a) {
                 backend->req_chunked = false;
                 backend->req_need_header = true;
-                backend->chunk_in_trailer = false;
-                backend->chunk_trailer_window = 0;
-                backend->chunk_size_acc = 0;
-                backend->chunk_line_len = 0;
-                backend->chunk_expect_crlf = false;
-                backend->chunk_in_ext = false;
-                backend->chunk_left = 0;
+                reset_chunk_parser_state(backend);
                 return (ssize_t)i;
             }
             continue;
@@ -1172,6 +1197,151 @@ static bool inject_forwarded_headers(RpConnection *conn, int source_fd) {
     return true;
 }
 
+static bool forward_client_fail(RevPx *revpx, RpConnection *client, RpConnection *backend, int code, const char *status) {
+    send_error(revpx, client, code, status);
+    cleanup(revpx, backend->fd);
+    return false;
+}
+
+static bool forward_client_backpressure_to_client(RevPx *revpx, RpConnection *client, RpConnection *backend,
+                                                  const unsigned char *data, size_t n) {
+    // Backend socket blocked after flush — can't write more right now.
+    // Save remaining input bytes in the client's own buffer so they
+    // aren't lost. proxy_data will drain these before reading new data.
+    compact_buffer(client);
+    size_t cs = buffer_space(client);
+    size_t save = n < cs ? n : cs;
+    if (save > 0) {
+        memcpy(client->buf + client->off + client->len, data, save);
+        client->len += save;
+    }
+    client->read_stalled = true;
+    ep_mod(revpx, backend->fd, EPOLLOUT | EPOLLET);
+    return true;
+}
+
+static bool forward_client_replay_leftover(RevPx *revpx, RpConnection *client, RpConnection *backend,
+                                           const unsigned char *leftover_data, size_t leftover) {
+    unsigned char tmpbuf[RP_BUF_SIZE];
+    if (leftover > sizeof(tmpbuf)) {
+        return forward_client_fail(revpx, client, backend, 413, "Request Entity Too Large");
+    }
+
+    memcpy(tmpbuf, leftover_data, leftover);
+    flush_buffer(revpx, backend);
+    if (!revpx->conns[backend->fd]) return false;
+    if (backend->len > 0) {
+        return forward_client_fail(revpx, client, backend, 400, "Bad Request");
+    }
+
+    backend_reset_buffer(backend);
+    backend_expect_next_header(backend);
+    if (!forward_client_bytes(revpx, client, backend, tmpbuf, leftover)) return false;
+    return revpx->conns[backend->fd] != NULL;
+}
+
+static void forward_client_parse_body_mode(RpConnection *backend, size_t header_end) {
+    backend->req_chunked = has_chunked_encoding(backend->buf, header_end);
+    backend->req_body_left = 0;
+
+    const char *cl = NULL;
+    size_t cl_len = 0;
+    if (find_header(backend->buf, header_end, "Content-Length", &cl, &cl_len) && cl_len > 0) {
+        char tmp[32];
+        size_t copy_len = cl_len >= sizeof(tmp) ? sizeof(tmp) - 1 : cl_len;
+        memcpy(tmp, cl, copy_len);
+        tmp[copy_len] = '\0';
+        if (tmp[0] != '-') {
+            backend->req_body_left = strtoull(tmp, NULL, 10);
+        }
+    }
+}
+
+typedef enum {
+    FWD_HDR_FATAL = -1,
+    FWD_HDR_CONTINUE = 0,
+    FWD_HDR_DONE = 1
+} ForwardClientHeaderResult;
+
+static ForwardClientHeaderResult forward_client_handle_complete_header(RevPx *revpx, RpConnection *client, RpConnection *backend) {
+    if (backend->off > 0) {
+        memmove(backend->buf, backend->buf + backend->off, backend->len);
+        backend->off = 0;
+    }
+
+    int header_end_idx = find_headers_end(backend->buf, backend->len);
+    size_t orig_header_end = (size_t)header_end_idx;
+
+    // Temporarily remove body bytes so header injection has room before CRLFCRLF.
+    size_t saved_body_len = backend->len > orig_header_end ? backend->len - orig_header_end : 0;
+    unsigned char saved_body[RP_BUF_SIZE];
+    if (saved_body_len > 0) {
+        memcpy(saved_body, backend->buf + orig_header_end, saved_body_len);
+        backend->len = orig_header_end;
+    }
+
+    // Parse headers before injection (need original headers for CL/TE).
+    forward_client_parse_body_mode(backend, orig_header_end);
+
+    if (!inject_forwarded_headers(backend, client->fd)) {
+        if (!forward_client_fail(revpx, client, backend, 400, "Bad Request")) return FWD_HDR_FATAL;
+    }
+
+    backend->req_need_header = false;
+    backend->req_parsing_header = false;
+
+    // Flush headers, then forward saved body data.
+    if (saved_body_len > 0) {
+        flush_buffer(revpx, backend);
+        if (!revpx->conns[backend->fd]) return FWD_HDR_FATAL;
+        backend_reset_buffer(backend);
+        if (backend->req_body_left == 0 && !backend->req_chunked) {
+            backend->req_need_header = true;
+        }
+        if (!forward_client_bytes(revpx, client, backend, saved_body, saved_body_len)) return FWD_HDR_FATAL;
+        return FWD_HDR_DONE;
+    }
+
+    size_t header_end = (size_t)find_headers_end(backend->buf, backend->len);
+    size_t body_avail = backend->len > header_end ? backend->len - header_end : 0;
+
+    if (backend->req_chunked) {
+        reset_chunk_parser_state(backend);
+        if (body_avail) {
+            ssize_t consumed = advance_chunked(backend, backend->buf + header_end, body_avail);
+            if (consumed < 0) {
+                if (!forward_client_fail(revpx, client, backend, 400, "Bad Request")) return FWD_HDR_FATAL;
+            }
+            if ((size_t)consumed < body_avail) {
+                size_t leftover = body_avail - (size_t)consumed;
+                if (backend->len >= leftover) backend->len -= leftover;
+                if (!forward_client_replay_leftover(revpx, client, backend, backend->buf + header_end + consumed, leftover)) {
+                    return FWD_HDR_FATAL;
+                }
+                return FWD_HDR_DONE;
+            }
+        }
+        if (!backend->req_chunked) backend->req_parsing_header = false;
+    } else {
+        size_t body_used = body_avail < backend->req_body_left ? body_avail : backend->req_body_left;
+        if (backend->req_body_left > 0) backend->req_body_left -= body_used;
+        size_t leftover = body_avail > body_used ? body_avail - body_used : 0;
+        if (backend->req_body_left == 0) {
+            backend->req_need_header = true;
+            backend->req_parsing_header = false;
+        }
+        if (leftover > 0) {
+            if (backend->len >= leftover) backend->len -= leftover;
+            if (!forward_client_replay_leftover(revpx, client, backend, backend->buf + header_end + body_used, leftover)) {
+                return FWD_HDR_FATAL;
+            }
+            return FWD_HDR_DONE;
+        }
+    }
+
+    return FWD_HDR_CONTINUE;
+}
+
 /**
  * Forward client data to the backend with HTTP request boundary awareness.
  *
@@ -1198,14 +1368,12 @@ static bool inject_forwarded_headers(RpConnection *conn, int source_fd) {
  */
 static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnection *backend, const unsigned char *data, size_t n) {
     while (n > 0) {
-        if (backend->req_need_header && !backend->req_parsing_header) backend->req_parsing_header = true;
+        backend_maybe_resume_header_parse(backend);
         if (backend->req_parsing_header) compact_buffer(backend);
         size_t space = buffer_space(backend);
         if (space == 0) {
             if (backend->req_parsing_header) {
-                send_error(revpx, client, 431, "Request Header Fields Too Large");
-                cleanup(revpx, backend->fd);
-                return false;
+                return forward_client_fail(revpx, client, backend, 431, "Request Header Fields Too Large");
             }
             // Flush buffer to make space
             flush_buffer(revpx, backend);
@@ -1213,19 +1381,7 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
             compact_buffer(backend);
             space = buffer_space(backend);
             if (space == 0) {
-                // Backend socket blocked after flush — can't write more right now.
-                // Save remaining input bytes in the client's own buffer so they
-                // aren't lost. proxy_data will drain these before reading new data.
-                compact_buffer(client);
-                size_t cs = buffer_space(client);
-                size_t save = n < cs ? n : cs;
-                if (save > 0) {
-                    memcpy(client->buf + client->off + client->len, data, save);
-                    client->len += save;
-                }
-                client->read_stalled = true;
-                ep_mod(revpx, backend->fd, EPOLLOUT | EPOLLET);
-                return true;
+                return forward_client_backpressure_to_client(revpx, client, backend, data, n);
             }
         }
         size_t to_copy = n < space ? n : space;
@@ -1239,140 +1395,11 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
         n -= to_copy;
 
         if (backend->req_parsing_header) {
-            int end = find_headers_end(backend->buf + backend->off, backend->len);
-            if (end > 0) {
-                if (backend->off > 0) {
-                    memmove(backend->buf, backend->buf + backend->off, backend->len);
-                    backend->off = 0;
-                }
-                end = find_headers_end(backend->buf, backend->len);
-                size_t orig_header_end = (size_t)end;
-
-                // Temporarily remove body bytes from the buffer so that
-                // inject_forwarded_headers() has room to insert extra headers
-                // before the \r\n\r\n. Body will be re-forwarded after flush.
-                size_t saved_body_len = backend->len > orig_header_end ? backend->len - orig_header_end : 0;
-                unsigned char saved_body[RP_BUF_SIZE];
-                if (saved_body_len > 0) {
-                    memcpy(saved_body, backend->buf + orig_header_end, saved_body_len);
-                    backend->len = orig_header_end;
-                }
-
-                // Parse headers before injection (need original headers for CL/TE)
-                backend->req_chunked = has_chunked_encoding(backend->buf, orig_header_end);
-                backend->req_body_left = 0;
-                const char *cl = NULL;
-                size_t cl_len = 0;
-                if (find_header(backend->buf, orig_header_end, "Content-Length", &cl, &cl_len) && cl_len > 0) {
-                    char tmp[32];
-                    size_t copy_len = cl_len >= sizeof(tmp) ? sizeof(tmp) - 1 : cl_len;
-                    memcpy(tmp, cl, copy_len);
-                    tmp[copy_len] = '\0';
-                    if (tmp[0] == '-') {
-                        backend->req_body_left = 0;
-                    } else {
-                        backend->req_body_left = strtoull(tmp, NULL, 10);
-                    }
-                }
-
-                if (!inject_forwarded_headers(backend, client->fd)) {
-                    send_error(revpx, client, 400, "Bad Request");
-                    cleanup(revpx, backend->fd);
-                    return false;
-                }
-
-                backend->req_need_header = false;
-                backend->req_parsing_header = false;
-
-                // Flush headers, then forward saved body data
-                if (saved_body_len > 0) {
-                    flush_buffer(revpx, backend);
-                    if (!revpx->conns[backend->fd]) return false;
-                    backend->off = 0;
-                    backend->len = 0;
-                    // No body expected → saved bytes are the next request
-                    if (backend->req_body_left == 0 && !backend->req_chunked)
-                        backend->req_need_header = true;
-                    // Forward saved body as new input
-                    if (!forward_client_bytes(revpx, client, backend, saved_body, saved_body_len)) return false;
-                    return revpx->conns[backend->fd] != NULL;
-                }
-
-                size_t header_end = (size_t)find_headers_end(backend->buf, backend->len);
-                size_t body_avail = backend->len > header_end ? backend->len - header_end : 0;
-                if (backend->req_chunked) {
-                    backend->chunk_left = 0;
-                    backend->chunk_size_acc = 0;
-                    backend->chunk_line_len = 0;
-                    backend->chunk_expect_crlf = false;
-                    backend->chunk_in_trailer = false;
-                    backend->chunk_in_ext = false;
-                    backend->chunk_trailer_window = 0;
-                    if (body_avail) {
-                        ssize_t consumed = advance_chunked(backend, backend->buf + header_end, body_avail);
-                        if (consumed < 0) {
-                            send_error(revpx, client, 400, "Bad Request");
-                            cleanup(revpx, backend->fd);
-                            return false;
-                        }
-                        if ((size_t)consumed < body_avail) {
-                            size_t leftover = body_avail - (size_t)consumed;
-                            if (backend->len >= leftover) backend->len -= leftover;
-                            unsigned char tmpbuf[RP_BUF_SIZE];
-                            if (leftover > sizeof(tmpbuf)) {
-                                send_error(revpx, client, 413, "Request Entity Too Large");
-                                cleanup(revpx, backend->fd);
-                                return false;
-                            }
-                            memcpy(tmpbuf, backend->buf + header_end + consumed, leftover);
-                            flush_buffer(revpx, backend);
-                            if (!revpx->conns[backend->fd]) return false;
-                            if (backend->len > 0) {
-                                send_error(revpx, client, 400, "Bad Request");
-                                cleanup(revpx, backend->fd);
-                                return false;
-                            }
-                            backend->off = 0;
-                            backend->len = 0;
-                            backend->req_parsing_header = true;
-                            backend->req_need_header = true;
-                            if (!forward_client_bytes(revpx, client, backend, tmpbuf, leftover)) return false;
-                            return revpx->conns[backend->fd] != NULL;
-                        }
-                    }
-                    if (backend->req_chunked == false) backend->req_parsing_header = false;
-                } else {
-                    size_t body_used = body_avail < backend->req_body_left ? body_avail : backend->req_body_left;
-                    if (backend->req_body_left > 0) backend->req_body_left -= body_used;
-                    size_t leftover = body_avail > body_used ? body_avail - body_used : 0;
-                    if (backend->req_body_left == 0) {
-                        backend->req_need_header = true;
-                        backend->req_parsing_header = false;
-                    }
-                    if (leftover > 0) {
-                        if (backend->len >= leftover) backend->len -= leftover;
-                        unsigned char tmpbuf[RP_BUF_SIZE];
-                        if (leftover > sizeof(tmpbuf)) {
-                            send_error(revpx, client, 413, "Request Entity Too Large");
-                            cleanup(revpx, backend->fd);
-                            return false;
-                        }
-                        memcpy(tmpbuf, backend->buf + header_end + body_used, leftover);
-                        flush_buffer(revpx, backend);
-                        if (!revpx->conns[backend->fd]) return false;
-                        if (backend->len > 0) {
-                            send_error(revpx, client, 400, "Bad Request");
-                            cleanup(revpx, backend->fd);
-                            return false;
-                        }
-                        backend->off = 0;
-                        backend->len = 0;
-                        backend->req_parsing_header = true;
-                        backend->req_need_header = true;
-                        if (!forward_client_bytes(revpx, client, backend, tmpbuf, leftover)) return false;
-                        return revpx->conns[backend->fd] != NULL;
-                    }
-                }
+            int header_end_idx = find_headers_end(backend->buf + backend->off, backend->len);
+            if (header_end_idx > 0) {
+                ForwardClientHeaderResult header_rc = forward_client_handle_complete_header(revpx, client, backend);
+                if (header_rc == FWD_HDR_FATAL) return false;
+                if (header_rc == FWD_HDR_DONE) return revpx->conns[backend->fd] != NULL;
             }
         } else if (!backend->req_chunked) {
             if (backend->req_body_left > to_copy) {
@@ -1385,33 +1412,12 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
         } else {
             ssize_t consumed = advance_chunked(backend, dst_pos, to_copy);
             if (consumed < 0) {
-                send_error(revpx, client, 400, "Bad Request");
-                cleanup(revpx, backend->fd);
-                return false;
+                return forward_client_fail(revpx, client, backend, 400, "Bad Request");
             }
             if ((size_t)consumed < to_copy) {
                 size_t leftover = to_copy - (size_t)consumed;
                 if (backend->len >= leftover) backend->len -= leftover;
-                unsigned char tmpbuf[RP_BUF_SIZE];
-                if (leftover > sizeof(tmpbuf)) {
-                    send_error(revpx, client, 413, "Request Entity Too Large");
-                    cleanup(revpx, backend->fd);
-                    return false;
-                }
-                memcpy(tmpbuf, dst_pos + consumed, leftover);
-                flush_buffer(revpx, backend);
-                if (!revpx->conns[backend->fd]) return false;
-                if (backend->len > 0) {
-                    send_error(revpx, client, 400, "Bad Request");
-                    cleanup(revpx, backend->fd);
-                    return false;
-                }
-                backend->off = 0;
-                backend->len = 0;
-                backend->req_parsing_header = true;
-                backend->req_need_header = true;
-                if (!forward_client_bytes(revpx, client, backend, tmpbuf, leftover)) return false;
-                return revpx->conns[backend->fd] != NULL;
+                return forward_client_replay_leftover(revpx, client, backend, dst_pos + consumed, leftover);
             }
         }
     }
@@ -1428,9 +1434,8 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
  * based on the connection's current state machine position.
  * Handles EPOLLERR/EPOLLHUP before dispatching to state-specific logic.
  */
-static void handle_event(RevPx *revpx, int fd, uint32_t events) {
-    RpConnection *c = revpx->conns[fd];
-    if (!c) return;
+static bool handle_event_error_or_hup(RevPx *revpx, RpConnection *c, uint32_t events) {
+    int fd = c->fd;
 
     if (events & EPOLLERR) {
         rp_log_error("EPOLLERR on fd=%d, state=%d\n", fd, c->state);
@@ -1448,13 +1453,13 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
         } else {
             cleanup_both(revpx, fd);
         }
-        return;
+        return true;
     }
 
     if (events & EPOLLHUP) {
         if (c->state == ST_PROXYING && (events & EPOLLIN)) {
             proxy_data(revpx, c, events);
-            return;
+            return true;
         }
         if (c->state == ST_CONNECTING && c->type == CT_BACKEND) {
             RpConnection *client = revpx->conns[c->peer];
@@ -1465,343 +1470,344 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
             }
             c->peer = -1;
             cleanup(revpx, fd);
-            return;
+            return true;
         }
         if (c->state != ST_SHUTTING_DOWN) {
             rp_log_error("EPOLLHUP on fd=%d, state=%d - unexpected connection hangup\n", fd, c->state);
             cleanup(revpx, fd);
-            return;
+            return true;
         }
     }
+
+    return false;
+}
+
+static void handle_state_ssl_handshake(RevPx *revpx, RpConnection *c) {
+    int ret = SSL_accept(c->ssl);
+    if (ret == 1) {
+        c->state = ST_READ_HEADER;
+        ep_mod(revpx, c->fd, EPOLLIN | EPOLLET);
+    } else {
+        int err = SSL_get_error(c->ssl, ret);
+        if (err == SSL_ERROR_WANT_READ)
+            ep_mod(revpx, c->fd, EPOLLIN | EPOLLET);
+        else if (err == SSL_ERROR_WANT_WRITE)
+            ep_mod(revpx, c->fd, EPOLLOUT | EPOLLET);
+        else {
+            char ssl_ctx[64];
+            snprintf(ssl_ctx, sizeof(ssl_ctx), "SSL handshake failed on fd=%d", c->fd);
+            if (!log_ssl_error_queue(RP_DEBUG, ssl_ctx)) {
+                rp_log_debug("SSL handshake failed on fd=%d, error code: %d\n", c->fd, err);
+            }
+            cleanup(revpx, c->fd);
+        }
+    }
+}
+
+static void handle_state_read_header(RevPx *revpx, RpConnection *c) {
+    int fd = c->fd;
+    size_t space = sizeof(c->buf) - c->len;
+    if (space == 0) {
+        rp_log_error("Header too large for fd=%d\n", fd);
+        send_error(revpx, c, 431, "Request Header Fields Too Large");
+        return;
+    }
+
+    int n = do_read(c, c->buf + c->len, space);
+    if (n > 0) {
+        c->len += n;
+        rp_log_debug("Read %d bytes, total header buffer: %zu bytes for fd=%d\n", n, c->len, fd);
+
+        int end = find_headers_end(c->buf, c->len);
+        if (end > 0) {
+            char host[512], target[1024] = "/";
+            extract_host(c->buf, end, host, sizeof(host));
+            extract_target(c->buf, end, target, sizeof(target));
+            const char *sni_name = c->ssl ? SSL_get_servername(c->ssl, TLSEXT_NAMETYPE_host_name) : NULL;
+            if (host[0] == '\0' && sni_name && *sni_name) {
+                strncpy(host, sni_name, sizeof(host) - 1);
+                host[sizeof(host) - 1] = '\0';
+            }
+            if (!c->ssl && host[0] == '\0') {
+                send_error(revpx, c, 400, "Bad Request");
+                return;
+            }
+            if (host[0] == '\0' && revpx->domain_count > 0) {
+                strncpy(host, revpx->domains[0].domain, sizeof(host) - 1);
+                host[sizeof(host) - 1] = '\0';
+            }
+
+            c->websocket = is_websocket_upgrade_request(c->buf, end);
+            if (c->websocket) {
+                rp_log_debug("websocket upgrade request detected\n");
+            }
+
+            if (!c->ssl) {
+                send_redirect(revpx, c, host, target, revpx->https_port);
+                return;
+            }
+
+            RpHostDomain *d = NULL;
+            for (int i = 0; i < revpx->domain_count; i++) {
+                if (strcasecmp(revpx->domains[i].domain, host) == 0) {
+                    d = &revpx->domains[i];
+                    break;
+                }
+            }
+            if (!d) {
+                rp_log_error("Domain not found: %s\n", host);
+                send_error(revpx, c, 421, "Misdirected Request");
+                return;
+            }
+            rp_log_debug("HTTPS request: https://%s%s -> %s:%s\n", host, target, d->host, d->port);
+
+            int backend = create_backend(d->host, d->port);
+            if (backend < 0) {
+                rp_log_error("Failed to create backend connection to %s:%s\n", d->host, d->port);
+                send_error(revpx, c, 502, "Bad Gateway");
+                return;
+            }
+
+            RpConnection *b = alloc_conn(revpx, backend, NULL, ST_CONNECTING, CT_BACKEND);
+            c->peer = backend;
+            b->peer = fd;
+            c->state = ST_CONNECTING;
+
+            ep_add(revpx, backend, EPOLLOUT | EPOLLET);
+        } else {
+            rp_log_debug("Headers incomplete (%zu bytes), waiting for more data on fd=%d\n", c->len, fd);
+            ep_mod(revpx, fd, EPOLLIN | EPOLLET);
+        }
+    } else if (n == 0) {
+        rp_log_debug("Connection closed during header read fd=%d\n", fd);
+        cleanup(revpx, fd);
+    } else {
+        int err = get_error(c, n);
+        if (err == SSL_ERROR_WANT_READ) {
+            rp_log_debug("SSL_ERROR_WANT_READ on fd=%d, waiting for more data\n", fd);
+        } else if (err == SSL_ERROR_WANT_WRITE) {
+            rp_log_debug("SSL_ERROR_WANT_WRITE on fd=%d\n", fd);
+            ep_mod(revpx, fd, EPOLLOUT | EPOLLIN | EPOLLET);
+        } else {
+            if (err == SSL_ERROR_ZERO_RETURN) {
+                rp_log_error("Connection closed during header read fd=%d\n", fd);
+            } else if (err == SSL_ERROR_SYSCALL) {
+                rp_log_error("SSL read error during header read fd=%d: %s\n", fd, strerror(errno));
+            } else {
+                rp_log_error("Read error during header read fd=%d, error: %d\n", fd, err);
+            }
+            cleanup(revpx, fd);
+        }
+    }
+}
+
+static void handle_state_connecting(RevPx *revpx, RpConnection *c, uint32_t events) {
+    int fd = c->fd;
+
+    // For SSL clients: the backend TCP connect is in-flight. Meanwhile, the client
+    // may keep sending request body data. Buffer it here so it's not lost.
+    // Once the backend connects (EPOLLOUT on the backend fd), these buffered bytes
+    // are forwarded via forward_client_bytes.
+    if (c->ssl) {
+        if (events & EPOLLIN) {
+            while (1) {
+                compact_buffer(c);
+                size_t space = buffer_space(c);
+                if (space == 0) {
+                    // Buffer full — stop reading until backend connects and data is forwarded
+                    break;
+                }
+                int n = do_read(c, c->buf + c->off + c->len, space);
+                if (n > 0) {
+                    c->len += n;
+                    continue;
+                } else if (n == 0) {
+                    cleanup_both(revpx, fd);
+                    break;
+                } else {
+                    int err = get_error(c, n);
+                    if (err == SSL_ERROR_WANT_READ) break;
+                    if (err == SSL_ERROR_WANT_WRITE) {
+                        ep_mod(revpx, fd, EPOLLIN | EPOLLOUT | EPOLLET);
+                        break;
+                    }
+                    cleanup_both(revpx, fd);
+                    break;
+                }
+            }
+        }
+        return;
+    }
+
+    if (!(events & EPOLLOUT)) return;
+
+    // Backend fd: EPOLLOUT means connect() completed. Check SO_ERROR to
+    // distinguish success from failure (async connect reports errors here).
+    int err = 0;
+    socklen_t len = sizeof(err);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
+        if (err == 0) {
+            rp_log_error("getsockopt failed on fd=%d: %s\n", fd, strerror(errno));
+        }
+        RpConnection *client = revpx->conns[c->peer];
+        if (client && !client->websocket) {
+            send_error(revpx, client, 502, "Bad Gateway");
+            client->peer = -1;
+            client->state = ST_READ_HEADER;
+        } else {
+            rp_log_error("Backend connection failed on fd=%d: %s\n", fd, strerror(err));
+        }
+        c->peer = -1;
+        cleanup(revpx, fd);
+        return;
+    }
+
+    rp_log_debug("Backend fd=%d connected successfully\n", fd);
+
+    RpConnection *client = revpx->conns[c->peer];
+    if (!client) {
+        cleanup(revpx, fd);
+        return;
+    }
+
+    // Initialize request boundary tracking on the backend so
+    // forward_client_bytes knows to parse the first request's headers
+    init_backend_request_state(c);
+
+    if (client->websocket) {
+        c->state = ST_UPGRADING;
+        client->state = ST_UPGRADING;
+        rp_log_debug("Waiting for websocket upgrade to complete\n");
+    } else {
+        c->state = ST_PROXYING;
+        client->state = ST_PROXYING;
+    }
+
+    if (client->len > 0) {
+        if (!forward_client_bytes(revpx, client, c, client->buf + client->off, client->len)) {
+            return;
+        }
+        client->off = 0;
+        client->len = 0;
+    } else {
+        rp_log_debug("Backend fd=%d ready, no data to forward yet\n", fd);
+    }
+    if (revpx->conns[fd]) ep_mod(revpx, fd, EPOLLIN | (revpx->conns[fd]->len ? EPOLLOUT : 0) | EPOLLET);
+    if (client && revpx->conns[client->fd]) ep_mod(revpx, client->fd, EPOLLIN | EPOLLET);
+}
+
+static void handle_state_upgrading(RevPx *revpx, RpConnection *c) {
+    // WebSocket upgrade: read the backend's response. If it's "101 Switching Protocols",
+    // copy the response to the client buffer and transition both sides to ST_TUNNELING.
+    // Any other response means the upgrade failed → send 502 to client.
+    RpConnection *client = revpx->conns[c->peer];
+    if (!client) {
+        rp_log_error("WebSocket upgrade error: client connection lost for fd=%d\n", c->fd);
+        cleanup(revpx, c->fd);
+        return;
+    }
+
+    int n = do_read(c, c->buf + c->len, sizeof(c->buf) - c->len);
+    if (n > 0) {
+        c->len += n;
+    } else if (n <= 0 && errno == EAGAIN) {
+        ep_mod(revpx, c->fd, EPOLLIN | EPOLLET);
+        return;
+    } else if (n <= 0 && get_error(c, n) != SSL_ERROR_WANT_READ) {
+        rp_log_error("WebSocket upgrade failed - backend read error fd=%d: %s\n", c->fd, strerror(errno));
+        send_error(revpx, client, 502, "Bad Gateway");
+        cleanup(revpx, c->fd);
+        return;
+    }
+
+    if (c->len >= 12 && strncasecmp((char *)c->buf, "HTTP/1.1 101", 12) == 0) {
+        rp_log_debug("websocket: handshake success, start tunneling\n");
+
+        c->state = ST_TUNNELING;
+        client->state = ST_TUNNELING;
+
+        memcpy(client->buf, c->buf, c->len);
+        client->len = c->len;
+        client->off = 0;
+
+        c->len = 0;
+        c->off = 0;
+
+        rp_log_debug("Copied %zu bytes (101 response) to client fd=%d buffer\n", client->len, client->fd);
+        ep_mod(revpx, client->fd, EPOLLOUT | EPOLLIN | EPOLLET);
+        ep_mod(revpx, c->fd, EPOLLIN | EPOLLET);
+    } else {
+        rp_log_warn("Upgrade a WebSocket failed. Backend response:\n%.*s\n", (int)c->len, c->buf);
+        send_error(revpx, client, 502, "Bad Gateway: WebSocket handshake failed");
+        cleanup(revpx, c->fd);
+    }
+}
+
+static void handle_state_shutting_down(RevPx *revpx, RpConnection *c) {
+    if (!c->ssl) {
+        shutdown(c->fd, SHUT_WR);
+        cleanup(revpx, c->fd);
+        return;
+    }
+
+    int ret = SSL_shutdown(c->ssl);
+    if (ret == 1) {
+        cleanup(revpx, c->fd);
+    } else if (ret == 0) {
+        ep_mod(revpx, c->fd, EPOLLIN | EPOLLET);
+    } else {
+        int err = SSL_get_error(c->ssl, ret);
+        if (err == SSL_ERROR_WANT_READ)
+            ep_mod(revpx, c->fd, EPOLLIN | EPOLLET);
+        else if (err == SSL_ERROR_WANT_WRITE)
+            ep_mod(revpx, c->fd, EPOLLOUT | EPOLLET);
+        else {
+            char ssl_ctx[64];
+            snprintf(ssl_ctx, sizeof(ssl_ctx), "SSL shutdown error on fd=%d", c->fd);
+            if (!log_ssl_error_queue(RP_DEBUG, ssl_ctx)) {
+                rp_log_debug("SSL shutdown error on fd=%d, error code: %d\n", c->fd, err);
+            }
+            cleanup(revpx, c->fd);
+        }
+    }
+}
+
+static void handle_event(RevPx *revpx, int fd, uint32_t events) {
+    RpConnection *c = revpx->conns[fd];
+    if (!c) return;
+
+    if (handle_event_error_or_hup(revpx, c, events)) return;
 
     // Flush pending outbound data for non-proxy states (proxy_data handles its own flush).
     // Skip for ST_CONNECTING backend fds — they haven't finished connect() yet.
-    if (c->state != ST_PROXYING && c->len > 0 && (events & EPOLLOUT)) {
-        if (c->state == ST_CONNECTING) goto skip_flush;
+    if (c->state != ST_PROXYING && c->state != ST_CONNECTING && c->len > 0 && (events & EPOLLOUT)) {
         flush_buffer(revpx, c);
         if (!revpx->conns[fd]) return;
+        c = revpx->conns[fd];
     }
 
-skip_flush:
     switch (c->state) {
-    case ST_SSL_HANDSHAKE: {
-        int ret = SSL_accept(c->ssl);
-        if (ret == 1) {
-            c->state = ST_READ_HEADER;
-            ep_mod(revpx, fd, EPOLLIN | EPOLLET);
-        } else {
-            int err = SSL_get_error(c->ssl, ret);
-            if (err == SSL_ERROR_WANT_READ)
-                ep_mod(revpx, fd, EPOLLIN | EPOLLET);
-            else if (err == SSL_ERROR_WANT_WRITE)
-                ep_mod(revpx, fd, EPOLLOUT | EPOLLET);
-            else {
-                unsigned long ssl_err;
-                while ((ssl_err = ERR_get_error()) != 0) {
-                    char err_buf[256];
-                    ERR_error_string_n(ssl_err, err_buf, sizeof(err_buf));
-                    rp_log_debug("SSL handshake failed on fd=%d: %s\n", fd, err_buf);
-                }
-                if (ssl_err == 0) {
-                    rp_log_debug("SSL handshake failed on fd=%d, error code: %d\n", fd, err);
-                }
-                cleanup(revpx, fd);
-            }
-        }
+    case ST_SSL_HANDSHAKE:
+        handle_state_ssl_handshake(revpx, c);
         break;
-    }
-
-    case ST_READ_HEADER: {
-        size_t space = sizeof(c->buf) - c->len;
-        if (space == 0) {
-            rp_log_error("Header too large for fd=%d\n", fd);
-            send_error(revpx, c, 431, "Request Header Fields Too Large");
-            break;
-        }
-
-        int n = do_read(c, c->buf + c->len, space);
-        if (n > 0) {
-            c->len += n;
-            rp_log_debug("Read %d bytes, total header buffer: %zu bytes for fd=%d\n", n, c->len, fd);
-
-            int end = find_headers_end(c->buf, c->len);
-            if (end > 0) {
-                char host[512], target[1024] = "/";
-                extract_host(c->buf, end, host, sizeof(host));
-                extract_target(c->buf, end, target, sizeof(target));
-                const char *sni_name = c->ssl ? SSL_get_servername(c->ssl, TLSEXT_NAMETYPE_host_name) : NULL;
-                if (host[0] == '\0' && sni_name && *sni_name) {
-                    strncpy(host, sni_name, sizeof(host) - 1);
-                    host[sizeof(host) - 1] = '\0';
-                }
-                if (!c->ssl && host[0] == '\0') {
-                    send_error(revpx, c, 400, "Bad Request");
-                    break;
-                }
-                if (host[0] == '\0' && revpx->domain_count > 0) {
-                    strncpy(host, revpx->domains[0].domain, sizeof(host) - 1);
-                    host[sizeof(host) - 1] = '\0';
-                }
-
-                c->websocket = is_websocket_upgrade_request(c->buf, end);
-                if (c->websocket) {
-                    rp_log_debug("websocket upgrade request detected\n");
-                }
-
-                if (!c->ssl) {
-                    send_redirect(revpx, c, host, target, revpx->https_port);
-                    break;
-                }
-
-                RpHostDomain *d = NULL;
-                for (int i = 0; i < revpx->domain_count; i++) {
-                    if (strcasecmp(revpx->domains[i].domain, host) == 0) {
-                        d = &revpx->domains[i];
-                        break;
-                    }
-                }
-                if (!d) {
-                    rp_log_error("Domain not found: %s\n", host);
-                    send_error(revpx, c, 421, "Misdirected Request");
-                    break;
-                }
-                rp_log_debug("HTTPS request: https://%s%s -> %s:%s\n", host, target, d->host, d->port);
-
-                int backend = create_backend(d->host, d->port);
-                if (backend < 0) {
-                    rp_log_error("Failed to create backend connection to %s:%s\n", d->host, d->port);
-                    send_error(revpx, c, 502, "Bad Gateway");
-                    break;
-                }
-
-                RpConnection *b = alloc_conn(revpx, backend, NULL, ST_CONNECTING, CT_BACKEND);
-                c->peer = backend;
-                b->peer = fd;
-                c->state = ST_CONNECTING;
-
-                ep_add(revpx, backend, EPOLLOUT | EPOLLET);
-            } else {
-                rp_log_debug("Headers incomplete (%zu bytes), waiting for more data on fd=%d\n", c->len, fd);
-                ep_mod(revpx, fd, EPOLLIN | EPOLLET);
-            }
-        } else if (n == 0) {
-            rp_log_debug("Connection closed during header read fd=%d\n", fd);
-            cleanup(revpx, fd);
-        } else {
-            int err = get_error(c, n);
-            if (err == SSL_ERROR_WANT_READ) {
-                rp_log_debug("SSL_ERROR_WANT_READ on fd=%d, waiting for more data\n", fd);
-            } else if (err == SSL_ERROR_WANT_WRITE) {
-                rp_log_debug("SSL_ERROR_WANT_WRITE on fd=%d\n", fd);
-                ep_mod(revpx, fd, EPOLLOUT | EPOLLIN | EPOLLET);
-            } else {
-                if (err == SSL_ERROR_ZERO_RETURN) {
-                    rp_log_error("Connection closed during header read fd=%d\n", fd);
-                } else if (err == SSL_ERROR_SYSCALL) {
-                    rp_log_error("SSL read error during header read fd=%d: %s\n", fd, strerror(errno));
-                } else {
-                    rp_log_error("Read error during header read fd=%d, error: %d\n", fd, err);
-                }
-                cleanup(revpx, fd);
-            }
-        }
+    case ST_READ_HEADER:
+        handle_state_read_header(revpx, c);
         break;
-    }
-
-    case ST_CONNECTING: {
-        // For SSL clients: the backend TCP connect is in-flight. Meanwhile, the client
-        // may keep sending request body data. Buffer it here so it's not lost.
-        // Once the backend connects (EPOLLOUT on the backend fd), these buffered bytes
-        // are forwarded via forward_client_bytes.
-        if (c->ssl) {
-            if (events & EPOLLIN) {
-                while (1) {
-                    compact_buffer(c);
-                    size_t space = buffer_space(c);
-                    if (space == 0) {
-                        // Buffer full — stop reading until backend connects and data is forwarded
-                        break;
-                    }
-                    int n = do_read(c, c->buf + c->off + c->len, space);
-                    if (n > 0) {
-                        c->len += n;
-                        continue;
-                    } else if (n == 0) {
-                        cleanup_both(revpx, fd);
-                        break;
-                    } else {
-                        int err = get_error(c, n);
-                        if (err == SSL_ERROR_WANT_READ) break;
-                        if (err == SSL_ERROR_WANT_WRITE) {
-                            ep_mod(revpx, fd, EPOLLIN | EPOLLOUT | EPOLLET);
-                            break;
-                        }
-                        cleanup_both(revpx, fd);
-                        break;
-                    }
-                }
-            }
-            break;
-        }
-
-        if (!(events & EPOLLOUT)) break;
-
-        // Backend fd: EPOLLOUT means connect() completed. Check SO_ERROR to
-        // distinguish success from failure (async connect reports errors here).
-        int err = 0;
-        socklen_t len = sizeof(err);
-        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
-            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) {
-                rp_log_error("getsockopt failed on fd=%d: %s\n", fd, strerror(errno));
-            }
-            RpConnection *client = revpx->conns[c->peer];
-            if (client && !client->websocket) {
-                send_error(revpx, client, 502, "Bad Gateway");
-                client->peer = -1;
-                client->state = ST_READ_HEADER;
-            } else {
-                rp_log_error("Backend connection failed on fd=%d: %s\n", fd, strerror(err));
-            }
-            c->peer = -1;
-            cleanup(revpx, fd);
-            break;
-        }
-
-        rp_log_debug("Backend fd=%d connected successfully\n", fd);
-
-        RpConnection *client = revpx->conns[c->peer];
-        if (!client) {
-            cleanup(revpx, fd);
-            break;
-        }
-
-        // Initialize request boundary tracking on the backend so
-        // forward_client_bytes knows to parse the first request's headers
-        c->req_need_header = true;
-        c->req_parsing_header = true;
-        c->req_chunked = false;
-        c->req_body_left = 0;
-        c->chunk_left = 0;
-        c->chunk_size_acc = 0;
-        c->chunk_line_len = 0;
-        c->chunk_expect_crlf = false;
-        c->chunk_in_trailer = false;
-        c->chunk_in_ext = false;
-        c->chunk_trailer_window = 0;
-
-        if (client->websocket) {
-            c->state = ST_UPGRADING;
-            client->state = ST_UPGRADING;
-            rp_log_debug("Waiting for websocket upgrade to complete\n");
-        } else {
-            c->state = ST_PROXYING;
-            client->state = ST_PROXYING;
-        }
-
-        if (client->len > 0) {
-            if (!forward_client_bytes(revpx, client, c, client->buf + client->off, client->len)) {
-                break;
-            }
-            client->off = 0;
-            client->len = 0;
-        } else {
-            rp_log_debug("Backend fd=%d ready, no data to forward yet\n", fd);
-        }
-        if (revpx->conns[fd]) ep_mod(revpx, fd, EPOLLIN | (revpx->conns[fd]->len ? EPOLLOUT : 0) | EPOLLET);
-        if (client && revpx->conns[client->fd]) ep_mod(revpx, client->fd, EPOLLIN | EPOLLET);
+    case ST_CONNECTING:
+        handle_state_connecting(revpx, c, events);
         break;
-    }
-
-    case ST_UPGRADING: {
-        // WebSocket upgrade: read the backend's response. If it's "101 Switching Protocols",
-        // copy the response to the client buffer and transition both sides to ST_TUNNELING.
-        // Any other response means the upgrade failed → send 502 to client.
-        RpConnection *client = revpx->conns[c->peer];
-        if (!client) {
-            rp_log_error("WebSocket upgrade error: client connection lost for fd=%d\n", fd);
-            cleanup(revpx, fd);
-            break;
-        }
-
-        int n = do_read(c, c->buf + c->len, sizeof(c->buf) - c->len);
-        if (n > 0) {
-            c->len += n;
-        } else if (n <= 0 && errno == EAGAIN) {
-            ep_mod(revpx, c->fd, EPOLLIN | EPOLLET);
-            break;
-        } else if (n <= 0 && get_error(c, n) != SSL_ERROR_WANT_READ) {
-            rp_log_error("WebSocket upgrade failed - backend read error fd=%d: %s\n", c->fd, strerror(errno));
-            send_error(revpx, client, 502, "Bad Gateway");
-            cleanup(revpx, c->fd);
-            break;
-        }
-
-        if (c->len >= 12 && strncasecmp((char *)c->buf, "HTTP/1.1 101", 12) == 0) {
-            rp_log_debug("websocket: handshake success, start tunneling\n");
-
-            c->state = ST_TUNNELING;
-            client->state = ST_TUNNELING;
-
-            memcpy(client->buf, c->buf, c->len);
-            client->len = c->len;
-            client->off = 0;
-
-            c->len = 0;
-            c->off = 0;
-
-            rp_log_debug("Copied %zu bytes (101 response) to client fd=%d buffer\n", client->len, client->fd);
-            ep_mod(revpx, client->fd, EPOLLOUT | EPOLLIN | EPOLLET);
-            ep_mod(revpx, c->fd, EPOLLIN | EPOLLET);
-        } else {
-            rp_log_warn("Upgrade a WebSocket failed. Backend response:\n%.*s\n", (int)c->len, c->buf);
-            send_error(revpx, client, 502, "Bad Gateway: WebSocket handshake failed");
-            cleanup(revpx, c->fd);
-        }
-
+    case ST_UPGRADING:
+        handle_state_upgrading(revpx, c);
         break;
-    }
-
     case ST_PROXYING:
         proxy_data(revpx, c, events);
         break;
-
     case ST_TUNNELING:
         tunnel_data(revpx, c, events);
         break;
-
-    case ST_SHUTTING_DOWN: {
-        if (!c->ssl) {
-            shutdown(c->fd, SHUT_WR);
-            cleanup(revpx, c->fd);
-            break;
-        }
-
-        int ret = SSL_shutdown(c->ssl);
-        if (ret == 1) {
-            cleanup(revpx, c->fd);
-        } else if (ret == 0) {
-            ep_mod(revpx, c->fd, EPOLLIN | EPOLLET);
-        } else {
-            int err = SSL_get_error(c->ssl, ret);
-            if (err == SSL_ERROR_WANT_READ)
-                ep_mod(revpx, c->fd, EPOLLIN | EPOLLET);
-            else if (err == SSL_ERROR_WANT_WRITE)
-                ep_mod(revpx, c->fd, EPOLLOUT | EPOLLET);
-            else {
-                unsigned long ssl_err;
-                while ((ssl_err = ERR_get_error()) != 0) {
-                    char err_buf[256];
-                    ERR_error_string_n(ssl_err, err_buf, sizeof(err_buf));
-                    rp_log_debug("SSL shutdown error on fd=%d: %s\n", c->fd, err_buf);
-                }
-                if (ssl_err == 0) {
-                    rp_log_debug("SSL shutdown error on fd=%d, error code: %d\n", c->fd, err);
-                }
-                cleanup(revpx, c->fd);
-            }
-        }
+    case ST_SHUTTING_DOWN:
+        handle_state_shutting_down(revpx, c);
         break;
-    }
     }
 }
 
@@ -1922,22 +1928,17 @@ int revpx_run_server(RevPx *revpx) {
     SSL_CTX *root_ctx = SSL_CTX_new(TLS_server_method());
     if (!root_ctx) {
         rp_log_error("SSL_CTX_new failed for root context\n");
-        unsigned long ssl_err;
-        while ((ssl_err = ERR_get_error()) != 0) {
-            char err_buf[256];
-            ERR_error_string_n(ssl_err, err_buf, sizeof(err_buf));
-            rp_log_error("SSL error: %s\n", err_buf);
-        }
-        if (http_fd >= 0) close(http_fd);
-        close(https_fd);
-        close(revpx->epfd);
+        log_ssl_error_queue(RP_ERROR, "SSL error");
+        close_if_valid(http_fd);
+        close_if_valid(https_fd);
+        close_if_valid(revpx->epfd);
         return -1;
     }
     if (revpx->domain_count == 0) {
         rp_log_error("No domains configured\n");
-        if (http_fd >= 0) close(http_fd);
-        close(https_fd);
-        close(revpx->epfd);
+        close_if_valid(http_fd);
+        close_if_valid(https_fd);
+        close_if_valid(revpx->epfd);
         SSL_CTX_free(root_ctx);
         return -1;
     }
@@ -1948,15 +1949,10 @@ int revpx_run_server(RevPx *revpx) {
     if (SSL_CTX_use_certificate_file(root_ctx, default_domain->cert, SSL_FILETYPE_PEM) <= 0 ||
         SSL_CTX_use_PrivateKey_file(root_ctx, default_domain->key, SSL_FILETYPE_PEM) <= 0 ||
         SSL_CTX_check_private_key(root_ctx) != 1) {
-        unsigned long ssl_err;
-        while ((ssl_err = ERR_get_error()) != 0) {
-            char err_buf[256];
-            ERR_error_string_n(ssl_err, err_buf, sizeof(err_buf));
-            rp_log_error("SSL error: %s\n", err_buf);
-        }
-        if (http_fd >= 0) close(http_fd);
-        if (https_fd >= 0) close(https_fd);
-        if (revpx->epfd >= 0) close(revpx->epfd);
+        log_ssl_error_queue(RP_ERROR, "SSL error");
+        close_if_valid(http_fd);
+        close_if_valid(https_fd);
+        close_if_valid(revpx->epfd);
         SSL_CTX_free(root_ctx);
         return -1;
     }
@@ -2041,9 +2037,9 @@ int revpx_run_server(RevPx *revpx) {
             cleanup(revpx, i);
         }
     }
-    if (http_fd >= 0) close(http_fd);
-    if (https_fd >= 0) close(https_fd);
-    if (revpx->epfd >= 0) close(revpx->epfd);
+    close_if_valid(http_fd);
+    close_if_valid(https_fd);
+    close_if_valid(revpx->epfd);
     SSL_CTX_free(root_ctx);
     return ret;
 }
