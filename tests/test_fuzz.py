@@ -33,10 +33,13 @@ from test_revpx import (
     BackendServer,
     ProxyClient,
     RevPxProxy,
-    HTTPS_PORT,
-    BACKEND_PORT,
     TEST_DOMAIN,
 )
+
+
+FUZZ_HTTPS_PORT = 19243
+FUZZ_HTTP_PORT = 19280
+FUZZ_BACKEND_PORT = 19200
 
 
 # ============================================================================
@@ -46,7 +49,7 @@ from test_revpx import (
 @pytest.fixture(scope="module")
 def backend():
     """Start backend server for the test module"""
-    server = BackendServer(BACKEND_PORT)
+    server = BackendServer(FUZZ_BACKEND_PORT)
     server.start()
     yield server
     server.stop()
@@ -55,7 +58,11 @@ def backend():
 @pytest.fixture(scope="module")
 def proxy(backend):
     """Start revpx proxy for the test module"""
-    proxy = RevPxProxy()
+    proxy = RevPxProxy(
+        https_port=FUZZ_HTTPS_PORT,
+        http_port=FUZZ_HTTP_PORT,
+        backend_port=FUZZ_BACKEND_PORT,
+    )
     proxy.start()
     yield proxy
     proxy.stop()
@@ -64,7 +71,7 @@ def proxy(backend):
 @pytest.fixture
 def client(proxy):
     """Get a test client"""
-    return ProxyClient()
+    return ProxyClient(port=FUZZ_HTTPS_PORT)
 
 
 @pytest.fixture(autouse=True)
@@ -77,7 +84,7 @@ def reset_backend():
 class RawClient:
     """Low-level client for sending raw bytes through the proxy"""
 
-    def __init__(self, host: str = TEST_DOMAIN, port: int = HTTPS_PORT):
+    def __init__(self, host: str = TEST_DOMAIN, port: int = FUZZ_HTTPS_PORT):
         self.host = host
         self.port = port
         self.context = ssl.create_default_context()
@@ -631,7 +638,7 @@ class TestConnectionState:
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
 
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
+        with socket.create_connection(("127.0.0.1", FUZZ_HTTPS_PORT), timeout=10) as sock:
             with context.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
                 # First request - trigger 404
                 def custom_404(handler, req):
@@ -672,7 +679,7 @@ class TestConnectionState:
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
 
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
+        with socket.create_connection(("127.0.0.1", FUZZ_HTTPS_PORT), timeout=10) as sock:
             with context.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
                 # Send multiple requests at once
                 requests = b""
@@ -704,7 +711,7 @@ class TestConnectionState:
 
         request = f"GET / HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\n\r\n".encode()
 
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=30) as sock:
+        with socket.create_connection(("127.0.0.1", FUZZ_HTTPS_PORT), timeout=30) as sock:
             with context.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
                 # Send byte by byte with small delay
                 for b in request:
@@ -733,7 +740,7 @@ class TestConnectionState:
 
         body = b"x" * 100
 
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=30) as sock:
+        with socket.create_connection(("127.0.0.1", FUZZ_HTTPS_PORT), timeout=30) as sock:
             with context.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
                 headers = (
                     f"POST / HTTP/1.1\r\n"
@@ -773,7 +780,7 @@ class TestConnectionState:
         context.verify_mode = ssl.CERT_NONE
 
         try:
-            with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
+            with socket.create_connection(("127.0.0.1", FUZZ_HTTPS_PORT), timeout=10) as sock:
                 with context.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
                     request = f"GET / HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\n\r\n".encode()
                     ssock.sendall(request)
@@ -786,7 +793,7 @@ class TestConnectionState:
         time.sleep(0.5)
 
         # Proxy should still work for next request
-        client = ProxyClient()
+        client = ProxyClient(port=FUZZ_HTTPS_PORT)
         BackendHandler.response_delay = 0
         status, _, _ = client.request("GET", "/")
         assert status == 200
@@ -803,7 +810,7 @@ class TestStress:
         """Test rapidly creating and destroying connections"""
         for _ in range(50):
             try:
-                client = ProxyClient()
+                client = ProxyClient(port=FUZZ_HTTPS_PORT)
                 status, _, _ = client.request("GET", "/", timeout=5)
                 assert status == 200
             except Exception:
@@ -814,7 +821,7 @@ class TestStress:
         paths = [f"/path/{i}/subpath/{j}" for i in range(10) for j in range(10)]
 
         def make_request(path):
-            client = ProxyClient()
+            client = ProxyClient(port=FUZZ_HTTPS_PORT)
             try:
                 status, _, body = client.request("GET", path, timeout=10)
                 return path, status
@@ -833,7 +840,7 @@ class TestStress:
         num_requests = 50
 
         def make_request(i):
-            client = ProxyClient()
+            client = ProxyClient(port=FUZZ_HTTPS_PORT)
             body = f"request-{i}-data".encode() * 100
             body_hash = hashlib.md5(body).hexdigest()
             try:
@@ -857,7 +864,7 @@ class TestStress:
         sizes = [10, 100, 1000, 5000, 10000, 20000]
 
         def make_request(size):
-            client = ProxyClient()
+            client = ProxyClient(port=FUZZ_HTTPS_PORT)
             body = os.urandom(size)
             body_hash = hashlib.md5(body).hexdigest()
             try:

@@ -40,9 +40,9 @@ from test_revpx import (
 # Configuration - use unique ports to avoid conflicts with other test files
 # ============================================================================
 
-MIXED_BACKEND_PORT = 18100
-MIXED_HTTPS_PORT = 18943
-MIXED_HTTP_PORT = 18980
+MIXED_BACKEND_PORT = 19100
+MIXED_HTTPS_PORT = 19143
+MIXED_HTTP_PORT = 19180
 MIXED_DOMAIN = "test.localhost"
 
 
@@ -311,6 +311,20 @@ def make_ssl_connection(port=MIXED_HTTPS_PORT, domain=MIXED_DOMAIN):
     return ssock
 
 
+def wait_for_tcp_port(port: int, timeout: float = 5.0):
+    """Wait until a local TCP port is accepting connections."""
+    deadline = time.time() + timeout
+    last_error = None
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                return
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.02)
+    raise RuntimeError(f"Port {port} not ready within {timeout}s (last error: {last_error})")
+
+
 # ============================================================================
 # Fixtures
 # ============================================================================
@@ -321,7 +335,7 @@ def mixed_backend():
     server = ThreadedHTTPServer(("127.0.0.1", MIXED_BACKEND_PORT), MixedBackendHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    time.sleep(0.2)
+    wait_for_tcp_port(MIXED_BACKEND_PORT, timeout=2.0)
     yield server
     server.shutdown()
 
@@ -351,7 +365,7 @@ def mixed_proxy(mixed_backend):
         cwd=PROJECT_ROOT,
         env=env,
     )
-    time.sleep(1)
+    wait_for_tcp_port(MIXED_HTTPS_PORT, timeout=5.0)
 
     if process.poll() is not None:
         stdout, stderr = process.communicate()

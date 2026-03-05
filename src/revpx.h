@@ -322,6 +322,12 @@ static RpConnection *alloc_conn(RevPx *revpx, int fd, SSL *ssl, RpConnectionStat
         return NULL;
     }
     RpConnection *c = calloc(1, sizeof(RpConnection));
+    if (!c) {
+        rp_log_error("Out of memory allocating connection for fd=%d\n", fd);
+        if (ssl) SSL_free(ssl);
+        close(fd);
+        return NULL;
+    }
     c->fd = fd;
     c->ssl = ssl;
     c->peer = -1;
@@ -339,9 +345,12 @@ static int do_read(RpConnection *c, void *data, size_t size) {
     return c->ssl ? SSL_read(c->ssl, data, size) : read(c->fd, data, size);
 }
 
-static int get_error(RpConnection *c, int ret) {
+static int get_error(RpConnection *c, int ret, bool is_write) {
     if (c->ssl) return SSL_get_error(c->ssl, ret);
-    return errno == EAGAIN || errno == EWOULDBLOCK ? SSL_ERROR_WANT_WRITE : SSL_ERROR_SYSCALL;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        return is_write ? SSL_ERROR_WANT_WRITE : SSL_ERROR_WANT_READ;
+    }
+    return SSL_ERROR_SYSCALL;
 }
 
 static void compact_buffer(RpConnection *c) {
@@ -479,10 +488,23 @@ static bool is_websocket_upgrade_request(const unsigned char *buf, size_t len) {
 
         if (strncasecmp(p, "Upgrade:", 8) == 0) {
             const char *value = p + 8;
+            const char *nl_end = nl;
+            if (nl > p && nl[-1] == '\r') nl_end--;
             while (value < nl && isspace(*value))
                 value++;
-            if (strncasecmp(value, "websocket", 9) == 0) {
-                upgrade_header_found = true;
+
+            const char *c = value;
+            while (c < nl_end) {
+                while (c < nl_end && (*c == ' ' || *c == '\t' || *c == ',')) c++;
+                const char *tok_start = c;
+                while (c < nl_end && *c != ',') c++;
+                const char *tok_end = c;
+                while (tok_end > tok_start && (tok_end[-1] == ' ' || tok_end[-1] == '\t')) tok_end--;
+
+                if ((tok_end - tok_start) == 9 && strncasecmp(tok_start, "websocket", 9) == 0) {
+                    upgrade_header_found = true;
+                    break;
+                }
             }
         }
 
@@ -493,11 +515,16 @@ static bool is_websocket_upgrade_request(const unsigned char *buf, size_t len) {
 
             const char *c = value;
             while (c < nl_end) {
-                if (strncasecmp(c, "Upgrade", 7) == 0) {
+                while (c < nl_end && (*c == ' ' || *c == '\t' || *c == ',')) c++;
+                const char *tok_start = c;
+                while (c < nl_end && *c != ',') c++;
+                const char *tok_end = c;
+                while (tok_end > tok_start && (tok_end[-1] == ' ' || tok_end[-1] == '\t')) tok_end--;
+
+                if ((tok_end - tok_start) == 7 && strncasecmp(tok_start, "Upgrade", 7) == 0) {
                     connection_header_found = true;
                     break;
                 }
-                c++;
             }
         }
 
@@ -594,7 +621,7 @@ static void flush_buffer(RevPx *revpx, RpConnection *c) {
             c->len -= n;
             c->write_retry_count = 0;
         } else {
-            int err = get_error(c, n);
+            int err = get_error(c, n, true);
             if (err == SSL_ERROR_WANT_WRITE) {
                 ep_mod(revpx, c->fd, EPOLLOUT | EPOLLET);
                 return;
@@ -738,7 +765,7 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
                         written += w;
                         dst->write_retry_count = 0;
                     } else {
-                        int err = get_error(dst, w);
+                        int err = get_error(dst, w, true);
                         if (err == SSL_ERROR_WANT_WRITE) break;
                         if (err == SSL_ERROR_WANT_READ) {
                             ep_mod(revpx, dst->fd, EPOLLIN | EPOLLOUT | EPOLLET);
@@ -782,7 +809,7 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
                 cleanup(revpx, src->fd);
                 return;
             } else {
-                int err = get_error(src, n);
+                int err = get_error(src, n, false);
                 if (err == SSL_ERROR_WANT_READ) return;
                 if (err == SSL_ERROR_WANT_WRITE) {
                     ep_mod(revpx, src->fd, EPOLLOUT | EPOLLIN | EPOLLET);
@@ -843,7 +870,7 @@ static void tunnel_data(RevPx *revpx, RpConnection *src, uint32_t events) {
             rp_log_debug("WebSocket peer (fd: %d) closed connection.\n", src->fd);
             cleanup_both(revpx, src->fd);
         } else {
-            int err = get_error(src, n);
+            int err = get_error(src, n, false);
 
             if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
                 return;
@@ -865,35 +892,101 @@ static void tunnel_data(RevPx *revpx, RpConnection *src, uint32_t events) {
     }
 }
 
-static int create_backend(const char *host, const char *port) {
-    struct addrinfo hints = {0}, *res;
-    hints.ai_family = AF_UNSPEC;
+static int create_backend_with_family(const char *host, const char *port, int family, int *last_err) {
+    struct addrinfo hints = {0}, *res = NULL;
+    hints.ai_family = family;
     hints.ai_socktype = SOCK_STREAM;
 
-    if (getaddrinfo(host, port, &hints, &res) != 0) {
-        rp_log_error("getaddrinfo failed for %s:%s: %s\n", host, port, strerror(errno));
+    int gai_rc = getaddrinfo(host, port, &hints, &res);
+    if (gai_rc != 0) {
+        if (last_err) *last_err = 0;
         return -1;
     }
 
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd < 0) {
-        rp_log_error("socket creation failed for backend %s:%s: %s\n", host, port, strerror(errno));
-        freeaddrinfo(res);
-        return -1;
-    }
+    int fd = -1;
+    int err = 0;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) {
+            err = errno;
+            continue;
+        }
 
-    set_nonblock(fd);
-    int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        set_nonblock(fd);
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
-    if (connect(fd, res->ai_addr, res->ai_addrlen) < 0 && errno != EINPROGRESS) {
-        rp_log_error("connect failed for backend %s:%s: %s\n", host, port, strerror(errno));
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0 || errno == EINPROGRESS) {
+            break;
+        }
+
+        err = errno;
         close(fd);
-        freeaddrinfo(res);
+        fd = -1;
+    }
+
+    freeaddrinfo(res);
+    if (fd < 0 && last_err) *last_err = err;
+    return fd;
+}
+
+static int create_backend(const char *host, const char *port) {
+    int last_err = 0;
+
+    // Prefer IPv4 first to avoid localhost (::1 first) false 502 when backend
+    // is IPv4-only and connect() is asynchronous.
+    int fd = create_backend_with_family(host, port, AF_INET, &last_err);
+    if (fd >= 0) return fd;
+
+    fd = create_backend_with_family(host, port, AF_UNSPEC, &last_err);
+    if (fd >= 0) return fd;
+
+    if (last_err == 0) {
+        rp_log_error("getaddrinfo failed for %s:%s\n", host, port);
         return -1;
     }
-    freeaddrinfo(res);
-    return fd;
+    rp_log_error("connect failed for backend %s:%s: %s\n", host, port, strerror(last_err));
+    return -1;
+}
+
+static bool find_header(const unsigned char *buf, size_t len, const char *header_name,
+                        const char **value_start, size_t *value_len);
+
+static bool header_has_token_ci(const unsigned char *buf, size_t header_len, const char *name, const char *token) {
+    const char *line = (const char *)buf;
+    const char *end_headers = (const char *)buf + header_len;
+    size_t name_len = strlen(name);
+    size_t token_len = strlen(token);
+
+    while (line < end_headers) {
+        const char *nl = memchr(line, '\n', end_headers - line);
+        if (!nl) break;
+
+        const char *line_end = nl;
+        if (line_end > line && line_end[-1] == '\r') line_end--;
+        if ((size_t)(line_end - line) >= name_len + 1 &&
+            strncasecmp(line, name, name_len) == 0 && line[name_len] == ':') {
+            const char *p = line + name_len + 1;
+            const char *value_end = line_end;
+
+            while (p < value_end) {
+                while (p < value_end && (*p == ' ' || *p == '\t' || *p == ',')) p++;
+                const char *tok_start = p;
+                while (p < value_end && *p != ',') p++;
+                const char *tok_end = p;
+                while (tok_end > tok_start && (tok_end[-1] == ' ' || tok_end[-1] == '\t')) tok_end--;
+
+                if ((size_t)(tok_end - tok_start) == token_len &&
+                    strncasecmp(tok_start, token, token_len) == 0) {
+                    return true;
+                }
+            }
+        }
+
+        line = nl + 1;
+    }
+
+    return false;
 }
 
 static bool find_header(const unsigned char *buf, size_t len, const char *header_name,
@@ -925,12 +1018,40 @@ static bool find_header(const unsigned char *buf, size_t len, const char *header
 }
 
 static bool has_chunked_encoding(const unsigned char *buf, size_t len) {
-    const char *te = NULL;
-    size_t te_len = 0;
-    if (!find_header(buf, len, "Transfer-Encoding", &te, &te_len)) return false;
-    for (size_t i = 0; i + 6 < te_len; i++) {
-        if (strncasecmp(te + i, "chunked", 7) == 0) return true;
+    const char *line = (const char *)buf;
+    const char *end = (const char *)buf + len;
+    while (line < end) {
+        const char *nl = memchr(line, '\n', end - line);
+        if (!nl) break;
+
+        const char *line_end = nl;
+        if (line_end > line && line_end[-1] == '\r') line_end--;
+
+        if ((size_t)(line_end - line) >= 18 &&
+            strncasecmp(line, "Transfer-Encoding", 17) == 0 && line[17] == ':') {
+            const char *p = line + 18;
+            const char *value_end = line_end;
+
+            while (p < value_end) {
+                while (p < value_end && (*p == ' ' || *p == '\t' || *p == ',')) p++;
+                const char *tok_start = p;
+                while (p < value_end && *p != ',') p++;
+                const char *tok_end = p;
+
+                while (tok_end > tok_start && (tok_end[-1] == ' ' || tok_end[-1] == '\t')) tok_end--;
+                const char *semi = memchr(tok_start, ';', (size_t)(tok_end - tok_start));
+                if (semi) tok_end = semi;
+                while (tok_end > tok_start && (tok_end[-1] == ' ' || tok_end[-1] == '\t')) tok_end--;
+
+                if ((tok_end - tok_start) == 7 && strncasecmp(tok_start, "chunked", 7) == 0) {
+                    return true;
+                }
+            }
+        }
+
+        line = nl + 1;
     }
+
     return false;
 }
 
@@ -1086,6 +1207,43 @@ static bool append_header(char *dst, size_t dst_size, size_t *used, const char *
     return true;
 }
 
+static bool normalize_chunked_framing_headers(RpConnection *conn) {
+    if (conn->len == 0) return false;
+
+    unsigned char *p = conn->buf;
+    int headers_end = find_headers_end(p, conn->len);
+    if (headers_end <= 0) return false;
+    size_t header_len = (size_t)headers_end;
+
+    const char *to_strip[] = {"Content-Length", "Transfer-Encoding"};
+    for (size_t i = 0; i < sizeof(to_strip) / sizeof(to_strip[0]); i++) {
+        while (1) {
+            unsigned char *hs = find_header_ci_in(p, header_len, to_strip[i]);
+            if (!hs) break;
+            unsigned char *line_end = (unsigned char *)memchr(hs, '\n', (p + header_len) - hs);
+            if (!line_end) break;
+            line_end += 1;
+            size_t remove_len = (size_t)(line_end - hs);
+            memmove(hs, line_end, (p + conn->len) - line_end);
+            conn->len -= remove_len;
+            header_len -= remove_len;
+            headers_end -= (int)remove_len;
+        }
+    }
+
+    const char *te = "\r\nTransfer-Encoding: chunked";
+    size_t te_len = strlen(te);
+    if (conn->len + te_len >= sizeof(conn->buf)) return false;
+
+    memmove(p + headers_end - 4 + te_len,
+            p + headers_end - 4,
+            conn->len - (size_t)(headers_end - 4));
+    memcpy(p + headers_end - 4, te, te_len);
+    conn->len += te_len;
+
+    return true;
+}
+
 static void fill_peer_ip(int fd, char *out, size_t max) {
     if (max == 0) return;
     out[0] = '\0';
@@ -1109,7 +1267,7 @@ static void fill_peer_ip(int fd, char *out, size_t max) {
 /**
  * Inject X-Forwarded-For, X-Real-IP, X-Forwarded-Proto/Scheme/Host, and Forwarded
  * headers into the HTTP request stored in conn->buf. Strips any pre-existing
- * forwarded headers to prevent spoofing, then appends client IP from source_fd.
+ * forwarded headers to prevent spoofing, then sets values from source_fd.
  *
  * The headers are inserted just before the \r\n\r\n terminator. Caller must ensure
  * the buffer only contains headers (body separated beforehand) so there's room.
@@ -1126,28 +1284,7 @@ static bool inject_forwarded_headers(RpConnection *conn, int source_fd) {
 
     size_t header_len = (size_t)headers_end;
 
-    const char *ff_value;
-    size_t ff_len = 0;
-    char ff[512];
-    find_header((const unsigned char *)p, header_len, "X-Forwarded-For", &ff_value, &ff_len);
-    if (ff_value && ff_len > 0) {
-        size_t copy_len = ff_len >= sizeof(ff) ? sizeof(ff) - 1 : ff_len;
-        memcpy(ff, ff_value, copy_len);
-        ff[copy_len] = '\0';
-        size_t used = strlen(ff);
-        if (used < sizeof(ff) - 2) {
-            ff[used++] = ',';
-            ff[used++] = ' ';
-        }
-        size_t ip_len = strlen(injected_ip);
-        if (used + ip_len >= sizeof(ff)) ip_len = sizeof(ff) - used - 1;
-        memcpy(ff + used, injected_ip, ip_len);
-        ff[used + ip_len] = '\0';
-    } else {
-        strncpy(ff, injected_ip, sizeof(ff) - 1);
-        ff[sizeof(ff) - 1] = '\0';
-    }
-    if (!append_header(extra_headers, sizeof(extra_headers), &extra_len, "\r\nX-Forwarded-For: %s", ff)) return false;
+    if (!append_header(extra_headers, sizeof(extra_headers), &extra_len, "\r\nX-Forwarded-For: %s", injected_ip)) return false;
 
     const char *to_strip[] = {"Forwarded", "X-Forwarded-For",
                               "X-Forwarded-Proto", "X-Forwarded-Scheme", "X-Forwarded-Host", "X-Real-IP"};
@@ -1177,10 +1314,29 @@ static bool inject_forwarded_headers(RpConnection *conn, int source_fd) {
         int host_copy = (int)(host_len > 1024 ? 1024 : host_len);
         if (!append_header(extra_headers, sizeof(extra_headers), &extra_len, "\r\nX-Forwarded-Host: %.*s", host_copy, host_start)) return false;
     }
-    if (!append_header(extra_headers, sizeof(extra_headers), &extra_len, "\r\nForwarded: proto=https; for=%s", (ff_value && ff_len > 0) ? ff : injected_ip)) return false;
+    char forwarded_for[INET6_ADDRSTRLEN + 8];
+    if (strchr(injected_ip, ':')) {
+        // RFC 7239: IPv6 literal in Forwarded for= should be quoted and bracketed.
+        if (snprintf(forwarded_for, sizeof(forwarded_for), "\"[%s]\"", injected_ip) >= (int)sizeof(forwarded_for)) {
+            return false;
+        }
+    } else {
+        if (snprintf(forwarded_for, sizeof(forwarded_for), "%s", injected_ip) >= (int)sizeof(forwarded_for)) {
+            return false;
+        }
+    }
+
+    if (!append_header(extra_headers, sizeof(extra_headers), &extra_len, "\r\nForwarded: proto=https; for=%s", forwarded_for)) return false;
     if (host_start && host_len > 0) {
         int host_copy = (int)(host_len > 1024 ? 1024 : host_len);
-        if (!append_header(extra_headers, sizeof(extra_headers), &extra_len, "; host=%.*s", host_copy, host_start)) return false;
+        char host_buf[1025];
+        memcpy(host_buf, host_start, (size_t)host_copy);
+        host_buf[host_copy] = '\0';
+        if (strchr(host_buf, ':')) {
+            if (!append_header(extra_headers, sizeof(extra_headers), &extra_len, "; host=\"%s\"", host_buf)) return false;
+        } else {
+            if (!append_header(extra_headers, sizeof(extra_headers), &extra_len, "; host=%s", host_buf)) return false;
+        }
     }
 
     if (conn->len + extra_len >= sizeof(conn->buf)) {
@@ -1240,21 +1396,81 @@ static bool forward_client_replay_leftover(RevPx *revpx, RpConnection *client, R
     return revpx->conns[backend->fd] != NULL;
 }
 
-static void forward_client_parse_body_mode(RpConnection *backend, size_t header_end) {
+static bool parse_content_length_strict(const char *cl, size_t cl_len, size_t *out) {
+    if (!cl || cl_len == 0 || !out) return false;
+
+    size_t i = 0;
+    while (i < cl_len && (cl[i] == ' ' || cl[i] == '\t')) i++;
+    if (i == cl_len) return false;
+    if (cl[i] == '+' || cl[i] == '-') return false;
+
+    size_t value = 0;
+    bool has_digit = false;
+    for (; i < cl_len; i++) {
+        unsigned char ch = (unsigned char)cl[i];
+        if (ch >= '0' && ch <= '9') {
+            has_digit = true;
+            size_t digit = (size_t)(ch - '0');
+            if (value > (SIZE_MAX - digit) / 10) return false;
+            value = value * 10 + digit;
+            continue;
+        }
+
+        if (ch == ' ' || ch == '\t') {
+            while (i < cl_len && (cl[i] == ' ' || cl[i] == '\t')) i++;
+            if (i != cl_len) return false;
+            break;
+        }
+
+        return false;
+    }
+
+    if (!has_digit) return false;
+    *out = value;
+    return true;
+}
+
+static bool parse_content_length_headers(const unsigned char *buf, size_t header_len, size_t *out_body_left) {
+    const unsigned char *p = buf;
+    const unsigned char *end = buf + header_len;
+    bool has_cl = false;
+    size_t parsed_cl = 0;
+
+    while (p < end) {
+        const unsigned char *nl = (const unsigned char *)memchr(p, '\n', end - p);
+        if (!nl) break;
+
+        const unsigned char *line_end = nl;
+        if (line_end > p && line_end[-1] == '\r') line_end--;
+
+        size_t line_len = (size_t)(line_end - p);
+        if (line_len >= 15 && strncasecmp((const char *)p, "Content-Length", 14) == 0 && p[14] == ':') {
+            if (has_cl) return false; // reject duplicate Content-Length headers
+
+            const char *val = (const char *)(p + 15);
+            const char *val_end = (const char *)line_end;
+            while (val < val_end && (*val == ' ' || *val == '\t')) val++;
+            size_t val_len = (size_t)(val_end - val);
+            if (val_len == 0) return false;
+
+            if (!parse_content_length_strict(val, val_len, &parsed_cl)) return false;
+            has_cl = true;
+        }
+
+        p = nl + 1;
+    }
+
+    *out_body_left = has_cl ? parsed_cl : 0;
+    return true;
+}
+
+static bool forward_client_parse_body_mode(RpConnection *backend, size_t header_end) {
     backend->req_chunked = has_chunked_encoding(backend->buf, header_end);
     backend->req_body_left = 0;
 
-    const char *cl = NULL;
-    size_t cl_len = 0;
-    if (find_header(backend->buf, header_end, "Content-Length", &cl, &cl_len) && cl_len > 0) {
-        char tmp[32];
-        size_t copy_len = cl_len >= sizeof(tmp) ? sizeof(tmp) - 1 : cl_len;
-        memcpy(tmp, cl, copy_len);
-        tmp[copy_len] = '\0';
-        if (tmp[0] != '-') {
-            backend->req_body_left = strtoull(tmp, NULL, 10);
-        }
-    }
+    if (!parse_content_length_headers(backend->buf, header_end, &backend->req_body_left)) return false;
+
+    return true;
 }
 
 typedef enum {
@@ -1281,7 +1497,17 @@ static ForwardClientHeaderResult forward_client_handle_complete_header(RevPx *re
     }
 
     // Parse headers before injection (need original headers for CL/TE).
-    forward_client_parse_body_mode(backend, orig_header_end);
+    if (!forward_client_parse_body_mode(backend, orig_header_end)) {
+        if (!forward_client_fail(revpx, client, backend, 400, "Bad Request")) return FWD_HDR_FATAL;
+    }
+
+    // Normalize framing headers before forwarding. This avoids CL/TE ambiguity
+    // and makes repeated Transfer-Encoding field-lines deterministic downstream.
+    if (backend->req_chunked) {
+        if (!normalize_chunked_framing_headers(backend)) {
+            if (!forward_client_fail(revpx, client, backend, 400, "Bad Request")) return FWD_HDR_FATAL;
+        }
+    }
 
     if (!inject_forwarded_headers(backend, client->fd)) {
         if (!forward_client_fail(revpx, client, backend, 400, "Bad Request")) return FWD_HDR_FATAL;
@@ -1399,7 +1625,12 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
             if (header_end_idx > 0) {
                 ForwardClientHeaderResult header_rc = forward_client_handle_complete_header(revpx, client, backend);
                 if (header_rc == FWD_HDR_FATAL) return false;
-                if (header_rc == FWD_HDR_DONE) return revpx->conns[backend->fd] != NULL;
+                if (header_rc == FWD_HDR_DONE) {
+                    // Header handling may recursively process buffered leftovers,
+                    // but this loop can still have unread bytes from the current
+                    // input burst. Keep iterating instead of returning early.
+                    continue;
+                }
             }
         } else if (!backend->req_chunked) {
             if (backend->req_body_left > to_copy) {
@@ -1569,6 +1800,10 @@ static void handle_state_read_header(RevPx *revpx, RpConnection *c) {
             }
 
             RpConnection *b = alloc_conn(revpx, backend, NULL, ST_CONNECTING, CT_BACKEND);
+            if (!b) {
+                send_error(revpx, c, 503, "Service Unavailable");
+                return;
+            }
             c->peer = backend;
             b->peer = fd;
             c->state = ST_CONNECTING;
@@ -1582,7 +1817,7 @@ static void handle_state_read_header(RevPx *revpx, RpConnection *c) {
         rp_log_debug("Connection closed during header read fd=%d\n", fd);
         cleanup(revpx, fd);
     } else {
-        int err = get_error(c, n);
+        int err = get_error(c, n, false);
         if (err == SSL_ERROR_WANT_READ) {
             rp_log_debug("SSL_ERROR_WANT_READ on fd=%d, waiting for more data\n", fd);
         } else if (err == SSL_ERROR_WANT_WRITE) {
@@ -1625,7 +1860,7 @@ static void handle_state_connecting(RevPx *revpx, RpConnection *c, uint32_t even
                     cleanup_both(revpx, fd);
                     break;
                 } else {
-                    int err = get_error(c, n);
+                    int err = get_error(c, n, false);
                     if (err == SSL_ERROR_WANT_READ) break;
                     if (err == SSL_ERROR_WANT_WRITE) {
                         ep_mod(revpx, fd, EPOLLIN | EPOLLOUT | EPOLLET);
@@ -1713,14 +1948,56 @@ static void handle_state_upgrading(RevPx *revpx, RpConnection *c) {
     } else if (n <= 0 && errno == EAGAIN) {
         ep_mod(revpx, c->fd, EPOLLIN | EPOLLET);
         return;
-    } else if (n <= 0 && get_error(c, n) != SSL_ERROR_WANT_READ) {
+    } else if (n <= 0 && get_error(c, n, false) != SSL_ERROR_WANT_READ) {
         rp_log_error("WebSocket upgrade failed - backend read error fd=%d: %s\n", c->fd, strerror(errno));
         send_error(revpx, client, 502, "Bad Gateway");
         cleanup(revpx, c->fd);
         return;
     }
 
-    if (c->len >= 12 && strncasecmp((char *)c->buf, "HTTP/1.1 101", 12) == 0) {
+    if (c->len == sizeof(c->buf)) {
+        rp_log_warn("Upgrade a WebSocket failed: backend response headers too large\n");
+        send_error(revpx, client, 502, "Bad Gateway: WebSocket handshake failed");
+        cleanup(revpx, c->fd);
+        return;
+    }
+
+    const unsigned char *line_end = (const unsigned char *)memchr(c->buf, '\n', c->len);
+    if (!line_end) {
+        ep_mod(revpx, c->fd, EPOLLIN | EPOLLET);
+        return;
+    }
+
+    size_t line_len = (size_t)(line_end - c->buf);
+    if (line_len > 0 && c->buf[line_len - 1] == '\r') line_len--;
+
+    char status_line[256];
+    size_t copy_len = line_len < sizeof(status_line) - 1 ? line_len : sizeof(status_line) - 1;
+    memcpy(status_line, c->buf, copy_len);
+    status_line[copy_len] = '\0';
+
+    int code = 0;
+    if (sscanf(status_line, "HTTP/%*s %d", &code) != 1) {
+        rp_log_warn("Upgrade a WebSocket failed: malformed backend status line: %s\n", status_line);
+        send_error(revpx, client, 502, "Bad Gateway: WebSocket handshake failed");
+        cleanup(revpx, c->fd);
+        return;
+    }
+
+    if (code == 101) {
+        int header_end = find_headers_end(c->buf, c->len);
+        if (header_end <= 0) {
+            ep_mod(revpx, c->fd, EPOLLIN | EPOLLET);
+            return;
+        }
+        if (!header_has_token_ci(c->buf, (size_t)header_end, "Upgrade", "websocket") ||
+            !header_has_token_ci(c->buf, (size_t)header_end, "Connection", "Upgrade")) {
+            rp_log_warn("Upgrade a WebSocket failed: backend 101 missing required upgrade headers\n");
+            send_error(revpx, client, 502, "Bad Gateway: WebSocket handshake failed");
+            cleanup(revpx, c->fd);
+            return;
+        }
+
         rp_log_debug("websocket: handshake success, start tunneling\n");
 
         c->state = ST_TUNNELING;
@@ -1812,44 +2089,58 @@ static void handle_event(RevPx *revpx, int fd, uint32_t events) {
 }
 
 static int create_listener(const char *port) {
-    struct addrinfo hints = {0}, *res;
+    struct addrinfo hints = {0}, *res = NULL;
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
 
-    if (getaddrinfo(NULL, port, &hints, &res) != 0) {
-        rp_log_error("getaddrinfo failed for port %s: %s\n", port, strerror(errno));
+    int gai_rc = getaddrinfo(NULL, port, &hints, &res);
+    if (gai_rc != 0) {
+        rp_log_error("getaddrinfo failed for port %s: %s\n", port, gai_strerror(gai_rc));
         return -1;
     }
 
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd < 0) {
-        rp_log_error("socket creation failed for listener on port %s: %s\n", port, strerror(errno));
-        freeaddrinfo(res);
-        return -1;
-    }
-
-    int yes = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-
-    if (bind(fd, res->ai_addr, res->ai_addrlen) < 0) {
-        if (errno == EADDRINUSE) {
-            rp_log_error("bind failed on port %s: address already in use\n", port);
-        } else {
-            rp_log_error("bind failed on port %s: %s\n", port, strerror(errno));
+    int fd = -1;
+    int last_err = 0;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) {
+            last_err = errno;
+            continue;
         }
-        close(fd);
-        freeaddrinfo(res);
-        return -1;
+
+        int yes = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+        if (bind(fd, ai->ai_addr, ai->ai_addrlen) < 0) {
+            last_err = errno;
+            close(fd);
+            fd = -1;
+            continue;
+        }
+
+        set_nonblock(fd);
+        if (listen(fd, 512) < 0) {
+            last_err = errno;
+            close(fd);
+            fd = -1;
+            continue;
+        }
+        break;
     }
 
     freeaddrinfo(res);
-    set_nonblock(fd);
-    if (listen(fd, 512) < 0) {
-        rp_log_error("listen failed on port %s: %s\n", port, strerror(errno));
-        close(fd);
+    if (fd < 0) {
+        if (last_err == EADDRINUSE) {
+            rp_log_error("bind failed on port %s: address already in use\n", port);
+        } else if (last_err != 0) {
+            rp_log_error("Failed to create listener on port %s: %s\n", port, strerror(last_err));
+        } else {
+            rp_log_error("Failed to create listener on port %s\n", port);
+        }
         return -1;
     }
+
     return fd;
 }
 

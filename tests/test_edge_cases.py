@@ -20,6 +20,7 @@ import os
 import socket
 import ssl
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -39,6 +40,7 @@ from test_revpx import (
     BACKEND_PORT,
     TEST_DOMAIN,
     PROJECT_ROOT,
+    REVPX_BINARY,
     CERT_FILE,
     KEY_FILE,
 )
@@ -105,9 +107,13 @@ class RawSSLClient:
             return None
 
 
+_SOCKET_RESPONSE_BUFFER = {}
+
+
 def read_http_response(ssock):
-    """Read a single HTTP response from a socket, return (status, headers_dict, body_bytes)"""
-    response = b""
+    """Read one HTTP response and preserve extra bytes for subsequent pipelined reads."""
+    sock_id = id(ssock)
+    response = _SOCKET_RESPONSE_BUFFER.pop(sock_id, b"")
     while b"\r\n\r\n" not in response:
         chunk = ssock.recv(8192)
         if not chunk:
@@ -134,6 +140,9 @@ def read_http_response(ssock):
             break
         body_data += chunk
 
+    if len(body_data) > content_length:
+        _SOCKET_RESPONSE_BUFFER[sock_id] = body_data[content_length:]
+
     return status, headers, body_data[:content_length]
 
 
@@ -145,6 +154,20 @@ def make_ssl_connection():
     sock = socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=15)
     ssock = ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN)
     return ssock
+
+
+def wait_for_tcp_port(port: int, timeout: float = 5.0):
+    """Wait until a local TCP port starts accepting connections."""
+    deadline = time.time() + timeout
+    last_error = None
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                return
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.02)
+    raise RuntimeError(f"Port {port} not ready within {timeout}s (last error: {last_error})")
 
 
 # ============================================================================
@@ -197,6 +220,58 @@ class TestForwardedHeaders:
         assert "proto=https" in fwd
         assert "for=" in fwd
 
+    def test_forwarded_ipv6_for_value_is_quoted_or_bracketed(self, client):
+        """RFC 7239: IPv6-like for= values must be quoted/bracketed, not raw tokens."""
+        status, _, body = client.request("GET", "/fwd-rfc7239")
+        assert status == 200
+        data = json.loads(body)
+        fwd = data["headers"].get("Forwarded", "")
+        assert "for=" in fwd
+
+        # Extract for= value until ';' or end.
+        start = fwd.lower().find("for=")
+        assert start >= 0
+        value = fwd[start + 4:]
+        sep = value.find(";")
+        if sep >= 0:
+            value = value[:sep]
+        value = value.strip()
+
+        # On systems where peer appears as IPv4, this check is not applicable.
+        if ":" not in value and ":" not in data["headers"].get("X-Forwarded-For", ""):
+            pytest.skip("Client peer address is not IPv6-like on this environment")
+
+        # Accept quoted value and/or bracketed IPv6 literal.
+        is_quoted = len(value) >= 2 and value[0] == '"' and value[-1] == '"'
+        inner = value[1:-1] if is_quoted else value
+        is_bracketed = len(inner) >= 2 and inner[0] == '[' and inner[-1] == ']'
+
+        assert is_quoted or is_bracketed, \
+            f"Forwarded for= value is not RFC-compliant for IPv6-like address: {value!r}"
+
+    def test_forwarded_host_with_port_is_quoted(self, proxy):
+        """RFC 7239: host= value containing ':' (host:port) should be quoted."""
+        raw = RawSSLClient()
+        request = (
+            f"GET /fwd-host-port HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}:{HTTPS_PORT}\r\n"
+            f"\r\n"
+        ).encode()
+
+        response = raw.send_raw(request)
+        assert response is not None and b"200" in response
+
+        req = BackendHandler.captured_requests[-1]
+        fwd = req.headers.get("Forwarded", "")
+        assert "host=" in fwd
+
+        host_pos = fwd.lower().find("host=")
+        host_value = fwd[host_pos + 5:].strip() if host_pos >= 0 else ""
+
+        # Host param is at the end in current formatter; this keeps the check simple.
+        assert host_value.startswith('"') and host_value.endswith('"'), \
+            f"Forwarded host= is not quoted for host:port value: {host_value!r}"
+
     def test_existing_forwarded_headers_stripped(self, client):
         """Proxy should strip pre-existing forwarded headers to prevent spoofing"""
         spoofed_headers = {
@@ -217,6 +292,27 @@ class TestForwardedHeaders:
         # Real IP should NOT be 1.2.3.4
         assert xri != "1.2.3.4", "X-Real-IP should be overwritten with actual client IP"
         assert proto == "https", "X-Forwarded-Proto should be overwritten to https"
+
+    def test_spoofed_xff_value_is_not_preserved(self, client):
+        """Spoofed X-Forwarded-For must be removed, not carried over."""
+        spoofed_headers = {
+            "X-Forwarded-For": "203.0.113.10",
+            "X-Real-IP": "203.0.113.10",
+            "Forwarded": "for=203.0.113.10;proto=http",
+        }
+
+        status, _, body = client.request("GET", "/fwd-spoof", headers=spoofed_headers)
+        assert status == 200
+        data = json.loads(body)
+
+        # Security expectation: client-supplied proxy chain must not survive.
+        xff = data["headers"].get("X-Forwarded-For", "")
+        forwarded = data["headers"].get("Forwarded", "")
+
+        assert "203.0.113.10" not in xff, \
+            "Spoofed X-Forwarded-For value leaked into backend-visible header"
+        assert "203.0.113.10" not in forwarded, \
+            "Spoofed Forwarded value leaked into backend-visible header"
 
     def test_forwarded_headers_on_keepalive(self, proxy):
         """Forwarded headers should be injected on each keep-alive request"""
@@ -330,6 +426,344 @@ class WebSocketRejectHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Rejected")
 
 
+class WebSocketFragmented101Handler(BaseHTTPRequestHandler):
+    """Backend that sends a fragmented 101 response before tunneling."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, format, *args):
+        pass
+
+    def do_GET(self):
+        if self.headers.get("Upgrade", "").lower() != "websocket":
+            self.send_response(400)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        magic = "258EAFA5-E914-47DA-95CA-5AB9C0FEDF5E"
+        accept = base64.b64encode(hashlib.sha1((key + magic).encode()).digest()).decode()
+        response = (
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {accept}\r\n"
+            "X-Extra-Header: fragmented\r\n"
+            "\r\n"
+        ).encode()
+
+        # Force the status line to arrive in multiple reads at the proxy backend side.
+        self.connection.sendall(response[:7])
+        time.sleep(0.03)
+        self.connection.sendall(response[7:19])
+        time.sleep(0.03)
+        self.connection.sendall(response[19:])
+
+        try:
+            while True:
+                header = self.rfile.read(2)
+                if len(header) < 2:
+                    break
+
+                opcode = header[0] & 0x0F
+                if opcode == 0x8:
+                    break
+
+                masked = (header[1] & 0x80) != 0
+                payload_len = header[1] & 0x7F
+
+                if payload_len == 126:
+                    payload_len = struct.unpack(">H", self.rfile.read(2))[0]
+                elif payload_len == 127:
+                    payload_len = struct.unpack(">Q", self.rfile.read(8))[0]
+
+                mask_key = self.rfile.read(4) if masked else b""
+                payload = self.rfile.read(payload_len)
+
+                if masked:
+                    payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+
+                frame = bytes([0x80 | opcode])
+                if len(payload) < 126:
+                    frame += bytes([len(payload)])
+                elif len(payload) < 65536:
+                    frame += bytes([126]) + struct.pack(">H", len(payload))
+                else:
+                    frame += bytes([127]) + struct.pack(">Q", len(payload))
+                frame += payload
+                self.wfile.write(frame)
+                self.wfile.flush()
+        except Exception:
+            pass
+
+
+class WebSocketDuplicateConnectionHeaderHandler(BaseHTTPRequestHandler):
+    """Backend that returns a valid 101 using repeated Connection headers."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, format, *args):
+        pass
+
+    def do_GET(self):
+        if self.headers.get("Upgrade", "").lower() != "websocket":
+            self.send_response(400)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        magic = "258EAFA5-E914-47DA-95CA-5AB9C0FEDF5E"
+        accept = base64.b64encode(hashlib.sha1((key + magic).encode()).digest()).decode()
+
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        # RFC-compliant repeated field-lines; semantically equivalent to comma-joined tokens.
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+
+        try:
+            while True:
+                header = self.rfile.read(2)
+                if len(header) < 2:
+                    break
+
+                opcode = header[0] & 0x0F
+                if opcode == 0x8:
+                    break
+
+                masked = (header[1] & 0x80) != 0
+                payload_len = header[1] & 0x7F
+
+                if payload_len == 126:
+                    payload_len = struct.unpack(">H", self.rfile.read(2))[0]
+                elif payload_len == 127:
+                    payload_len = struct.unpack(">Q", self.rfile.read(8))[0]
+
+                mask_key = self.rfile.read(4) if masked else b""
+                payload = self.rfile.read(payload_len)
+
+                if masked:
+                    payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+
+                frame = bytes([0x80 | opcode])
+                if len(payload) < 126:
+                    frame += bytes([len(payload)])
+                elif len(payload) < 65536:
+                    frame += bytes([126]) + struct.pack(">H", len(payload))
+                else:
+                    frame += bytes([127]) + struct.pack(">Q", len(payload))
+                frame += payload
+                self.wfile.write(frame)
+                self.wfile.flush()
+        except Exception:
+            pass
+
+
+class WebSocketRawDuplicateConnectionHeaderHandler(BaseHTTPRequestHandler):
+    """Backend that sends raw 101 with duplicated Connection field-lines."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, format, *args):
+        pass
+
+    def do_GET(self):
+        if self.headers.get("Upgrade", "").lower() != "websocket":
+            self.connection.sendall(
+                b"HTTP/1.1 400 Bad Request\r\n"
+                b"Content-Length: 0\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            return
+
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        magic = "258EAFA5-E914-47DA-95CA-5AB9C0FEDF5E"
+        accept = base64.b64encode(hashlib.sha1((key + magic).encode()).digest()).decode()
+
+        # Deliberately keep duplicated Connection headers as separate field-lines.
+        response = (
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: keep-alive\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {accept}\r\n"
+            "\r\n"
+        ).encode()
+        self.connection.sendall(response)
+
+        try:
+            while True:
+                header = self.rfile.read(2)
+                if len(header) < 2:
+                    break
+
+                opcode = header[0] & 0x0F
+                if opcode == 0x8:
+                    break
+
+                masked = (header[1] & 0x80) != 0
+                payload_len = header[1] & 0x7F
+
+                if payload_len == 126:
+                    payload_len = struct.unpack(">H", self.rfile.read(2))[0]
+                elif payload_len == 127:
+                    payload_len = struct.unpack(">Q", self.rfile.read(8))[0]
+
+                mask_key = self.rfile.read(4) if masked else b""
+                payload = self.rfile.read(payload_len)
+
+                if masked:
+                    payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+
+                frame = bytes([0x80 | opcode])
+                if len(payload) < 126:
+                    frame += bytes([len(payload)])
+                elif len(payload) < 65536:
+                    frame += bytes([126]) + struct.pack(">H", len(payload))
+                else:
+                    frame += bytes([127]) + struct.pack(">Q", len(payload))
+                frame += payload
+                self.wfile.write(frame)
+                self.wfile.flush()
+        except Exception:
+            pass
+
+
+class WebSocketRawDuplicateUpgradeHeaderHandler(BaseHTTPRequestHandler):
+    """Backend that sends raw 101 with duplicated Upgrade field-lines."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, format, *args):
+        pass
+
+    def do_GET(self):
+        if self.headers.get("Upgrade", "").lower() != "websocket":
+            self.connection.sendall(
+                b"HTTP/1.1 400 Bad Request\r\n"
+                b"Content-Length: 0\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            return
+
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        magic = "258EAFA5-E914-47DA-95CA-5AB9C0FEDF5E"
+        accept = base64.b64encode(hashlib.sha1((key + magic).encode()).digest()).decode()
+
+        response = (
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: h2c\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {accept}\r\n"
+            "\r\n"
+        ).encode()
+        self.connection.sendall(response)
+
+        try:
+            while True:
+                header = self.rfile.read(2)
+                if len(header) < 2:
+                    break
+
+                opcode = header[0] & 0x0F
+                if opcode == 0x8:
+                    break
+
+                masked = (header[1] & 0x80) != 0
+                payload_len = header[1] & 0x7F
+
+                if payload_len == 126:
+                    payload_len = struct.unpack(">H", self.rfile.read(2))[0]
+                elif payload_len == 127:
+                    payload_len = struct.unpack(">Q", self.rfile.read(8))[0]
+
+                mask_key = self.rfile.read(4) if masked else b""
+                payload = self.rfile.read(payload_len)
+
+                if masked:
+                    payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+
+                frame = bytes([0x80 | opcode])
+                if len(payload) < 126:
+                    frame += bytes([len(payload)])
+                elif len(payload) < 65536:
+                    frame += bytes([126]) + struct.pack(">H", len(payload))
+                else:
+                    frame += bytes([127]) + struct.pack(">Q", len(payload))
+                frame += payload
+                self.wfile.write(frame)
+                self.wfile.flush()
+        except Exception:
+            pass
+
+
+class WebSocketMissingConnectionUpgradeHandler(BaseHTTPRequestHandler):
+    """Backend that replies 101 without Connection: Upgrade token."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, format, *args):
+        pass
+
+    def do_GET(self):
+        if self.headers.get("Upgrade", "").lower() != "websocket":
+            self.connection.sendall(
+                b"HTTP/1.1 400 Bad Request\r\n"
+                b"Content-Length: 0\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            return
+
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        magic = "258EAFA5-E914-47DA-95CA-5AB9C0FEDF5E"
+        accept = base64.b64encode(hashlib.sha1((key + magic).encode()).digest()).decode()
+
+        response = (
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: keep-alive\r\n"
+            f"Sec-WebSocket-Accept: {accept}\r\n"
+            "\r\n"
+        ).encode()
+        self.connection.sendall(response)
+
+
+class WebSocketMissingUpgradeHeaderHandler(BaseHTTPRequestHandler):
+    """Backend that replies 101 without Upgrade: websocket token."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, format, *args):
+        pass
+
+    def do_GET(self):
+        if self.headers.get("Upgrade", "").lower() != "websocket":
+            self.connection.sendall(
+                b"HTTP/1.1 400 Bad Request\r\n"
+                b"Content-Length: 0\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            return
+
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        magic = "258EAFA5-E914-47DA-95CA-5AB9C0FEDF5E"
+        accept = base64.b64encode(hashlib.sha1((key + magic).encode()).digest()).decode()
+
+        response = (
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: h2c\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {accept}\r\n"
+            "\r\n"
+        ).encode()
+        self.connection.sendall(response)
+
+
 WS_BACKEND_PORT = 18001
 
 
@@ -338,12 +772,18 @@ def ws_backend():
     server = HTTPServer(("127.0.0.1", WS_BACKEND_PORT), WebSocketBackendHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    time.sleep(0.1)
+    wait_for_tcp_port(WS_BACKEND_PORT, timeout=2.0)
     yield server
     server.shutdown()
 
 
 WS_REJECT_PORT = 18002
+WS_FRAGMENTED_PORT = 18004
+WS_DUP_CONN_PORT = 18007
+WS_RAW_DUP_CONN_PORT = 18008
+WS_RAW_DUP_UPGRADE_PORT = 18009
+WS_MISSING_CONN_UPGRADE_PORT = 18012
+WS_MISSING_UPGRADE_PORT = 18013
 
 
 @pytest.fixture(scope="module")
@@ -351,17 +791,84 @@ def ws_reject_backend():
     server = HTTPServer(("127.0.0.1", WS_REJECT_PORT), WebSocketRejectHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    time.sleep(0.1)
+    wait_for_tcp_port(WS_REJECT_PORT, timeout=2.0)
+    yield server
+    server.shutdown()
+
+
+@pytest.fixture(scope="module")
+def ws_fragmented_backend():
+    server = HTTPServer(("127.0.0.1", WS_FRAGMENTED_PORT), WebSocketFragmented101Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    wait_for_tcp_port(WS_FRAGMENTED_PORT, timeout=2.0)
+    yield server
+    server.shutdown()
+
+
+@pytest.fixture(scope="module")
+def ws_dup_conn_backend():
+    server = HTTPServer(("127.0.0.1", WS_DUP_CONN_PORT), WebSocketDuplicateConnectionHeaderHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    wait_for_tcp_port(WS_DUP_CONN_PORT, timeout=2.0)
+    yield server
+    server.shutdown()
+
+
+@pytest.fixture(scope="module")
+def ws_raw_dup_conn_backend():
+    server = HTTPServer(("127.0.0.1", WS_RAW_DUP_CONN_PORT), WebSocketRawDuplicateConnectionHeaderHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    wait_for_tcp_port(WS_RAW_DUP_CONN_PORT, timeout=2.0)
+    yield server
+    server.shutdown()
+
+
+@pytest.fixture(scope="module")
+def ws_raw_dup_upgrade_backend():
+    server = HTTPServer(("127.0.0.1", WS_RAW_DUP_UPGRADE_PORT), WebSocketRawDuplicateUpgradeHeaderHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    wait_for_tcp_port(WS_RAW_DUP_UPGRADE_PORT, timeout=2.0)
+    yield server
+    server.shutdown()
+
+
+@pytest.fixture(scope="module")
+def ws_missing_conn_upgrade_backend():
+    server = HTTPServer(("127.0.0.1", WS_MISSING_CONN_UPGRADE_PORT), WebSocketMissingConnectionUpgradeHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    wait_for_tcp_port(WS_MISSING_CONN_UPGRADE_PORT, timeout=2.0)
+    yield server
+    server.shutdown()
+
+
+@pytest.fixture(scope="module")
+def ws_missing_upgrade_backend():
+    server = HTTPServer(("127.0.0.1", WS_MISSING_UPGRADE_PORT), WebSocketMissingUpgradeHeaderHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    wait_for_tcp_port(WS_MISSING_UPGRADE_PORT, timeout=2.0)
     yield server
     server.shutdown()
 
 
 WS_DOMAIN = "ws.localhost"
 WS_REJECT_DOMAIN = "wsrej.localhost"
+WS_FRAGMENTED_DOMAIN = "wsfrag.localhost"
+WS_DUP_CONN_DOMAIN = "wsdup.localhost"
+WS_RAW_DUP_CONN_DOMAIN = "wsrawdup.localhost"
+WS_RAW_DUP_UPGRADE_DOMAIN = "wsrawup.localhost"
+WS_MISSING_CONN_UPGRADE_DOMAIN = "wsmissconn.localhost"
+WS_MISSING_UPGRADE_DOMAIN = "wsmissup.localhost"
 
 
 @pytest.fixture(scope="module")
-def ws_proxy(ws_backend, ws_reject_backend):
+def ws_proxy(ws_backend, ws_reject_backend, ws_fragmented_backend, ws_dup_conn_backend, ws_raw_dup_conn_backend,
+             ws_raw_dup_upgrade_backend, ws_missing_conn_upgrade_backend, ws_missing_upgrade_backend):
     """Proxy configured with WebSocket backend domains"""
     p = RevPxProxy(
         https_port=18543,
@@ -384,6 +891,42 @@ def ws_proxy(ws_backend, ws_reject_backend):
             "cert_file": CERT_FILE,
             "key_file": KEY_FILE,
         },
+        {
+            "domain": WS_FRAGMENTED_DOMAIN,
+            "port": str(WS_FRAGMENTED_PORT),
+            "cert_file": CERT_FILE,
+            "key_file": KEY_FILE,
+        },
+        {
+            "domain": WS_DUP_CONN_DOMAIN,
+            "port": str(WS_DUP_CONN_PORT),
+            "cert_file": CERT_FILE,
+            "key_file": KEY_FILE,
+        },
+        {
+            "domain": WS_RAW_DUP_CONN_DOMAIN,
+            "port": str(WS_RAW_DUP_CONN_PORT),
+            "cert_file": CERT_FILE,
+            "key_file": KEY_FILE,
+        },
+        {
+            "domain": WS_RAW_DUP_UPGRADE_DOMAIN,
+            "port": str(WS_RAW_DUP_UPGRADE_PORT),
+            "cert_file": CERT_FILE,
+            "key_file": KEY_FILE,
+        },
+        {
+            "domain": WS_MISSING_CONN_UPGRADE_DOMAIN,
+            "port": str(WS_MISSING_CONN_UPGRADE_PORT),
+            "cert_file": CERT_FILE,
+            "key_file": KEY_FILE,
+        },
+        {
+            "domain": WS_MISSING_UPGRADE_DOMAIN,
+            "port": str(WS_MISSING_UPGRADE_PORT),
+            "cert_file": CERT_FILE,
+            "key_file": KEY_FILE,
+        },
     ]
     with open(config_file, "w") as f:
         json.dump(config, f)
@@ -401,7 +944,7 @@ def ws_proxy(ws_backend, ws_reject_backend):
         cwd=PROJECT_ROOT,
         env=env,
     )
-    time.sleep(1)
+    wait_for_tcp_port(18543, timeout=5.0)
     if process.poll() is not None:
         stdout, stderr = process.communicate()
         raise RuntimeError(f"WS proxy failed to start:\n{stdout.decode()}\n{stderr.decode()}")
@@ -467,6 +1010,38 @@ def read_ws_frame(ssock) -> bytes:
 class TestWebSocket:
     """Test WebSocket upgrade and tunneling"""
 
+    def test_upgrade_header_without_connection_upgrade_token_is_not_forced_ws(self, proxy):
+        """A request with Upgrade:websocket but without Connection: Upgrade should remain normal HTTP."""
+        raw = RawSSLClient()
+        request = (
+            f"GET /ws-detect-false-positive HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: keep-alive, NotUpgrade\r\n"
+            f"\r\n"
+        ).encode()
+
+        response = raw.send_raw(request)
+        assert response is not None
+        assert b"200" in response.split(b"\r\n", 1)[0], \
+            f"False WebSocket detection: expected normal HTTP response, got {response[:160]}"
+
+    def test_upgrade_header_prefix_websocketx_is_not_treated_as_websocket(self, proxy):
+        """Upgrade token must match exactly websocket, not websocketX prefix variants."""
+        raw = RawSSLClient()
+        request = (
+            f"GET /ws-upgrade-prefix HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"Upgrade: websocketX\r\n"
+            f"Connection: Upgrade\r\n"
+            f"\r\n"
+        ).encode()
+
+        response = raw.send_raw(request)
+        assert response is not None
+        assert b"200" in response.split(b"\r\n", 1)[0], \
+            f"False WebSocket detection with Upgrade:websocketX, got {response[:160]}"
+
     def test_websocket_upgrade_echo(self, ws_proxy):
         """Full WebSocket handshake and echo through the proxy"""
         ctx = ssl.create_default_context()
@@ -509,6 +1084,43 @@ class TestWebSocket:
                 # Send close frame
                 ssock.sendall(ws_frame(b"", opcode=0x8))
 
+    def test_websocket_upgrade_with_duplicate_connection_headers(self, ws_proxy):
+        """Repeated Connection headers containing Upgrade should still allow WS tunneling."""
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        ws_key = base64.b64encode(os.urandom(16)).decode()
+        request = (
+            f"GET /ws-dup-conn HTTP/1.1\r\n"
+            f"Host: {WS_DUP_CONN_DOMAIN}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {ws_key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"\r\n"
+        ).encode()
+
+        with socket.create_connection(("127.0.0.1", 18543), timeout=10) as sock:
+            with ctx.wrap_socket(sock, server_hostname=WS_DUP_CONN_DOMAIN) as ssock:
+                ssock.sendall(request)
+
+                response = b""
+                while b"\r\n\r\n" not in response:
+                    chunk = ssock.recv(4096)
+                    if not chunk:
+                        break
+                    response += chunk
+
+                assert b"101" in response.split(b"\r\n")[0], f"Expected 101, got: {response[:120]}"
+
+                message = b"dup-conn-works"
+                ssock.sendall(ws_frame(message, opcode=0x1))
+                echoed = read_ws_frame(ssock)
+                assert echoed == message
+
+                ssock.sendall(ws_frame(b"", opcode=0x8))
+
     def test_websocket_binary_frames(self, ws_proxy):
         """Binary WebSocket frames through the proxy tunnel"""
         ctx = ssl.create_default_context()
@@ -548,6 +1160,80 @@ class TestWebSocket:
 
                 ssock.sendall(ws_frame(b"", opcode=0x8))
 
+    def test_websocket_upgrade_with_raw_duplicate_connection_headers(self, ws_proxy):
+        """Raw repeated Connection field-lines containing Upgrade should allow WS tunneling."""
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        ws_key = base64.b64encode(os.urandom(16)).decode()
+        request = (
+            f"GET /ws-raw-dup-conn HTTP/1.1\r\n"
+            f"Host: {WS_RAW_DUP_CONN_DOMAIN}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {ws_key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"\r\n"
+        ).encode()
+
+        with socket.create_connection(("127.0.0.1", 18543), timeout=10) as sock:
+            with ctx.wrap_socket(sock, server_hostname=WS_RAW_DUP_CONN_DOMAIN) as ssock:
+                ssock.sendall(request)
+
+                response = b""
+                while b"\r\n\r\n" not in response:
+                    chunk = ssock.recv(4096)
+                    if not chunk:
+                        break
+                    response += chunk
+
+                assert b"101" in response.split(b"\r\n")[0], f"Expected 101, got: {response[:160]}"
+
+                message = b"raw-dup-conn-works"
+                ssock.sendall(ws_frame(message, opcode=0x1))
+                echoed = read_ws_frame(ssock)
+                assert echoed == message
+
+                ssock.sendall(ws_frame(b"", opcode=0x8))
+
+    def test_websocket_upgrade_with_raw_duplicate_upgrade_headers(self, ws_proxy):
+        """Raw repeated Upgrade field-lines should match websocket token across all lines."""
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        ws_key = base64.b64encode(os.urandom(16)).decode()
+        request = (
+            f"GET /ws-raw-dup-upgrade HTTP/1.1\r\n"
+            f"Host: {WS_RAW_DUP_UPGRADE_DOMAIN}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {ws_key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"\r\n"
+        ).encode()
+
+        with socket.create_connection(("127.0.0.1", 18543), timeout=10) as sock:
+            with ctx.wrap_socket(sock, server_hostname=WS_RAW_DUP_UPGRADE_DOMAIN) as ssock:
+                ssock.sendall(request)
+
+                response = b""
+                while b"\r\n\r\n" not in response:
+                    chunk = ssock.recv(4096)
+                    if not chunk:
+                        break
+                    response += chunk
+
+                assert b"101" in response.split(b"\r\n")[0], f"Expected 101, got: {response[:160]}"
+
+                message = b"raw-dup-upgrade-works"
+                ssock.sendall(ws_frame(message, opcode=0x1))
+                echoed = read_ws_frame(ssock)
+                assert echoed == message
+
+                ssock.sendall(ws_frame(b"", opcode=0x8))
+
     def test_websocket_failed_upgrade(self, ws_proxy):
         """Backend rejects WebSocket upgrade → proxy returns 502"""
         ctx = ssl.create_default_context()
@@ -581,6 +1267,74 @@ class TestWebSocket:
                     pass
 
                 assert b"502" in response, f"Expected 502, got: {response[:200]}"
+
+    def test_websocket_101_missing_connection_upgrade_is_rejected(self, ws_proxy):
+        """Backend 101 without Connection: Upgrade must be rejected with 502."""
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        ws_key = base64.b64encode(os.urandom(16)).decode()
+        request = (
+            f"GET /ws-missing-conn-upgrade HTTP/1.1\r\n"
+            f"Host: {WS_MISSING_CONN_UPGRADE_DOMAIN}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {ws_key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"\r\n"
+        ).encode()
+
+        with socket.create_connection(("127.0.0.1", 18543), timeout=10) as sock:
+            with ctx.wrap_socket(sock, server_hostname=WS_MISSING_CONN_UPGRADE_DOMAIN) as ssock:
+                ssock.sendall(request)
+
+                response = b""
+                ssock.settimeout(3.0)
+                try:
+                    while True:
+                        chunk = ssock.recv(4096)
+                        if not chunk:
+                            break
+                        response += chunk
+                except socket.timeout:
+                    pass
+
+                assert b"502" in response, f"Expected 502 for missing Connection: Upgrade, got: {response[:220]}"
+
+    def test_websocket_101_missing_upgrade_websocket_is_rejected(self, ws_proxy):
+        """Backend 101 without Upgrade: websocket must be rejected with 502."""
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        ws_key = base64.b64encode(os.urandom(16)).decode()
+        request = (
+            f"GET /ws-missing-upgrade-token HTTP/1.1\r\n"
+            f"Host: {WS_MISSING_UPGRADE_DOMAIN}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {ws_key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"\r\n"
+        ).encode()
+
+        with socket.create_connection(("127.0.0.1", 18543), timeout=10) as sock:
+            with ctx.wrap_socket(sock, server_hostname=WS_MISSING_UPGRADE_DOMAIN) as ssock:
+                ssock.sendall(request)
+
+                response = b""
+                ssock.settimeout(3.0)
+                try:
+                    while True:
+                        chunk = ssock.recv(4096)
+                        if not chunk:
+                            break
+                        response += chunk
+                except socket.timeout:
+                    pass
+
+                assert b"502" in response, f"Expected 502 for missing Upgrade:websocket, got: {response[:220]}"
 
 
 # ============================================================================
@@ -616,7 +1370,7 @@ class TestBackendErrors:
             cwd=PROJECT_ROOT,
             env=env,
         )
-        time.sleep(1)
+        wait_for_tcp_port(18643, timeout=5.0)
 
         try:
             ctx = ssl.create_default_context()
@@ -715,7 +1469,7 @@ class TestBackendErrors:
             cwd=PROJECT_ROOT,
             env=env,
         )
-        time.sleep(1)
+        wait_for_tcp_port(18743, timeout=5.0)
 
         try:
             ctx = ssl.create_default_context()
@@ -1411,6 +2165,44 @@ class TestSTUpgradingBugs:
 
                 ssock.sendall(ws_frame(b"", opcode=0x8))
 
+    def test_websocket_101_fragmented_status_line(self, ws_proxy):
+        """A fragmented 101 response must not be treated as an immediate upgrade failure."""
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        ws_key = base64.b64encode(os.urandom(16)).decode()
+        request = (
+            f"GET /ws-frag HTTP/1.1\r\n"
+            f"Host: {WS_FRAGMENTED_DOMAIN}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {ws_key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"\r\n"
+        ).encode()
+
+        with socket.create_connection(("127.0.0.1", 18543), timeout=10) as sock:
+            with ctx.wrap_socket(sock, server_hostname=WS_FRAGMENTED_DOMAIN) as ssock:
+                ssock.sendall(request)
+
+                response = b""
+                while b"\r\n\r\n" not in response:
+                    chunk = ssock.recv(4096)
+                    if not chunk:
+                        break
+                    response += chunk
+
+                assert b"101" in response.split(b"\r\n")[0], \
+                    f"Expected 101, got: {response[:120]}"
+
+                message = b"frag-works"
+                ssock.sendall(ws_frame(message, opcode=0x1))
+                echoed = read_ws_frame(ssock)
+                assert echoed == message
+
+                ssock.sendall(ws_frame(b"", opcode=0x8))
+
 
 # ============================================================================
 # 11. TestPipelinedChunkedThenGet - Chunked terminator → next request
@@ -1576,6 +2368,253 @@ class TestHostHeaderEdgeCases:
 
 class TestMalformedRequests:
     """Test error handling for malformed HTTP requests."""
+
+    def test_transfer_encoding_chunked_in_second_header_is_honored(self, proxy):
+        """If chunked appears in a later Transfer-Encoding header, proxy should still parse as chunked."""
+        te_backend_port = 18010
+        te_domain = "te-dup.localhost"
+        te_https_port = 18853
+        te_http_port = 18890
+
+        def read_chunked_body(conn):
+            body = b""
+            while True:
+                line = b""
+                while not line.endswith(b"\n"):
+                    ch = conn.recv(1)
+                    if not ch:
+                        return body
+                    line += ch
+                line = line.strip()
+                if not line:
+                    continue
+                size = int(line.split(b";", 1)[0], 16)
+                if size == 0:
+                    # consume trailers until empty line
+                    trailer = b""
+                    while True:
+                        trailer = b""
+                        while not trailer.endswith(b"\n"):
+                            ch = conn.recv(1)
+                            if not ch:
+                                return body
+                            trailer += ch
+                        if trailer in (b"\r\n", b"\n"):
+                            return body
+                chunk = b""
+                while len(chunk) < size:
+                    data = conn.recv(size - len(chunk))
+                    if not data:
+                        return body
+                    chunk += data
+                body += chunk
+                # trailing CRLF
+                _ = conn.recv(2)
+
+        def raw_backend():
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("127.0.0.1", te_backend_port))
+            srv.listen(1)
+            srv.settimeout(8.0)
+            try:
+                conn, _ = srv.accept()
+                conn.settimeout(3.0)
+
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+
+                header_end = data.find(b"\r\n\r\n") + 4
+                body = data[header_end:]
+
+                # Continue reading remaining chunked stream if needed.
+                # We parse on the socket because body may be partial in initial recv.
+                if b"0\r\n\r\n" not in body:
+                    body += read_chunked_body(conn)
+
+                # Minimal decoding for expected test payload: 5\r\nhello\r\n0\r\n\r\n
+                decoded = b""
+                if b"5\r\nhello\r\n0\r\n\r\n" in body:
+                    decoded = b"hello"
+
+                resp_body = json.dumps({"decoded": decoded.decode(errors="ignore")}).encode()
+                response = (
+                    b"HTTP/1.1 200 OK\r\n"
+                    + f"Content-Length: {len(resp_body)}\r\n".encode()
+                    + b"Content-Type: application/json\r\n"
+                    + b"Connection: close\r\n\r\n"
+                    + resp_body
+                )
+                conn.sendall(response)
+                conn.close()
+            finally:
+                srv.close()
+
+        backend_thread = threading.Thread(target=raw_backend, daemon=True)
+        backend_thread.start()
+
+        config_file = os.path.join(PROJECT_ROOT, "tests", "test_te_dup_config.json")
+        config = [{
+            "domain": te_domain,
+            "port": str(te_backend_port),
+            "cert_file": CERT_FILE,
+            "key_file": KEY_FILE,
+        }]
+        with open(config_file, "w") as f:
+            json.dump(config, f)
+
+        env = os.environ.copy()
+        env["REVPX_PORT"] = str(te_https_port)
+        env["REVPX_PORT_PLAIN"] = str(te_http_port)
+
+        process = subprocess.Popen(
+            [REVPX_BINARY, "-f", config_file],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=PROJECT_ROOT,
+            env=env,
+        )
+        wait_for_tcp_port(te_https_port, timeout=5.0)
+
+        try:
+            raw = RawSSLClient(host=te_domain, port=te_https_port)
+            chunked_body = b"5\r\nhello\r\n0\r\n\r\n"
+            request = (
+                f"POST /te-dup-chunked HTTP/1.1\r\n"
+                f"Host: {te_domain}\r\n"
+                f"Transfer-Encoding: gzip\r\n"
+                f"Transfer-Encoding: chunked\r\n"
+                f"Connection: close\r\n"
+                f"\r\n"
+            ).encode() + chunked_body
+
+            response = raw.send_raw(request, timeout=8.0)
+            assert response is not None
+            assert b"200" in response.split(b"\r\n", 1)[0], \
+                f"Expected 200 when chunked is in second TE header, got: {response[:200]}"
+            assert b'"decoded": "hello"' in response, \
+                f"Second Transfer-Encoding header was ignored, response={response[:240]}"
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            if os.path.exists(config_file):
+                os.remove(config_file)
+            backend_thread.join(timeout=2.0)
+
+    def test_transfer_encoding_substring_not_treated_as_chunked(self):
+        """Transfer-Encoding token matching must be exact (notchunked != chunked)."""
+        te_backend_port = 18006
+        te_domain = "te.localhost"
+        te_https_port = 18843
+        te_http_port = 18880
+
+        def raw_backend():
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("127.0.0.1", te_backend_port))
+            srv.listen(1)
+            srv.settimeout(8.0)
+            try:
+                conn, _ = srv.accept()
+                conn.settimeout(3.0)
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+
+                resp_body = b'{"ok":true}'
+                response = (
+                    b"HTTP/1.1 200 OK\r\n"
+                    + f"Content-Length: {len(resp_body)}\r\n".encode()
+                    + b"Content-Type: application/json\r\n"
+                    + b"Connection: close\r\n\r\n"
+                    + resp_body
+                )
+                conn.sendall(response)
+                conn.close()
+            finally:
+                srv.close()
+
+        backend_thread = threading.Thread(target=raw_backend, daemon=True)
+        backend_thread.start()
+
+        config_file = os.path.join(PROJECT_ROOT, "tests", "test_te_substring_config.json")
+        config = [{
+            "domain": te_domain,
+            "port": str(te_backend_port),
+            "cert_file": CERT_FILE,
+            "key_file": KEY_FILE,
+        }]
+        with open(config_file, "w") as f:
+            json.dump(config, f)
+
+        env = os.environ.copy()
+        env["REVPX_PORT"] = str(te_https_port)
+        env["REVPX_PORT_PLAIN"] = str(te_http_port)
+
+        process = subprocess.Popen(
+            [REVPX_BINARY, "-f", config_file],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=PROJECT_ROOT,
+            env=env,
+        )
+        wait_for_tcp_port(te_https_port, timeout=5.0)
+
+        try:
+            raw = RawSSLClient(host=te_domain, port=te_https_port)
+            body = b"hello"
+            request = (
+                f"POST /te-substring HTTP/1.1\r\n"
+                f"Host: {te_domain}\r\n"
+                f"Transfer-Encoding: notchunked\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                f"Connection: close\r\n"
+                f"\r\n"
+            ).encode() + body
+
+            response = raw.send_raw(request, timeout=8.0)
+            assert response is not None
+            # If proxy falsely treats 'notchunked' as chunked, it returns 400.
+            assert b"200" in response.split(b"\r\n", 1)[0], \
+                f"Unexpected response for TE:notchunked: {response[:200]}"
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            if os.path.exists(config_file):
+                os.remove(config_file)
+            backend_thread.join(timeout=2.0)
+
+    def test_transfer_encoding_chunked_with_spaces_and_params_is_honored(self, proxy):
+        """Chunked token with surrounding spaces/params must still be detected."""
+        raw = RawSSLClient()
+        request = (
+            f"POST /te-spaces-params HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"Transfer-Encoding: gzip , chunked ; ext=yes\r\n"
+            f"Connection: close\r\n"
+            f"\r\n"
+            f"5\r\nhello\r\n0\r\n\r\n"
+        ).encode()
+
+        response = raw.send_raw(request, timeout=8.0)
+        assert response is not None
+        assert b"200" in response.split(b"\r\n", 1)[0], \
+            f"Expected 200 for TE with spacing/params around chunked token, got: {response[:220]}"
 
     def test_malformed_chunk_hex(self, proxy):
         """Invalid hex in chunk size should return 400"""
@@ -1907,16 +2946,13 @@ class TestContentLengthParsing:
     Malicious or malformed values can cause incorrect request boundary tracking."""
 
     def test_negative_content_length_keepalive(self, proxy):
-        """Content-Length: -1 → strtoull returns ULLONG_MAX → next request
-        on keepalive is swallowed as body data, never reaches the backend.
-        This is a request parsing corruption bug."""
+        """Negative Content-Length must be rejected with 400 and connection close."""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 
         with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
             with ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                # Send POST with CL:-1 (no actual body)
                 ssock.sendall(
                     (
                         f"POST /neg-cl/1 HTTP/1.1\r\n"
@@ -1927,38 +2963,21 @@ class TestContentLengthParsing:
                     ).encode()
                 )
 
-                # Read response to POST
                 ssock.settimeout(3.0)
-                status1, _, body1 = read_http_response(ssock)
-                # POST itself should get some response (200 or error)
+                status1, _, _ = read_http_response(ssock)
+                assert status1 == 400
 
-                # Now send a GET on the same connection
-                ssock.sendall(
-                    (
-                        f"GET /neg-cl/2 HTTP/1.1\r\n"
-                        f"Host: {TEST_DOMAIN}\r\n"
-                        f"Connection: keep-alive\r\n"
-                        f"\r\n"
-                    ).encode()
-                )
-
-                # The GET should get its OWN response, not be swallowed as body
-                try:
-                    status2, _, body2 = read_http_response(ssock)
-                    data2 = json.loads(body2)
-                    assert data2["path"] == "/neg-cl/2", \
-                        f"GET was not parsed as separate request: got path={data2.get('path')}"
-                    # Even if GET is processed, verify forwarded headers are injected.
-                    # If the proxy treats GET bytes as POST body (due to ULLONG_MAX
-                    # req_body_left), it skips header injection on the GET.
-                    assert "X-Forwarded-For" in data2["headers"], \
-                        "GET after CL:-1 POST is missing X-Forwarded-For — proxy treated " \
-                        "it as body data, not a new request. strtoull('-1') = ULLONG_MAX."
-                except (socket.timeout, ConnectionError, json.JSONDecodeError):
-                    pytest.fail(
-                        "GET after POST with Content-Length:-1 was swallowed as body data. "
-                        "strtoull('-1') returns ULLONG_MAX, breaking keepalive boundary tracking."
+                # After malformed CL, proxy should not keep the connection alive.
+                with pytest.raises((socket.timeout, ConnectionError, ssl.SSLError, OSError, ValueError)):
+                    ssock.sendall(
+                        (
+                            f"GET /neg-cl/2 HTTP/1.1\r\n"
+                            f"Host: {TEST_DOMAIN}\r\n"
+                            f"Connection: keep-alive\r\n"
+                            f"\r\n"
+                        ).encode()
                     )
+                    read_http_response(ssock)
 
     def test_zero_content_length_keepalive(self, proxy):
         """Content-Length: 0 should be treated as no body, next request parsed correctly"""
@@ -1991,7 +3010,7 @@ class TestContentLengthParsing:
                 assert data2["path"] == "/zero-cl/2"
 
     def test_content_length_with_leading_plus(self, proxy):
-        """Content-Length: +5 (with leading plus sign)"""
+        """Content-Length: +5 (with leading plus sign) should be rejected."""
         raw = RawSSLClient()
         body = b"hello"
         request = (
@@ -2003,8 +3022,7 @@ class TestContentLengthParsing:
 
         response = raw.send_raw(request)
         assert response is not None
-        # strtoull("+5") = 5, so this should work
-        assert b"200" in response
+        assert b"400" in response.split(b"\r\n", 1)[0]
 
     def test_content_length_with_leading_spaces(self, proxy):
         """Content-Length with leading spaces in value"""
@@ -2020,6 +3038,108 @@ class TestContentLengthParsing:
         response = raw.send_raw(request)
         assert response is not None
         assert b"200" in response
+
+    def test_content_length_with_trailing_whitespace_is_accepted(self, proxy):
+        """Content-Length with trailing SP/HTAB should remain valid."""
+        raw = RawSSLClient()
+        body = b"hello"
+        request = (
+            f"POST /cl-trailing-ws HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"Content-Length: 5 \t\r\n"
+            f"\r\n"
+        ).encode() + body
+
+        response = raw.send_raw(request)
+        assert response is not None
+        assert b"200" in response.split(b"\r\n", 1)[0], \
+            f"Expected 200 for Content-Length with trailing whitespace, got: {response[:180]}"
+
+    def test_content_length_with_suffix_is_rejected(self, proxy):
+        """Malformed Content-Length (e.g. 5abc) should be rejected with 400."""
+        raw = RawSSLClient()
+        request = (
+            f"POST /bad-cl-suffix HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"Content-Length: 5abc\r\n"
+            f"Connection: close\r\n"
+            f"\r\n"
+            f"hello"
+        ).encode()
+
+        response = raw.send_raw(request)
+        assert response is not None
+        assert b"400" in response.split(b"\r\n", 1)[0], \
+            f"Expected 400 for malformed Content-Length, got: {response[:160]}"
+
+    def test_empty_content_length_is_rejected(self, proxy):
+        """Empty Content-Length header should be rejected with 400."""
+        raw = RawSSLClient()
+        request = (
+            f"POST /empty-cl HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"Content-Length:\r\n"
+            f"Connection: close\r\n"
+            f"\r\n"
+        ).encode()
+
+        response = raw.send_raw(request)
+        assert response is not None
+        assert b"400" in response.split(b"\r\n", 1)[0], \
+            f"Expected 400 for empty Content-Length, got: {response[:160]}"
+
+    def test_duplicate_content_length_conflict_is_rejected(self, proxy):
+        """Conflicting duplicate Content-Length headers should be rejected with 400."""
+        raw = RawSSLClient()
+        request = (
+            f"POST /dup-cl-conflict HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"Content-Length: 5\r\n"
+            f"Content-Length: 0\r\n"
+            f"Connection: close\r\n"
+            f"\r\n"
+            f"hello"
+        ).encode()
+
+        response = raw.send_raw(request)
+        assert response is not None
+        assert b"400" in response.split(b"\r\n", 1)[0], \
+            f"Expected 400 for duplicate conflicting Content-Length, got: {response[:160]}"
+
+    def test_duplicate_content_length_identical_is_rejected(self, proxy):
+        """Duplicate identical Content-Length headers should be rejected to prevent smuggling ambiguity."""
+        raw = RawSSLClient()
+        request = (
+            f"POST /dup-cl-identical HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"Content-Length: 5\r\n"
+            f"Content-Length: 5\r\n"
+            f"Connection: close\r\n"
+            f"\r\n"
+            f"hello"
+        ).encode()
+
+        response = raw.send_raw(request)
+        assert response is not None
+        assert b"400" in response.split(b"\r\n", 1)[0], \
+            f"Expected 400 for duplicate identical Content-Length, got: {response[:160]}"
+
+    def test_content_length_list_value_is_rejected(self, proxy):
+        """Comma-separated Content-Length list must be rejected to avoid ambiguity."""
+        raw = RawSSLClient()
+        request = (
+            f"POST /cl-list HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"Content-Length: 5, 5\r\n"
+            f"Connection: close\r\n"
+            f"\r\n"
+            f"hello"
+        ).encode()
+
+        response = raw.send_raw(request)
+        assert response is not None
+        assert b"400" in response.split(b"\r\n", 1)[0], \
+            f"Expected 400 for list-form Content-Length, got: {response[:160]}"
 
     def test_very_large_content_length_keepalive(self, proxy):
         """Content-Length: 999999999999 with small body → keepalive broken"""
@@ -2069,6 +3189,22 @@ class TestContentLengthParsing:
                     # correct per HTTP spec (CL says how many bytes to read),
                     # but Content-Length: -1 is a clear security issue.
                     pass
+
+    def test_content_length_numeric_overflow_is_rejected(self, proxy):
+        """Content-Length values that overflow size_t must be rejected with 400."""
+        raw = RawSSLClient()
+        request = (
+            f"POST /cl-overflow HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"Content-Length: 184467440737095516160\r\n"
+            f"Connection: close\r\n"
+            f"\r\n"
+        ).encode()
+
+        response = raw.send_raw(request)
+        assert response is not None
+        assert b"400" in response.split(b"\r\n", 1)[0], \
+            f"Expected 400 for overflowing Content-Length, got: {response[:180]}"
 
 
 # ============================================================================
@@ -2922,8 +4058,48 @@ class TestRequestSmuggling:
         finally:
             ssock.close()
 
+    def test_cl_with_duplicate_te_chunked_and_pipelined_get(self, proxy):
+        """Duplicate TE lines + conflicting CL must still use chunked framing and preserve next request boundary."""
+        ssock = make_ssl_connection()
+        try:
+            chunked = b"5\r\nhello\r\n0\r\n\r\n"
+            pipelined = (
+                (
+                    f"POST /smuggle-dup-te HTTP/1.1\r\n"
+                    f"Host: {TEST_DOMAIN}\r\n"
+                    f"Content-Length: 1\r\n"
+                    f"Transfer-Encoding: gzip\r\n"
+                    f"Transfer-Encoding: chunked\r\n"
+                    f"Connection: keep-alive\r\n"
+                    f"\r\n"
+                ).encode()
+                + chunked
+                + (
+                    f"GET /after-smuggle-dup-te HTTP/1.1\r\n"
+                    f"Host: {TEST_DOMAIN}\r\n"
+                    f"Connection: keep-alive\r\n"
+                    f"\r\n"
+                ).encode()
+            )
+
+            ssock.sendall(pipelined)
+
+            s1, _, rb1 = read_http_response(ssock)
+            assert s1 == 200
+            d1 = json.loads(rb1)
+            assert d1["path"] == "/smuggle-dup-te"
+            assert d1["body_length"] == 5
+            assert d1["body_hash"] == hashlib.md5(b"hello").hexdigest()
+
+            s2, _, rb2 = read_http_response(ssock)
+            assert s2 == 200
+            d2 = json.loads(rb2)
+            assert d2["path"] == "/after-smuggle-dup-te"
+        finally:
+            ssock.close()
+
     def test_double_content_length(self, proxy):
-        """Two Content-Length headers with same value — should work normally"""
+        """Duplicate Content-Length headers (even identical) should be rejected."""
         ssock = make_ssl_connection()
         try:
             body = b"double_cl"
@@ -2935,22 +4111,18 @@ class TestRequestSmuggling:
                 f"\r\n"
             ).encode() + body
             ssock.sendall(req)
-            s1, _, rb1 = read_http_response(ssock)
-            # Should succeed since both CLs agree
-            assert s1 == 200
-            d1 = json.loads(rb1)
-            assert d1["body_length"] == len(body)
-            assert d1["body_hash"] == hashlib.md5(body).hexdigest()
+            s1, _, _ = read_http_response(ssock)
+            assert s1 == 400
 
-            # Verify keep-alive
-            req2 = (
-                f"GET /after-double-cl HTTP/1.1\r\n"
-                f"Host: {TEST_DOMAIN}\r\n"
-                f"\r\n"
-            ).encode()
-            ssock.sendall(req2)
-            s2, _, rb2 = read_http_response(ssock)
-            assert s2 == 200
+            # After malformed CL duplication, connection should not be reusable.
+            with pytest.raises((socket.timeout, ConnectionError, ssl.SSLError, OSError, ValueError)):
+                req2 = (
+                    f"GET /after-double-cl HTTP/1.1\r\n"
+                    f"Host: {TEST_DOMAIN}\r\n"
+                    f"\r\n"
+                ).encode()
+                ssock.sendall(req2)
+                read_http_response(ssock)
         finally:
             ssock.close()
 
@@ -3177,6 +4349,414 @@ class TestMultipleChunkedPostsWithDifferentSizes:
             assert s4 == 200
         finally:
             ssock.close()
+
+
+# ============================================================================
+# 37. TestBackpressureSafety
+# ============================================================================
+
+class TestBackpressureSafety:
+    """Ensure large uploads do not get silently truncated under backend backpressure."""
+
+    def test_large_post_not_silently_truncated(self):
+        slow_backend_port = 18005
+        slow_domain = "slowrecv.localhost"
+        https_port = 18743
+        http_port = 18780
+
+        stop_flag = {"stop": False}
+
+        def backend_worker():
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("127.0.0.1", slow_backend_port))
+            srv.listen(1)
+            srv.settimeout(5.0)
+            try:
+                conn, _ = srv.accept()
+            except Exception:
+                srv.close()
+                return
+
+            conn.settimeout(0.5)
+            received = b""
+            try:
+                while b"\r\n\r\n" not in received:
+                    chunk = conn.recv(8192)
+                    if not chunk:
+                        break
+                    received += chunk
+
+                if b"\r\n\r\n" not in received:
+                    conn.close()
+                    srv.close()
+                    return
+
+                head_end = received.index(b"\r\n\r\n") + 4
+                headers = received[:head_end].decode(errors="ignore")
+                body = received[head_end:]
+
+                declared = 0
+                for line in headers.split("\r\n"):
+                    if line.lower().startswith("content-length:"):
+                        declared = int(line.split(":", 1)[1].strip())
+                        break
+
+                # Intentionally delay reads to create backpressure at proxy/backend boundary.
+                time.sleep(0.4)
+
+                idle_rounds = 0
+                while len(body) < declared and idle_rounds < 4:
+                    try:
+                        chunk = conn.recv(32768)
+                    except socket.timeout:
+                        idle_rounds += 1
+                        continue
+                    if not chunk:
+                        break
+                    body += chunk
+
+                resp_obj = {"received": len(body), "declared": declared}
+                resp_body = json.dumps(resp_obj).encode()
+                response = (
+                    b"HTTP/1.1 200 OK\r\n"
+                    + f"Content-Length: {len(resp_body)}\r\n".encode()
+                    + b"Content-Type: application/json\r\n"
+                    + b"Connection: close\r\n\r\n"
+                    + resp_body
+                )
+                conn.sendall(response)
+            finally:
+                conn.close()
+                srv.close()
+                stop_flag["stop"] = True
+
+        backend_thread = threading.Thread(target=backend_worker, daemon=True)
+        backend_thread.start()
+
+        config_file = os.path.join(PROJECT_ROOT, "tests", "test_backpressure_config.json")
+        config = [{
+            "domain": slow_domain,
+            "port": str(slow_backend_port),
+            "cert_file": CERT_FILE,
+            "key_file": KEY_FILE,
+        }]
+        with open(config_file, "w") as f:
+            json.dump(config, f)
+
+        env = os.environ.copy()
+        env["REVPX_PORT"] = str(https_port)
+        env["REVPX_PORT_PLAIN"] = str(http_port)
+
+        binary = os.path.join(PROJECT_ROOT, "build", "revpx")
+        process = subprocess.Popen(
+            [binary, "-f", config_file],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=PROJECT_ROOT,
+            env=env,
+        )
+        time.sleep(1.0)
+
+        try:
+            payload = b"P" * (2 * 1024 * 1024)
+            headers = (
+                f"POST /slow-upload HTTP/1.1\r\n"
+                f"Host: {slow_domain}\r\n"
+                f"Content-Length: {len(payload)}\r\n"
+                f"Connection: close\r\n"
+                f"\r\n"
+            ).encode()
+
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+
+            with socket.create_connection(("127.0.0.1", https_port), timeout=10) as sock:
+                with ctx.wrap_socket(sock, server_hostname=slow_domain) as ssock:
+                    ssock.settimeout(20.0)
+                    ssock.sendall(headers + payload)
+                    status, _, body = read_http_response(ssock)
+
+            if status == 200:
+                result = json.loads(body)
+                assert result["declared"] == len(payload)
+                assert result["received"] == len(payload), \
+                    "Proxy forwarded a truncated request body without returning an error"
+            else:
+                # Any explicit failure is acceptable; silent truncation is not.
+                assert status in (413, 502), f"Unexpected status: {status}"
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            if os.path.exists(config_file):
+                os.remove(config_file)
+            backend_thread.join(timeout=2.0)
+
+    def test_large_post_then_pipelined_get_keeps_request_boundary(self):
+        """Large POST body followed by GET in same write should produce two clean responses."""
+        slow_backend_port = 18011
+        slow_domain = "slowpipe.localhost"
+        https_port = 18943
+        http_port = 18980
+
+        def recv_until(conn, marker: bytes, initial: bytes = b"") -> bytes:
+            data = initial
+            while marker not in data:
+                chunk = conn.recv(8192)
+                if not chunk:
+                    break
+                data += chunk
+            return data
+
+        def read_request(conn, initial: bytes = b""):
+            data = recv_until(conn, b"\r\n\r\n", initial)
+            if b"\r\n\r\n" not in data:
+                return None, None, b""
+
+            header_end = data.index(b"\r\n\r\n") + 4
+            head = data[:header_end]
+            rest = data[header_end:]
+
+            cl = 0
+            for line in head.decode(errors="ignore").split("\r\n"):
+                if line.lower().startswith("content-length:"):
+                    cl = int(line.split(":", 1)[1].strip())
+                    break
+
+            body = rest
+            while len(body) < cl:
+                # Slow body drain to force proxy-side buffering/backpressure.
+                time.sleep(0.01)
+                chunk = conn.recv(min(4096, cl - len(body)))
+                if not chunk:
+                    break
+                body += chunk
+
+            leftover = body[cl:] if len(body) > cl else b""
+            body = body[:cl]
+            return head, body, leftover
+
+        backend_state = {
+            "req1_line": None,
+            "req1_body_len": None,
+            "req2_line": None,
+            "error": None,
+        }
+
+        def backend_worker():
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("127.0.0.1", slow_backend_port))
+            srv.listen(1)
+            srv.settimeout(8.0)
+            conn = None
+            try:
+                conn, _ = srv.accept()
+                conn.settimeout(10.0)
+
+                h1, b1, rem = read_request(conn)
+                if h1 is None:
+                    backend_state["error"] = "first request not received"
+                    return
+
+                req_line_1 = h1.split(b"\r\n", 1)[0]
+                backend_state["req1_line"] = req_line_1.decode(errors="ignore")
+                backend_state["req1_body_len"] = len(b1)
+
+                resp1 = json.dumps({"received": len(b1)}).encode()
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    + f"Content-Length: {len(resp1)}\r\n".encode()
+                    + b"Content-Type: application/json\r\n"
+                    + b"Connection: keep-alive\r\n\r\n"
+                    + resp1
+                )
+
+                h2, _, _ = read_request(conn, rem)
+                if h2 is None:
+                    backend_state["error"] = "second request not received"
+                    return
+
+                req_line_2 = h2.split(b"\r\n", 1)[0]
+                backend_state["req2_line"] = req_line_2.decode(errors="ignore")
+
+                resp2 = b'{"ok":true}'
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    + f"Content-Length: {len(resp2)}\r\n".encode()
+                    + b"Content-Type: application/json\r\n"
+                    + b"Connection: close\r\n\r\n"
+                    + resp2
+                )
+            except Exception as exc:
+                backend_state["error"] = f"backend exception: {exc!r}"
+            finally:
+                if conn:
+                    conn.close()
+                srv.close()
+
+        backend_thread = threading.Thread(target=backend_worker, daemon=True)
+        backend_thread.start()
+
+        config_file = os.path.join(PROJECT_ROOT, "tests", "test_backpressure_pipeline_config.json")
+        config = [{
+            "domain": slow_domain,
+            "port": str(slow_backend_port),
+            "cert_file": CERT_FILE,
+            "key_file": KEY_FILE,
+        }]
+        with open(config_file, "w") as f:
+            json.dump(config, f)
+
+        env = os.environ.copy()
+        env["REVPX_PORT"] = str(https_port)
+        env["REVPX_PORT_PLAIN"] = str(http_port)
+
+        process = subprocess.Popen(
+            [REVPX_BINARY, "-f", config_file],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=PROJECT_ROOT,
+            env=env,
+        )
+        time.sleep(1.0)
+
+        try:
+            payload = b"Q" * (1024 * 1024)
+            request = (
+                (
+                    f"POST /slow-pipe HTTP/1.1\r\n"
+                    f"Host: {slow_domain}\r\n"
+                    f"Content-Length: {len(payload)}\r\n"
+                    f"Connection: keep-alive\r\n"
+                    f"\r\n"
+                ).encode()
+                + payload
+                + (
+                    f"GET /after-slow-pipe HTTP/1.1\r\n"
+                    f"Host: {slow_domain}\r\n"
+                    f"Connection: close\r\n"
+                    f"\r\n"
+                ).encode()
+            )
+
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+
+            with socket.create_connection(("127.0.0.1", https_port), timeout=10) as sock:
+                with ctx.wrap_socket(sock, server_hostname=slow_domain) as ssock:
+                    ssock.settimeout(20.0)
+                    ssock.sendall(request)
+
+                    s1, _, b1 = read_http_response(ssock)
+                    assert s1 == 200
+                    d1 = json.loads(b1)
+                    assert d1["received"] == len(payload)
+
+            # Backend thread observed both requests with expected boundaries.
+            backend_thread.join(timeout=5.0)
+
+            assert backend_state["error"] is None, backend_state["error"]
+            assert backend_state["req1_line"] is not None and backend_state["req1_line"].startswith(
+                "POST /slow-pipe HTTP/1.1"
+            )
+            assert backend_state["req1_body_len"] == len(payload)
+            assert backend_state["req2_line"] is not None and backend_state["req2_line"].startswith(
+                "GET /after-slow-pipe HTTP/1.1"
+            )
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            if os.path.exists(config_file):
+                os.remove(config_file)
+            backend_thread.join(timeout=2.0)
+
+
+# ============================================================================
+# 38. TestBackendAddressResolution
+# ============================================================================
+
+class TestBackendAddressResolution:
+    """Regression tests for backend address resolution."""
+
+    def test_backend_host_localhost_falls_back_to_ipv4(self):
+        """Proxy should try all getaddrinfo entries when connecting to backend host.
+
+        On many macOS setups localhost resolves to [::1, 127.0.0.1]. If the backend
+        listens only on IPv4, connect(::1) fails and the proxy must then try IPv4.
+        """
+        backend_port = 18006
+        https_port = 18843
+        http_port = 18880
+        domain = "localhost-backend.localhost"
+
+        backend = HTTPServer(("127.0.0.1", backend_port), BackendHandler)
+        backend_thread = threading.Thread(target=backend.serve_forever, daemon=True)
+        backend_thread.start()
+        time.sleep(0.1)
+
+        config_file = os.path.join(PROJECT_ROOT, "tests", "test_localhost_backend_config.json")
+        config = [{
+            "domain": domain,
+            "host": "localhost",
+            "port": str(backend_port),
+            "cert_file": CERT_FILE,
+            "key_file": KEY_FILE,
+        }]
+        with open(config_file, "w") as f:
+            json.dump(config, f)
+
+        env = os.environ.copy()
+        env["REVPX_PORT"] = str(https_port)
+        env["REVPX_PORT_PLAIN"] = str(http_port)
+
+        binary = os.path.join(PROJECT_ROOT, "build", "revpx")
+        process = subprocess.Popen(
+            [binary, "-f", config_file],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=PROJECT_ROOT,
+            env=env,
+        )
+        time.sleep(1)
+
+        try:
+            assert process.poll() is None, "Proxy exited unexpectedly"
+
+            client = ProxyClient(host=domain, port=https_port)
+            status, _, body = client.request("GET", "/localhost-fallback")
+
+            assert status == 200, (
+                "Expected successful routing via IPv4 localhost fallback; "
+                "proxy likely tried only the first resolved address"
+            )
+
+            data = json.loads(body)
+            assert data["path"] == "/localhost-fallback"
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+            backend.shutdown()
+            backend.server_close()
+            backend_thread.join(timeout=2.0)
+
+            if os.path.exists(config_file):
+                os.remove(config_file)
 
 
 # ============================================================================
