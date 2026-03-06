@@ -17,22 +17,24 @@ Tests cover:
 - Error conditions and edge cases
 """
 
+import asyncio
 import hashlib
 import json
 import os
 import socket
 import ssl
-import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from io import BytesIO
 from typing import Callable, Optional
 
 import pytest
+import pytest_asyncio
+
+pytestmark = pytest.mark.asyncio
 
 # Configuration
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -245,17 +247,17 @@ class RevPxProxy:
         self.domain = domain
         self.cert = cert
         self.key = key
-        self.process: Optional[subprocess.Popen] = None
+        self.process: Optional[asyncio.subprocess.Process] = None
         self.config_file: Optional[str] = None
 
-    def _wait_until_ready(self, timeout: float = 10.0):
+    async def _wait_until_ready(self, timeout: float = 10.0):
         """Wait until the HTTPS listener is accepting TCP connections."""
-        deadline = time.time() + timeout
+        deadline = asyncio.get_running_loop().time() + timeout
         last_connect_error = None
 
-        while time.time() < deadline:
-            if self.process and self.process.poll() is not None:
-                stdout, stderr = self.process.communicate()
+        while asyncio.get_running_loop().time() < deadline:
+            if self.process and self.process.returncode is not None:
+                stdout, stderr = await self.process.communicate()
                 raise RuntimeError(
                     f"revpx exited before becoming ready:\n"
                     f"stdout: {stdout.decode()}\n"
@@ -267,17 +269,21 @@ class RevPxProxy:
                     return
             except OSError as exc:
                 last_connect_error = exc
-                time.sleep(0.05)
+                await asyncio.sleep(0.05)
 
         raise RuntimeError(
             f"revpx did not become ready on 127.0.0.1:{self.https_port} within {timeout}s "
             f"(last error: {last_connect_error})"
         )
 
-    def start(self):
+    async def start(self):
         """Start the reverse proxy"""
-        # Create a temporary config file to avoid arg parsing issues
-        self.config_file = os.path.join(PROJECT_ROOT, "tests", "test_config.json")
+        # Use a per-process/per-port config path so parallel pytest shards do not race.
+        self.config_file = os.path.join(
+            PROJECT_ROOT,
+            "tests",
+            f"test_config_{os.getpid()}_{self.https_port}_{self.backend_port}.json",
+        )
         config = [{
             "domain": self.domain,
             "port": str(self.backend_port),
@@ -294,25 +300,25 @@ class RevPxProxy:
 
         cmd = [REVPX_BINARY, "-f", self.config_file]
 
-        self.process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+        self.process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             cwd=PROJECT_ROOT,
             env=env
         )
 
-        self._wait_until_ready()
+        await self._wait_until_ready()
 
-    def stop(self):
+    async def stop(self):
         """Stop the reverse proxy"""
         if self.process:
             self.process.terminate()
             try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
+                await asyncio.wait_for(self.process.wait(), timeout=5)
+            except asyncio.TimeoutError:
                 self.process.kill()
-                self.process.wait()
+                await self.process.wait()
             self.process = None
 
         # Clean up config file
@@ -332,7 +338,7 @@ class ProxyClient:
         self.context.check_hostname = False
         self.context.verify_mode = ssl.CERT_NONE
 
-    def request(
+    async def request(
         self,
         method: str = "GET",
         path: str = "/",
@@ -360,15 +366,20 @@ class ProxyClient:
         if body:
             request_data += body
 
-        # Connect to 127.0.0.1 but use SNI hostname for TLS
-        with socket.create_connection((self.connect_host, self.port), timeout=timeout) as sock:
-            with self.context.wrap_socket(sock, server_hostname=self.host) as ssock:
-                ssock.sendall(request_data)
+        async def _roundtrip() -> tuple[str, bytes]:
+            reader, writer = await asyncio.open_connection(
+                self.connect_host,
+                self.port,
+                ssl=self.context,
+                server_hostname=self.host,
+            )
+            try:
+                writer.write(request_data)
+                await writer.drain()
 
-                # Read response headers first
                 response = b""
                 while b"\r\n\r\n" not in response:
-                    chunk = ssock.recv(8192)
+                    chunk = await reader.read(8192)
                     if not chunk:
                         break
                     response += chunk
@@ -380,7 +391,6 @@ class ProxyClient:
                 headers_part = response[:header_end].decode()
                 body_data = response[header_end:]
 
-                # Parse content-length or chunked
                 content_length = None
                 chunked = False
                 for line in headers_part.split("\r\n"):
@@ -392,17 +402,26 @@ class ProxyClient:
 
                 if content_length is not None:
                     while len(body_data) < content_length:
-                        chunk = ssock.recv(8192)
+                        chunk = await reader.read(8192)
                         if not chunk:
                             break
                         body_data += chunk
                 elif chunked:
-                    # Read until 0\r\n\r\n
                     while not body_data.endswith(b"0\r\n\r\n"):
-                        chunk = ssock.recv(8192)
+                        chunk = await reader.read(8192)
                         if not chunk:
                             break
                         body_data += chunk
+
+                return headers_part, body_data
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+        headers_part, body_data = await asyncio.wait_for(_roundtrip(), timeout=timeout)
 
         # Parse status line
         status_line = headers_part.split("\r\n")[0]
@@ -448,49 +467,70 @@ class ProxyClient:
 
         return result.getvalue()
 
-    def request_raw(
+    async def request_raw(
         self,
         request_data: bytes,
         timeout: float = 10.0
     ) -> bytes:
         """Send raw request data and return raw response"""
-        with socket.create_connection((self.connect_host, self.port), timeout=timeout) as sock:
-            with self.context.wrap_socket(sock, server_hostname=self.host) as ssock:
-                ssock.sendall(request_data)
+        async def _roundtrip() -> bytes:
+            reader, writer = await asyncio.open_connection(
+                self.connect_host,
+                self.port,
+                ssl=self.context,
+                server_hostname=self.host,
+            )
+            try:
+                writer.write(request_data)
+                await writer.drain()
 
                 response = b""
+                idle_timeout = 1.0
+                deadline = asyncio.get_running_loop().time() + timeout
+                while True:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
+                    per_read = min(idle_timeout, remaining)
+                    try:
+                        chunk = await asyncio.wait_for(reader.read(8192), timeout=per_read)
+                    except TimeoutError:
+                        # No new data for a while: return what we have.
+                        break
+                    if not chunk:
+                        break
+                    response += chunk
+                return response
+            finally:
+                writer.close()
                 try:
-                    while True:
-                        chunk = ssock.recv(8192)
-                        if not chunk:
-                            break
-                        response += chunk
-                except socket.timeout:
+                    await writer.wait_closed()
+                except Exception:
                     pass
 
-                return response
+        return await _roundtrip()
 
 
 # ============================================================================
 # Fixtures
 # ============================================================================
 
-@pytest.fixture(scope="module")
-def backend():
+@pytest_asyncio.fixture(scope="module")
+async def backend():
     """Start backend server for the test module"""
     server = BackendServer(BACKEND_PORT)
-    server.start()
+    await asyncio.to_thread(server.start)
     yield server
-    server.stop()
+    await asyncio.to_thread(server.stop)
 
 
-@pytest.fixture(scope="module")
-def proxy(backend):
+@pytest_asyncio.fixture(scope="module")
+async def proxy(backend):
     """Start revpx proxy for the test module"""
     proxy = RevPxProxy()
-    proxy.start()
+    await proxy.start()
     yield proxy
-    proxy.stop()
+    await proxy.stop()
 
 
 @pytest.fixture
@@ -513,19 +553,19 @@ def reset_backend():
 class TestBasicHTTPMethods:
     """Test basic HTTP method handling"""
 
-    def test_get_request(self, client):
+    async def test_get_request(self, client):
         """Test simple GET request"""
-        status, headers, body = client.request("GET", "/test/path")
+        status, headers, body = await client.request("GET", "/test/path")
 
         assert status == 200
         data = json.loads(body)
         assert data["method"] == "GET"
         assert data["path"] == "/test/path"
 
-    def test_post_request(self, client):
+    async def test_post_request(self, client):
         """Test POST request with body"""
         request_body = b'{"key": "value"}'
-        status, headers, body = client.request(
+        status, headers, body = await client.request(
             "POST", "/api/data",
             headers={"Content-Type": "application/json"},
             body=request_body
@@ -536,43 +576,43 @@ class TestBasicHTTPMethods:
         assert data["method"] == "POST"
         assert data["body_length"] == len(request_body)
 
-    def test_put_request(self, client):
+    async def test_put_request(self, client):
         """Test PUT request"""
         request_body = b"updated content"
-        status, headers, body = client.request("PUT", "/resource/1", body=request_body)
+        status, headers, body = await client.request("PUT", "/resource/1", body=request_body)
 
         assert status == 200
         data = json.loads(body)
         assert data["method"] == "PUT"
 
-    def test_delete_request(self, client):
+    async def test_delete_request(self, client):
         """Test DELETE request"""
-        status, headers, body = client.request("DELETE", "/resource/1")
+        status, headers, body = await client.request("DELETE", "/resource/1")
 
         assert status == 200
         data = json.loads(body)
         assert data["method"] == "DELETE"
 
-    def test_patch_request(self, client):
+    async def test_patch_request(self, client):
         """Test PATCH request"""
         request_body = b'{"partial": "update"}'
-        status, headers, body = client.request("PATCH", "/resource/1", body=request_body)
+        status, headers, body = await client.request("PATCH", "/resource/1", body=request_body)
 
         assert status == 200
         data = json.loads(body)
         assert data["method"] == "PATCH"
 
-    def test_head_request(self, client):
+    async def test_head_request(self, client):
         """Test HEAD request returns headers without body"""
-        status, headers, body = client.request("HEAD", "/test")
+        status, headers, body = await client.request("HEAD", "/test")
 
         assert status == 200
         assert len(body) == 0
         assert "X-Custom" in headers
 
-    def test_options_request(self, client):
+    async def test_options_request(self, client):
         """Test OPTIONS request"""
-        status, headers, body = client.request("OPTIONS", "/api")
+        status, headers, body = await client.request("OPTIONS", "/api")
 
         assert status == 200
         assert "Allow" in headers
@@ -585,7 +625,7 @@ class TestBasicHTTPMethods:
 class TestHeaderForwarding:
     """Test that headers are properly forwarded"""
 
-    def test_standard_headers_forwarded(self, client):
+    async def test_standard_headers_forwarded(self, client):
         """Test standard headers are forwarded to backend"""
         custom_headers = {
             "Accept": "application/json",
@@ -594,7 +634,7 @@ class TestHeaderForwarding:
             "Cache-Control": "no-cache",
         }
 
-        status, _, body = client.request("GET", "/", headers=custom_headers)
+        status, _, body = await client.request("GET", "/", headers=custom_headers)
 
         assert status == 200
         data = json.loads(body)
@@ -602,7 +642,7 @@ class TestHeaderForwarding:
         for key, value in custom_headers.items():
             assert data["headers"].get(key) == value
 
-    def test_custom_headers_forwarded(self, client):
+    async def test_custom_headers_forwarded(self, client):
         """Test custom X- headers are forwarded"""
         custom_headers = {
             "X-Request-Id": "test-123",
@@ -610,7 +650,7 @@ class TestHeaderForwarding:
             "X-Custom-Header": "custom-value",
         }
 
-        status, _, body = client.request("GET", "/", headers=custom_headers)
+        status, _, body = await client.request("GET", "/", headers=custom_headers)
 
         assert status == 200
         data = json.loads(body)
@@ -618,31 +658,31 @@ class TestHeaderForwarding:
         for key, value in custom_headers.items():
             assert data["headers"].get(key) == value
 
-    def test_authorization_header_forwarded(self, client):
+    async def test_authorization_header_forwarded(self, client):
         """Test Authorization header is forwarded"""
         headers = {
             "Authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test"
         }
 
-        status, _, body = client.request("GET", "/api/protected", headers=headers)
+        status, _, body = await client.request("GET", "/api/protected", headers=headers)
 
         assert status == 200
         data = json.loads(body)
         assert data["headers"].get("Authorization") == headers["Authorization"]
 
-    def test_cookie_header_forwarded(self, client):
+    async def test_cookie_header_forwarded(self, client):
         """Test Cookie header is forwarded"""
         headers = {
             "Cookie": "session=abc123; user=test"
         }
 
-        status, _, body = client.request("GET", "/", headers=headers)
+        status, _, body = await client.request("GET", "/", headers=headers)
 
         assert status == 200
         data = json.loads(body)
         assert data["headers"].get("Cookie") == headers["Cookie"]
 
-    def test_content_type_preserved(self, client):
+    async def test_content_type_preserved(self, client):
         """Test Content-Type is preserved for requests"""
         content_types = [
             "application/json",
@@ -653,7 +693,7 @@ class TestHeaderForwarding:
         ]
 
         for ct in content_types:
-            status, _, body = client.request(
+            status, _, body = await client.request(
                 "POST", "/",
                 headers={"Content-Type": ct},
                 body=b"test"
@@ -663,11 +703,11 @@ class TestHeaderForwarding:
             data = json.loads(body)
             assert data["headers"].get("Content-Type") == ct
 
-    def test_many_headers(self, client):
+    async def test_many_headers(self, client):
         """Test request with many headers"""
         headers = {f"X-Header-{i}": f"value-{i}" for i in range(50)}
 
-        status, _, body = client.request("GET", "/", headers=headers)
+        status, _, body = await client.request("GET", "/", headers=headers)
 
         assert status == 200
         data = json.loads(body)
@@ -683,56 +723,56 @@ class TestHeaderForwarding:
 class TestLargePayloads:
     """Test handling of large request and response payloads"""
 
-    def test_small_request_body(self, client):
+    async def test_small_request_body(self, client):
         """Test small request body (100 bytes)"""
         body = b"x" * 100
-        status, _, resp_body = client.request("POST", "/", body=body)
+        status, _, resp_body = await client.request("POST", "/", body=body)
 
         assert status == 200
         data = json.loads(resp_body)
         assert data["body_length"] == 100
         assert data["body_hash"] == hashlib.md5(body).hexdigest()
 
-    def test_moderate_request_body(self, client):
+    async def test_moderate_request_body(self, client):
         """Test request body around 30KB (close to proxy buffer size)"""
         body = b"x" * (30 * 1024)
-        status, _, resp_body = client.request("POST", "/", body=body, timeout=15)
+        status, _, resp_body = await client.request("POST", "/", body=body, timeout=15)
 
         assert status == 200
         data = json.loads(resp_body)
         assert data["body_length"] == 30 * 1024
         assert data["body_hash"] == hashlib.md5(body).hexdigest()
 
-    def test_medium_request_body(self, client):
+    async def test_medium_request_body(self, client):
         """Test medium request body (100KB)"""
         body = b"x" * (100 * 1024)
-        status, _, resp_body = client.request("POST", "/", body=body, timeout=60)
+        status, _, resp_body = await client.request("POST", "/", body=body, timeout=60)
 
         assert status == 200
         data = json.loads(resp_body)
         assert data["body_length"] == 100 * 1024
         assert data["body_hash"] == hashlib.md5(body).hexdigest()
 
-    def test_large_request_body(self, client):
+    async def test_large_request_body(self, client):
         """Test large request body (1MB)"""
         body = b"x" * (1024 * 1024)
-        status, _, resp_body = client.request("POST", "/", body=body, timeout=60)
+        status, _, resp_body = await client.request("POST", "/", body=body, timeout=60)
 
         assert status == 200
         data = json.loads(resp_body)
         assert data["body_length"] == 1024 * 1024
         assert data["body_hash"] == hashlib.md5(body).hexdigest()
 
-    def test_very_large_request_body(self, client):
+    async def test_very_large_request_body(self, client):
         """Test very large request body (5MB)"""
         body = b"x" * (5 * 1024 * 1024)
-        status, _, resp_body = client.request("POST", "/", body=body, timeout=120)
+        status, _, resp_body = await client.request("POST", "/", body=body, timeout=120)
 
         assert status == 200
         data = json.loads(resp_body)
         assert data["body_length"] == 5 * 1024 * 1024
 
-    def test_large_response_body(self, client):
+    async def test_large_response_body(self, client):
         """Test large response from backend (1MB)"""
         response_size = 1024 * 1024
         response_data = b"y" * response_size
@@ -742,13 +782,13 @@ class TestLargePayloads:
 
         BackendHandler.custom_response = custom_response
 
-        status, headers, body = client.request("GET", "/large-response", timeout=30)
+        status, headers, body = await client.request("GET", "/large-response", timeout=30)
 
         assert status == 200
         assert len(body) == response_size
         assert body == response_data
 
-    def test_very_large_response_body(self, client):
+    async def test_very_large_response_body(self, client):
         """Test very large response from backend (5MB)"""
         response_size = 5 * 1024 * 1024
         response_data = os.urandom(response_size)
@@ -758,13 +798,13 @@ class TestLargePayloads:
 
         BackendHandler.custom_response = custom_response
 
-        status, headers, body = client.request("GET", "/very-large-response", timeout=60)
+        status, headers, body = await client.request("GET", "/very-large-response", timeout=60)
 
         assert status == 200
         assert len(body) == response_size
         assert body == response_data
 
-    def test_response_data_integrity(self, client):
+    async def test_response_data_integrity(self, client):
         """Test that response data arrives in correct order (not corrupted)"""
         # Create a pattern that makes out-of-order delivery detectable
         response_size = 256 * 1024  # 256KB
@@ -775,13 +815,13 @@ class TestLargePayloads:
 
         BackendHandler.custom_response = custom_response
 
-        status, _, body = client.request("GET", "/integrity", timeout=30)
+        status, _, body = await client.request("GET", "/integrity", timeout=30)
 
         assert status == 200
         assert len(body) == len(response_data)
         assert body == response_data, "Response data arrived corrupted or out of order"
 
-    def test_large_response_content_length_match(self, client):
+    async def test_large_response_content_length_match(self, client):
         """Test Content-Length matches actual body for large responses"""
         for size in [64 * 1024, 256 * 1024, 1024 * 1024]:
             response_data = b"A" * size
@@ -791,17 +831,17 @@ class TestLargePayloads:
 
             BackendHandler.custom_response = custom_response
 
-            status, headers, body = client.request("GET", f"/cl-match/{size}", timeout=30)
+            status, headers, body = await client.request("GET", f"/cl-match/{size}", timeout=30)
 
             assert status == 200
             cl = int(headers.get("Content-Length", -1))
             assert cl == size, f"Content-Length header {cl} != expected {size}"
             assert len(body) == size, f"Body length {len(body)} != expected {size}"
 
-    def test_binary_payload(self, client):
+    async def test_binary_payload(self, client):
         """Test binary data with all byte values"""
         body = bytes(range(256)) * 100  # 25.6KB of all possible bytes
-        status, _, resp_body = client.request(
+        status, _, resp_body = await client.request(
             "POST", "/binary",
             headers={"Content-Type": "application/octet-stream"},
             body=body
@@ -812,10 +852,10 @@ class TestLargePayloads:
         assert data["body_length"] == len(body)
         assert data["body_hash"] == hashlib.md5(body).hexdigest()
 
-    def test_random_payload(self, client):
+    async def test_random_payload(self, client):
         """Test random binary data (30KB to stay within buffer limits)"""
         body = os.urandom(30 * 1024)  # 30KB random - within 32KB buffer
-        status, _, resp_body = client.request("POST", "/random", body=body, timeout=15)
+        status, _, resp_body = await client.request("POST", "/random", body=body, timeout=15)
 
         assert status == 200
         data = json.loads(resp_body)
@@ -829,78 +869,68 @@ class TestLargePayloads:
 class TestConcurrentRequests:
     """Test handling of concurrent and rapid requests"""
 
-    def test_sequential_requests(self, client):
+    async def test_sequential_requests(self, client):
         """Test many sequential requests"""
         for i in range(50):
-            status, _, body = client.request("GET", f"/seq/{i}")
+            status, _, body = await client.request("GET", f"/seq/{i}")
             assert status == 200
             data = json.loads(body)
             assert data["path"] == f"/seq/{i}"
 
-    def test_parallel_requests(self, proxy):
+    async def test_parallel_requests(self, proxy):
         """Test parallel requests from multiple clients"""
         num_requests = 50
-        results = []
 
-        def make_request(i):
+        async def make_request(i):
             client = ProxyClient()
-            status, _, body = client.request("GET", f"/parallel/{i}")
+            status, _, body = await client.request("GET", f"/parallel/{i}")
             return i, status, json.loads(body)
 
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            futures = [executor.submit(make_request, i) for i in range(num_requests)]
-            for future in as_completed(futures):
-                results.append(future.result())
+        results = await asyncio.gather(*(make_request(i) for i in range(num_requests)))
 
         assert len(results) == num_requests
         for i, status, data in results:
             assert status == 200
             assert data["path"] == f"/parallel/{i}"
 
-    def test_rapid_fire_requests(self, proxy):
+    async def test_rapid_fire_requests(self, proxy):
         """Test rapid consecutive requests"""
         num_requests = 100
         client = ProxyClient()
 
         for i in range(num_requests):
-            status, _, body = client.request("GET", f"/rapid/{i}")
+            status, _, body = await client.request("GET", f"/rapid/{i}")
             assert status == 200
 
-    def test_mixed_method_parallel(self, proxy):
+    async def test_mixed_method_parallel(self, proxy):
         """Test parallel requests with mixed methods"""
         methods = ["GET", "POST", "PUT", "DELETE", "PATCH"]
-        results = []
 
-        def make_request(method, i):
+        async def make_request(method, i):
             client = ProxyClient()
             body = b"test" if method in ("POST", "PUT", "PATCH") else None
-            status, _, resp = client.request(method, f"/mixed/{i}", body=body)
+            status, _, resp = await client.request(method, f"/mixed/{i}", body=body)
             return method, status, json.loads(resp) if resp else None
 
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            futures = []
-            for i in range(20):
-                method = methods[i % len(methods)]
-                futures.append(executor.submit(make_request, method, i))
-
-            for future in as_completed(futures):
-                results.append(future.result())
+        results = await asyncio.gather(
+            *(make_request(methods[i % len(methods)], i) for i in range(20))
+        )
 
         assert len(results) == 20
         for method, status, _ in results:
             assert status == 200
 
-    def test_parallel_large_payloads(self, proxy):
+    async def test_parallel_large_payloads(self, proxy):
         """Test parallel requests with moderate payloads (within buffer limits)"""
         num_requests = 10
         payload_size = 20 * 1024  # 20KB each - within 32KB buffer
 
-        def make_request(i):
+        async def make_request(i):
             client = ProxyClient()
             body = os.urandom(payload_size)
             body_hash = hashlib.md5(body).hexdigest()
             try:
-                status, _, resp = client.request("POST", f"/large/{i}", body=body, timeout=60)
+                status, _, resp = await client.request("POST", f"/large/{i}", body=body, timeout=60)
                 if status == 200:
                     data = json.loads(resp)
                     return i, status, data["body_hash"] == body_hash
@@ -908,9 +938,7 @@ class TestConcurrentRequests:
             except Exception:
                 return i, -1, False
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = [executor.submit(make_request, i) for i in range(num_requests)]
-            results = [f.result() for f in as_completed(futures)]
+        results = await asyncio.gather(*(make_request(i) for i in range(num_requests)))
 
         assert len(results) == num_requests
         success_count = sum(1 for _, status, matched in results if status == 200 and matched)
@@ -925,7 +953,7 @@ class TestConcurrentRequests:
 class TestChunkedEncoding:
     """Test chunked transfer encoding handling"""
 
-    def test_chunked_response(self, client):
+    async def test_chunked_response(self, client):
         """Test receiving chunked response from backend"""
         response_data = b"This is a chunked response with multiple chunks."
 
@@ -936,12 +964,12 @@ class TestChunkedEncoding:
 
         BackendHandler.custom_response = custom_response
 
-        status, headers, body = client.request("GET", "/chunked")
+        status, headers, body = await client.request("GET", "/chunked")
 
         assert status == 200
         assert body == response_data
 
-    def test_large_chunked_response(self, client):
+    async def test_large_chunked_response(self, client):
         """Test large chunked response"""
         response_data = b"x" * (500 * 1024)  # 500KB
 
@@ -952,13 +980,13 @@ class TestChunkedEncoding:
 
         BackendHandler.custom_response = custom_response
 
-        status, headers, body = client.request("GET", "/large-chunked", timeout=30)
+        status, headers, body = await client.request("GET", "/large-chunked", timeout=30)
 
         assert status == 200
         assert len(body) == len(response_data)
         assert body == response_data
 
-    def test_chunked_request(self, client):
+    async def test_chunked_request(self, client):
         """Test sending chunked request.
 
         revpx decodes chunked request bodies and forwards with Content-Length.
@@ -980,7 +1008,7 @@ class TestChunkedEncoding:
             f"\r\n"
         ).encode() + chunked_body
 
-        response = client.request_raw(request)
+        response = await client.request_raw(request)
 
         # Parse response
         assert b"200" in response.split(b"\r\n")[0]
@@ -997,16 +1025,16 @@ class TestChunkedEncoding:
 class TestConnectionHandling:
     """Test connection keep-alive and handling"""
 
-    def test_connection_header(self, client):
+    async def test_connection_header(self, client):
         """Test Connection header is handled"""
-        status, _, body = client.request(
+        status, _, body = await client.request(
             "GET", "/",
             headers={"Connection": "keep-alive"}
         )
 
         assert status == 200
 
-    def test_multiple_requests_same_connection(self, proxy):
+    async def test_multiple_requests_same_connection(self, proxy):
         """Test multiple requests on same SSL connection"""
         context = ssl.create_default_context()
         context.check_hostname = False
@@ -1069,55 +1097,55 @@ class TestConnectionHandling:
 class TestURLHandling:
     """Test URL and path handling"""
 
-    def test_root_path(self, client):
+    async def test_root_path(self, client):
         """Test request to root path"""
-        status, _, body = client.request("GET", "/")
+        status, _, body = await client.request("GET", "/")
 
         assert status == 200
         data = json.loads(body)
         assert data["path"] == "/"
 
-    def test_nested_path(self, client):
+    async def test_nested_path(self, client):
         """Test deeply nested path"""
         path = "/a/b/c/d/e/f/g/h/i/j"
-        status, _, body = client.request("GET", path)
+        status, _, body = await client.request("GET", path)
 
         assert status == 200
         data = json.loads(body)
         assert data["path"] == path
 
-    def test_query_string(self, client):
+    async def test_query_string(self, client):
         """Test query string is preserved"""
         path = "/search?q=test&page=1&limit=10"
-        status, _, body = client.request("GET", path)
+        status, _, body = await client.request("GET", path)
 
         assert status == 200
         data = json.loads(body)
         assert data["path"] == path
 
-    def test_encoded_characters(self, client):
+    async def test_encoded_characters(self, client):
         """Test URL-encoded characters"""
         path = "/path%20with%20spaces?name=John%20Doe"
-        status, _, body = client.request("GET", path)
+        status, _, body = await client.request("GET", path)
 
         assert status == 200
         data = json.loads(body)
         assert data["path"] == path
 
-    def test_special_characters_in_path(self, client):
+    async def test_special_characters_in_path(self, client):
         """Test special characters in path"""
         path = "/api/v1/users/123/profile"
-        status, _, body = client.request("GET", path)
+        status, _, body = await client.request("GET", path)
 
         assert status == 200
         data = json.loads(body)
         assert data["path"] == path
 
-    def test_fragment_stripped(self, client):
+    async def test_fragment_stripped(self, client):
         """Test that fragment is handled (usually stripped by client)"""
         # Note: fragments are typically not sent to server
         path = "/page"
-        status, _, body = client.request("GET", path)
+        status, _, body = await client.request("GET", path)
 
         assert status == 200
 
@@ -1130,7 +1158,7 @@ class TestStatusCodes:
     """Test various HTTP status code handling"""
 
     @pytest.mark.parametrize("status_code", [200, 201, 204, 301, 302, 400, 401, 403, 404, 500, 502, 503])
-    def test_status_code_forwarded(self, client, status_code):
+    async def test_status_code_forwarded(self, client, status_code):
         """Test various status codes are forwarded correctly"""
         def custom_response(handler, req):
             body = b"" if status_code == 204 else b"response"
@@ -1138,7 +1166,7 @@ class TestStatusCodes:
 
         BackendHandler.custom_response = custom_response
 
-        status, _, _ = client.request("GET", f"/status/{status_code}")
+        status, _, _ = await client.request("GET", f"/status/{status_code}")
 
         assert status == status_code
 
@@ -1150,18 +1178,18 @@ class TestStatusCodes:
 class TestResponseHeaders:
     """Test response header handling"""
 
-    def test_content_type_forwarded(self, client):
+    async def test_content_type_forwarded(self, client):
         """Test Content-Type is forwarded in response"""
         def custom_response(handler, req):
             handler._send_response(200, {"Content-Type": "application/xml"}, b"<xml/>")
 
         BackendHandler.custom_response = custom_response
 
-        status, headers, _ = client.request("GET", "/")
+        status, headers, _ = await client.request("GET", "/")
 
         assert headers.get("Content-Type") == "application/xml"
 
-    def test_custom_response_headers(self, client):
+    async def test_custom_response_headers(self, client):
         """Test custom response headers are forwarded"""
         def custom_response(handler, req):
             headers = {
@@ -1173,13 +1201,13 @@ class TestResponseHeaders:
 
         BackendHandler.custom_response = custom_response
 
-        status, headers, _ = client.request("GET", "/")
+        status, headers, _ = await client.request("GET", "/")
 
         assert headers.get("X-Custom-Response") == "test-value"
         assert headers.get("X-Request-Id") == "12345"
         assert headers.get("Cache-Control") == "max-age=3600"
 
-    def test_set_cookie_header(self, client):
+    async def test_set_cookie_header(self, client):
         """Test Set-Cookie header is forwarded"""
         def custom_response(handler, req):
             handler.send_response(200)
@@ -1191,7 +1219,7 @@ class TestResponseHeaders:
 
         BackendHandler.custom_response = custom_response
 
-        status, headers, _ = client.request("GET", "/")
+        status, headers, _ = await client.request("GET", "/")
 
         assert status == 200
 
@@ -1203,39 +1231,39 @@ class TestResponseHeaders:
 class TestErrorHandling:
     """Test error conditions and edge cases"""
 
-    def test_backend_slow_response(self, client):
+    async def test_backend_slow_response(self, client):
         """Test handling of slow backend response"""
         BackendHandler.response_delay = 1.0
 
-        status, _, _ = client.request("GET", "/slow", timeout=10)
+        status, _, _ = await client.request("GET", "/slow", timeout=10)
 
         assert status == 200
 
-    def test_empty_body_post(self, client):
+    async def test_empty_body_post(self, client):
         """Test POST with empty body"""
-        status, _, body = client.request("POST", "/empty", body=b"")
+        status, _, body = await client.request("POST", "/empty", body=b"")
 
         assert status == 200
         data = json.loads(body)
         assert data["body_length"] == 0
 
-    def test_very_long_url(self, client):
+    async def test_very_long_url(self, client):
         """Test very long URL path"""
         long_path = "/" + "a" * 2000
-        status, _, body = client.request("GET", long_path)
+        status, _, body = await client.request("GET", long_path)
 
         assert status == 200
         data = json.loads(body)
         assert data["path"] == long_path
 
-    def test_special_header_values(self, client):
+    async def test_special_header_values(self, client):
         """Test headers with special characters"""
         headers = {
             "X-Special": "value with spaces",
             "X-Unicode": "utf-8: ñ é ü",
         }
 
-        status, _, body = client.request("GET", "/", headers=headers)
+        status, _, body = await client.request("GET", "/", headers=headers)
 
         assert status == 200
 
@@ -1247,13 +1275,13 @@ class TestErrorHandling:
 class TestSSL:
     """Test SSL/TLS functionality"""
 
-    def test_tls_connection(self, proxy):
+    async def test_tls_connection(self, proxy):
         """Test basic TLS connection works"""
         client = ProxyClient()
-        status, _, _ = client.request("GET", "/")
+        status, _, _ = await client.request("GET", "/")
         assert status == 200
 
-    def test_sni_hostname(self, proxy):
+    async def test_sni_hostname(self, proxy):
         """Test SNI with correct hostname"""
         context = ssl.create_default_context()
         context.check_hostname = False
@@ -1274,7 +1302,7 @@ class TestSSL:
 class TestHTTPRedirect:
     """Test HTTP to HTTPS redirect functionality"""
 
-    def test_http_redirects_to_https(self, proxy):
+    async def test_http_redirects_to_https(self, proxy):
         """Test that HTTP requests are redirected to HTTPS"""
         sock = socket.create_connection(("127.0.0.1", HTTP_PORT), timeout=10)
         try:
@@ -1296,7 +1324,7 @@ class TestHTTPRedirect:
 class TestStreamingResponses:
     """Test streaming and large data handling - targets buffer management bugs"""
 
-    def test_backend_slow_stream(self, client):
+    async def test_backend_slow_stream(self, client):
         """Test backend that sends response body slowly in pieces"""
         total_size = 100 * 1024  # 100KB
         response_data = os.urandom(total_size)
@@ -1315,13 +1343,13 @@ class TestStreamingResponses:
 
         BackendHandler.custom_response = custom_response
 
-        status, headers, body = client.request("GET", "/slow-stream", timeout=30)
+        status, headers, body = await client.request("GET", "/slow-stream", timeout=30)
 
         assert status == 200
         assert len(body) == total_size
         assert body == response_data
 
-    def test_concurrent_large_responses(self, proxy):
+    async def test_concurrent_large_responses(self, proxy):
         """Test multiple clients receiving large responses simultaneously"""
         response_size = 512 * 1024  # 512KB each
 
@@ -1334,20 +1362,18 @@ class TestStreamingResponses:
 
         BackendHandler.custom_response = custom_response
 
-        def make_request(i):
+        async def make_request(i):
             c = ProxyClient()
-            status, headers, body = c.request("GET", f"/concurrent-large/{i}", timeout=30)
+            status, headers, body = await c.request("GET", f"/concurrent-large/{i}", timeout=30)
             return i, status, len(body), int(headers.get("X-Expected-Size", 0))
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = [executor.submit(make_request, i) for i in range(5)]
-            results = [f.result() for f in as_completed(futures)]
+        results = await asyncio.gather(*(make_request(i) for i in range(5)))
 
         for i, status, body_len, expected in results:
             assert status == 200, f"Request {i}: got status {status}"
             assert body_len == expected, f"Request {i}: body {body_len} != expected {expected}"
 
-    def test_large_request_and_response(self, client):
+    async def test_large_request_and_response(self, client):
         """Test large request body with large response body"""
         req_body = os.urandom(256 * 1024)  # 256KB request
         resp_size = 256 * 1024  # 256KB response
@@ -1361,14 +1387,14 @@ class TestStreamingResponses:
 
         BackendHandler.custom_response = custom_response
 
-        status, headers, body = client.request("POST", "/echo-large", body=req_body, timeout=30)
+        status, headers, body = await client.request("POST", "/echo-large", body=req_body, timeout=30)
 
         assert status == 200
         assert headers.get("X-Req-Hash") == hashlib.md5(req_body).hexdigest()
         assert len(body) == resp_size
         assert body == resp_data
 
-    def test_many_sequential_large_responses(self, client):
+    async def test_many_sequential_large_responses(self, client):
         """Test many sequential requests with large responses on different connections"""
         response_size = 128 * 1024  # 128KB
 
@@ -1380,7 +1406,7 @@ class TestStreamingResponses:
 
             BackendHandler.custom_response = custom_response
 
-            status, _, body = client.request("GET", f"/seq-large/{i}", timeout=15)
+            status, _, body = await client.request("GET", f"/seq-large/{i}", timeout=15)
 
             assert status == 200
             assert len(body) == response_size, f"Iteration {i}: got {len(body)} bytes, expected {response_size}"
@@ -1394,7 +1420,7 @@ class TestStreamingResponses:
 class TestKeepAliveWithPayloads:
     """Test HTTP keep-alive with various payload sizes"""
 
-    def test_keepalive_multiple_large_posts(self, proxy):
+    async def test_keepalive_multiple_large_posts(self, proxy):
         """Test keep-alive with multiple large POST requests on same connection"""
         context = ssl.create_default_context()
         context.check_hostname = False
@@ -1446,7 +1472,7 @@ class TestKeepAliveWithPayloads:
                     data = json.loads(body_data[:content_length])
                     assert data["body_hash"] == body_hash, f"Iteration {i}: body hash mismatch"
 
-    def test_keepalive_mixed_sizes(self, proxy):
+    async def test_keepalive_mixed_sizes(self, proxy):
         """Test keep-alive with alternating small and large requests"""
         context = ssl.create_default_context()
         context.check_hostname = False
@@ -1506,7 +1532,7 @@ class TestKeepAliveWithPayloads:
 class TestHTTPPipelining:
     """Test HTTP pipelining edge cases"""
 
-    def test_pipelined_posts(self, proxy):
+    async def test_pipelined_posts(self, proxy):
         """Test pipelined POST requests with bodies"""
         context = ssl.create_default_context()
         context.check_hostname = False

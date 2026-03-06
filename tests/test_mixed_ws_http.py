@@ -9,6 +9,7 @@ the typical real-world usage pattern (e.g., a web app making API calls + opening
 a WebSocket connection simultaneously).
 """
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -17,7 +18,6 @@ import socket
 import socketserver
 import ssl
 import struct
-import subprocess
 import sys
 import threading
 import time
@@ -26,6 +26,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 
 import pytest
+import pytest_asyncio
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_revpx import (
@@ -263,10 +264,15 @@ def make_ws_connection(port=MIXED_HTTPS_PORT, domain=MIXED_DOMAIN):
     return ssock
 
 
-def make_http_request(path="/api/test", method="GET", body=None, port=MIXED_HTTPS_PORT, domain=MIXED_DOMAIN, timeout=10.0):
-    """Make an HTTP request through the proxy and return (status, headers, body)"""
+async def make_http_request(path="/api/test", method="GET", body=None, port=MIXED_HTTPS_PORT, domain=MIXED_DOMAIN, timeout=10.0):
+    """Make an HTTP request through the proxy and return (status, headers, body)."""
     client = ProxyClient(host=domain, port=port)
-    return client.request(method=method, path=path, body=body, timeout=timeout)
+    return await client.request(method=method, path=path, body=body, timeout=timeout)
+
+
+def make_http_request_sync(path="/api/test", method="GET", body=None, port=MIXED_HTTPS_PORT, domain=MIXED_DOMAIN, timeout=10.0):
+    """Sync wrapper for worker threads that need to call the async helper."""
+    return asyncio.run(make_http_request(path=path, method=method, body=body, port=port, domain=domain, timeout=timeout))
 
 
 def read_http_response(ssock):
@@ -325,23 +331,49 @@ def wait_for_tcp_port(port: int, timeout: float = 5.0):
     raise RuntimeError(f"Port {port} not ready within {timeout}s (last error: {last_error})")
 
 
+async def async_wait_for_tcp_port(port: int, timeout: float = 5.0):
+    """Async variant of wait_for_tcp_port for async fixture setup."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    last_error = None
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                return
+        except OSError as exc:
+            last_error = exc
+            await asyncio.sleep(0.02)
+    raise RuntimeError(f"Port {port} not ready within {timeout}s (last error: {last_error})")
+
+
+async def async_stop_process(process: asyncio.subprocess.Process, timeout: float = 5.0):
+    process.terminate()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+
+
+pytestmark = pytest.mark.asyncio
+
+
 # ============================================================================
 # Fixtures
 # ============================================================================
 
-@pytest.fixture(scope="module")
-def mixed_backend():
+@pytest_asyncio.fixture(scope="module")
+async def mixed_backend():
     """Start a combined WS+HTTP backend"""
     server = ThreadedHTTPServer(("127.0.0.1", MIXED_BACKEND_PORT), MixedBackendHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    wait_for_tcp_port(MIXED_BACKEND_PORT, timeout=2.0)
+    await async_wait_for_tcp_port(MIXED_BACKEND_PORT, timeout=2.0)
     yield server
     server.shutdown()
 
 
-@pytest.fixture(scope="module")
-def mixed_proxy(mixed_backend):
+@pytest_asyncio.fixture(scope="module")
+async def mixed_proxy(mixed_backend):
     """Start a single revpx proxy that forwards to the combined backend"""
     config_file = os.path.join(PROJECT_ROOT, "tests", "test_mixed_config.json")
     config = [{
@@ -358,27 +390,24 @@ def mixed_proxy(mixed_backend):
     env["REVPX_PORT_PLAIN"] = str(MIXED_HTTP_PORT)
 
     binary = os.path.join(PROJECT_ROOT, "build", "revpx")
-    process = subprocess.Popen(
-        [binary, "-f", config_file],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+    process = await asyncio.create_subprocess_exec(
+        binary,
+        "-f",
+        config_file,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
         cwd=PROJECT_ROOT,
         env=env,
     )
-    wait_for_tcp_port(MIXED_HTTPS_PORT, timeout=5.0)
+    await async_wait_for_tcp_port(MIXED_HTTPS_PORT, timeout=5.0)
 
-    if process.poll() is not None:
-        stdout, stderr = process.communicate()
+    if process.returncode is not None:
+        stdout, stderr = await process.communicate()
         raise RuntimeError(f"Mixed proxy failed to start:\n{stdout.decode()}\n{stderr.decode()}")
 
     yield process
 
-    process.terminate()
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
+    await async_stop_process(process, timeout=5.0)
     if os.path.exists(config_file):
         os.remove(config_file)
 
@@ -399,11 +428,11 @@ class TestHTTPWhileWSOpen:
     makes HTTP API calls (e.g., fetching data, posting forms).
     """
 
-    def test_single_get_while_ws_idle(self, mixed_proxy):
+    async def test_single_get_while_ws_idle(self, mixed_proxy):
         """Open WS, leave it idle, make a single HTTP GET"""
         ws = make_ws_connection()
         try:
-            status, _, body = make_http_request("/api/data")
+            status, _, body = await make_http_request("/api/data")
             assert status == 200
             data = json.loads(body)
             assert data["method"] == "GET"
@@ -412,12 +441,12 @@ class TestHTTPWhileWSOpen:
             ws.sendall(ws_frame(b"", opcode=0x8))
             ws.close()
 
-    def test_multiple_gets_while_ws_idle(self, mixed_proxy):
+    async def test_multiple_gets_while_ws_idle(self, mixed_proxy):
         """Open WS, make several sequential HTTP GETs"""
         ws = make_ws_connection()
         try:
             for i in range(5):
-                status, _, body = make_http_request(f"/api/items/{i}")
+                status, _, body = await make_http_request(f"/api/items/{i}")
                 assert status == 200, f"Request {i}: expected 200, got {status}"
                 data = json.loads(body)
                 assert data["path"] == f"/api/items/{i}", f"Request {i}: wrong path"
@@ -425,12 +454,12 @@ class TestHTTPWhileWSOpen:
             ws.sendall(ws_frame(b"", opcode=0x8))
             ws.close()
 
-    def test_post_while_ws_idle(self, mixed_proxy):
+    async def test_post_while_ws_idle(self, mixed_proxy):
         """Open WS, make HTTP POST with body"""
         ws = make_ws_connection()
         try:
             post_body = b'{"key": "value", "number": 42}'
-            status, _, body = make_http_request("/api/create", method="POST", body=post_body)
+            status, _, body = await make_http_request("/api/create", method="POST", body=post_body)
             assert status == 200
             data = json.loads(body)
             assert data["method"] == "POST"
@@ -439,39 +468,39 @@ class TestHTTPWhileWSOpen:
             ws.sendall(ws_frame(b"", opcode=0x8))
             ws.close()
 
-    def test_mixed_methods_while_ws_idle(self, mixed_proxy):
+    async def test_mixed_methods_while_ws_idle(self, mixed_proxy):
         """Open WS, make GET/POST/PUT/DELETE requests"""
         ws = make_ws_connection()
         try:
             # GET
-            status, _, body = make_http_request("/api/resource")
+            status, _, body = await make_http_request("/api/resource")
             assert status == 200
             assert json.loads(body)["method"] == "GET"
 
             # POST
-            status, _, body = make_http_request("/api/resource", method="POST", body=b"post-data")
+            status, _, body = await make_http_request("/api/resource", method="POST", body=b"post-data")
             assert status == 200
             assert json.loads(body)["method"] == "POST"
 
             # PUT
-            status, _, body = make_http_request("/api/resource/1", method="PUT", body=b"put-data")
+            status, _, body = await make_http_request("/api/resource/1", method="PUT", body=b"put-data")
             assert status == 200
             assert json.loads(body)["method"] == "PUT"
 
             # DELETE
-            status, _, body = make_http_request("/api/resource/1", method="DELETE")
+            status, _, body = await make_http_request("/api/resource/1", method="DELETE")
             assert status == 200
             assert json.loads(body)["method"] == "DELETE"
         finally:
             ws.sendall(ws_frame(b"", opcode=0x8))
             ws.close()
 
-    def test_parallel_gets_while_ws_idle(self, mixed_proxy):
+    async def test_parallel_gets_while_ws_idle(self, mixed_proxy):
         """Open WS, make parallel HTTP GETs"""
         ws = make_ws_connection()
         try:
             def do_request(i):
-                return i, make_http_request(f"/api/parallel/{i}")
+                return i, make_http_request_sync(f"/api/parallel/{i}")
 
             with ThreadPoolExecutor(max_workers=5) as executor:
                 futures = [executor.submit(do_request, i) for i in range(10)]
@@ -497,7 +526,7 @@ class TestInterleavedWSAndHTTP:
     an HTTP fetch.
     """
 
-    def test_ws_echo_then_http_get(self, mixed_proxy):
+    async def test_ws_echo_then_http_get(self, mixed_proxy):
         """Send WS message, get echo, then make HTTP request"""
         ws = make_ws_connection()
         try:
@@ -508,7 +537,7 @@ class TestInterleavedWSAndHTTP:
             assert echoed == msg
 
             # HTTP request
-            status, _, body = make_http_request("/api/after-ws")
+            status, _, body = await make_http_request("/api/after-ws")
             assert status == 200
             data = json.loads(body)
             assert data["path"] == "/api/after-ws"
@@ -516,12 +545,12 @@ class TestInterleavedWSAndHTTP:
             ws.sendall(ws_frame(b"", opcode=0x8))
             ws.close()
 
-    def test_http_get_then_ws_echo(self, mixed_proxy):
+    async def test_http_get_then_ws_echo(self, mixed_proxy):
         """Make HTTP request, then send/receive WS message"""
         ws = make_ws_connection()
         try:
             # HTTP request first
-            status, _, body = make_http_request("/api/before-ws")
+            status, _, body = await make_http_request("/api/before-ws")
             assert status == 200
 
             # Then WS echo
@@ -533,7 +562,7 @@ class TestInterleavedWSAndHTTP:
             ws.sendall(ws_frame(b"", opcode=0x8))
             ws.close()
 
-    def test_alternating_ws_and_http(self, mixed_proxy):
+    async def test_alternating_ws_and_http(self, mixed_proxy):
         """Alternate between WS messages and HTTP requests"""
         ws = make_ws_connection()
         try:
@@ -545,7 +574,7 @@ class TestInterleavedWSAndHTTP:
                 assert echoed == msg, f"WS round {i}: expected {msg!r}, got {echoed!r}"
 
                 # HTTP request
-                status, _, body = make_http_request(f"/api/interleaved/{i}")
+                status, _, body = await make_http_request(f"/api/interleaved/{i}")
                 assert status == 200, f"HTTP round {i}: expected 200, got {status}"
                 data = json.loads(body)
                 assert data["path"] == f"/api/interleaved/{i}"
@@ -553,7 +582,7 @@ class TestInterleavedWSAndHTTP:
             ws.sendall(ws_frame(b"", opcode=0x8))
             ws.close()
 
-    def test_ws_echo_during_http_request(self, mixed_proxy):
+    async def test_ws_echo_during_http_request(self, mixed_proxy):
         """
         Send a WS message and make an HTTP request concurrently.
         This simulates a real app where the server pushes a WS notification
@@ -576,7 +605,7 @@ class TestInterleavedWSAndHTTP:
             def http_requests():
                 try:
                     for i in range(3):
-                        status, _, body = make_http_request(f"/api/concurrent/{i}")
+                        status, _, body = make_http_request_sync(f"/api/concurrent/{i}")
                         if status != 200:
                             errors.append(f"HTTP {i}: expected 200, got {status}")
                         else:
@@ -612,7 +641,7 @@ class TestMultipleWSAndHTTP:
     their own WebSocket connection, plus HTTP API traffic.
     """
 
-    def test_two_ws_connections_plus_http(self, mixed_proxy):
+    async def test_two_ws_connections_plus_http(self, mixed_proxy):
         """Two concurrent WS connections + HTTP requests"""
         ws1 = make_ws_connection()
         ws2 = make_ws_connection()
@@ -622,7 +651,7 @@ class TestMultipleWSAndHTTP:
             assert read_ws_frame(ws1) == b"ws1-hello"
 
             # HTTP request
-            status, _, body = make_http_request("/api/with-two-ws")
+            status, _, body = await make_http_request("/api/with-two-ws")
             assert status == 200
 
             # Echo on WS2
@@ -630,7 +659,7 @@ class TestMultipleWSAndHTTP:
             assert read_ws_frame(ws2) == b"ws2-hello"
 
             # Another HTTP request
-            status, _, body = make_http_request("/api/with-two-ws-2")
+            status, _, body = await make_http_request("/api/with-two-ws-2")
             assert status == 200
         finally:
             for ws in (ws1, ws2):
@@ -640,7 +669,7 @@ class TestMultipleWSAndHTTP:
                     pass
                 ws.close()
 
-    def test_many_ws_connections_with_http_traffic(self, mixed_proxy):
+    async def test_many_ws_connections_with_http_traffic(self, mixed_proxy):
         """Open several WS connections and make HTTP requests in between"""
         ws_connections = []
         try:
@@ -649,7 +678,7 @@ class TestMultipleWSAndHTTP:
                 ws_connections.append(ws)
 
                 # HTTP request after each WS connection
-                status, _, body = make_http_request(f"/api/multi-ws/{i}")
+                status, _, body = await make_http_request(f"/api/multi-ws/{i}")
                 assert status == 200, f"HTTP after WS {i}: expected 200, got {status}"
 
             # Verify all WS connections still work
@@ -661,7 +690,7 @@ class TestMultipleWSAndHTTP:
 
             # More HTTP requests with all WS open
             for i in range(5):
-                status, _, body = make_http_request(f"/api/all-ws-open/{i}")
+                status, _, body = await make_http_request(f"/api/all-ws-open/{i}")
                 assert status == 200, f"HTTP {i} with all WS open: expected 200, got {status}"
         finally:
             for ws in ws_connections:
@@ -671,7 +700,7 @@ class TestMultipleWSAndHTTP:
                     pass
                 ws.close()
 
-    def test_parallel_ws_and_http_connections(self, mixed_proxy):
+    async def test_parallel_ws_and_http_connections(self, mixed_proxy):
         """Open WS and HTTP connections in parallel threads"""
         errors = []
         ws_connections = []
@@ -692,7 +721,7 @@ class TestMultipleWSAndHTTP:
 
         def make_http(i):
             try:
-                status, _, body = make_http_request(f"/api/parallel-mix/{i}")
+                status, _, body = make_http_request_sync(f"/api/parallel-mix/{i}")
                 if status != 200:
                     errors.append(f"HTTP {i}: status {status}")
             except Exception as e:
@@ -728,7 +757,7 @@ class TestHTTPKeepAliveWithWS:
     because browsers reuse HTTP connections for multiple API calls.
     """
 
-    def test_keepalive_gets_while_ws_open(self, mixed_proxy):
+    async def test_keepalive_gets_while_ws_open(self, mixed_proxy):
         """Multiple GETs on a keep-alive connection while WS is open"""
         ws = make_ws_connection()
         try:
@@ -752,7 +781,7 @@ class TestHTTPKeepAliveWithWS:
             ws.sendall(ws_frame(b"", opcode=0x8))
             ws.close()
 
-    def test_keepalive_mixed_methods_with_ws(self, mixed_proxy):
+    async def test_keepalive_mixed_methods_with_ws(self, mixed_proxy):
         """GET and POST on keep-alive while WS is open"""
         ws = make_ws_connection()
         try:
@@ -796,7 +825,7 @@ class TestHTTPKeepAliveWithWS:
             ws.sendall(ws_frame(b"", opcode=0x8))
             ws.close()
 
-    def test_keepalive_with_ws_messages_between(self, mixed_proxy):
+    async def test_keepalive_with_ws_messages_between(self, mixed_proxy):
         """HTTP keep-alive requests interleaved with WS messages"""
         ws = make_ws_connection()
         try:
@@ -823,7 +852,7 @@ class TestHTTPKeepAliveWithWS:
             ws.sendall(ws_frame(b"", opcode=0x8))
             ws.close()
 
-    def test_two_keepalive_connections_with_ws(self, mixed_proxy):
+    async def test_two_keepalive_connections_with_ws(self, mixed_proxy):
         """Two HTTP keep-alive connections + WS connection"""
         ws = make_ws_connection()
         try:
@@ -863,7 +892,7 @@ class TestRapidWSCyclingWithHTTP:
     where each page opens a new WS connection and closes the old one.
     """
 
-    def test_ws_open_close_then_http(self, mixed_proxy):
+    async def test_ws_open_close_then_http(self, mixed_proxy):
         """Open WS, close it, then make HTTP request"""
         ws = make_ws_connection()
         ws.sendall(ws_frame(b"quick-msg"))
@@ -873,13 +902,13 @@ class TestRapidWSCyclingWithHTTP:
         ws.close()
 
         # HTTP after WS close
-        status, _, body = make_http_request("/api/after-ws-close")
+        status, _, body = await make_http_request("/api/after-ws-close")
         assert status == 200
         assert json.loads(body)["path"] == "/api/after-ws-close"
 
-    def test_http_then_ws_open_close(self, mixed_proxy):
+    async def test_http_then_ws_open_close(self, mixed_proxy):
         """Make HTTP request, then open and close WS"""
-        status, _, body = make_http_request("/api/before-ws-open")
+        status, _, body = await make_http_request("/api/before-ws-open")
         assert status == 200
 
         ws = make_ws_connection()
@@ -889,7 +918,7 @@ class TestRapidWSCyclingWithHTTP:
         ws.sendall(ws_frame(b"", opcode=0x8))
         ws.close()
 
-    def test_repeated_ws_cycle_with_http(self, mixed_proxy):
+    async def test_repeated_ws_cycle_with_http(self, mixed_proxy):
         """Repeatedly open WS, use it, close it, make HTTP request"""
         for i in range(5):
             # Open WS
@@ -902,10 +931,10 @@ class TestRapidWSCyclingWithHTTP:
             ws.close()
 
             # HTTP request
-            status, _, body = make_http_request(f"/api/cycle/{i}")
+            status, _, body = await make_http_request(f"/api/cycle/{i}")
             assert status == 200, f"Cycle {i} HTTP: expected 200, got {status}"
 
-    def test_ws_replace_with_http_between(self, mixed_proxy):
+    async def test_ws_replace_with_http_between(self, mixed_proxy):
         """Close old WS, make HTTP request, open new WS - simulates page nav"""
         ws = make_ws_connection()
         try:
@@ -916,7 +945,7 @@ class TestRapidWSCyclingWithHTTP:
             ws.close()
 
         # Page navigation: fetch page data
-        status, _, body = make_http_request("/api/page2/data")
+        status, _, body = await make_http_request("/api/page2/data")
         assert status == 200
 
         # Open new WS for page 2
@@ -926,7 +955,7 @@ class TestRapidWSCyclingWithHTTP:
             assert read_ws_frame(ws) == b"page2-msg"
 
             # Make API call while new WS is open
-            status, _, body = make_http_request("/api/page2/extra")
+            status, _, body = await make_http_request("/api/page2/extra")
             assert status == 200
         finally:
             ws.sendall(ws_frame(b"", opcode=0x8))
@@ -943,14 +972,14 @@ class TestLargePayloadsWithWS:
     while WebSocket connections are active.
     """
 
-    def test_large_post_while_ws_open(self, mixed_proxy):
+    async def test_large_post_while_ws_open(self, mixed_proxy):
         """POST with large body while WS connection is active"""
         ws = make_ws_connection()
         try:
             large_body = os.urandom(50 * 1024)  # 50KB
             body_hash = hashlib.md5(large_body).hexdigest()
 
-            status, _, resp_body = make_http_request("/api/large-post", method="POST", body=large_body)
+            status, _, resp_body = await make_http_request("/api/large-post", method="POST", body=large_body)
             assert status == 200
             data = json.loads(resp_body)
             assert data["body_length"] == len(large_body)
@@ -959,7 +988,7 @@ class TestLargePayloadsWithWS:
             ws.sendall(ws_frame(b"", opcode=0x8))
             ws.close()
 
-    def test_large_ws_frame_then_http(self, mixed_proxy):
+    async def test_large_ws_frame_then_http(self, mixed_proxy):
         """Send large WS frame, then make HTTP request"""
         ws = make_ws_connection()
         try:
@@ -970,13 +999,13 @@ class TestLargePayloadsWithWS:
             assert echoed == large_msg
 
             # HTTP request should still work
-            status, _, body = make_http_request("/api/after-large-ws")
+            status, _, body = await make_http_request("/api/after-large-ws")
             assert status == 200
         finally:
             ws.sendall(ws_frame(b"", opcode=0x8))
             ws.close()
 
-    def test_concurrent_large_http_and_ws_traffic(self, mixed_proxy):
+    async def test_concurrent_large_http_and_ws_traffic(self, mixed_proxy):
         """Large WS messages and large HTTP bodies concurrently"""
         ws = make_ws_connection()
         errors = []
@@ -997,7 +1026,7 @@ class TestLargePayloadsWithWS:
                     for i in range(3):
                         body = os.urandom(20 * 1024)
                         body_hash = hashlib.md5(body).hexdigest()
-                        status, _, resp = make_http_request(f"/api/large-concurrent/{i}", method="POST", body=body)
+                        status, _, resp = make_http_request_sync(f"/api/large-concurrent/{i}", method="POST", body=body)
                         if status != 200:
                             errors.append(f"HTTP large {i}: status {status}")
                         else:
@@ -1034,7 +1063,7 @@ class TestWSFollowedByHTTPSameConnection:
     But the proxy should handle this gracefully.)
     """
 
-    def test_ws_and_http_on_separate_connections(self, mixed_proxy):
+    async def test_ws_and_http_on_separate_connections(self, mixed_proxy):
         """Verify WS and HTTP work fine on separate connections to same proxy"""
         # This is the basic sanity check for the whole test suite
         ws = make_ws_connection()
@@ -1046,7 +1075,7 @@ class TestWSFollowedByHTTPSameConnection:
             ws.sendall(ws_frame(b"", opcode=0x8))
             ws.close()
 
-        status, _, body = make_http_request("/api/sanity-check")
+        status, _, body = await make_http_request("/api/sanity-check")
         assert status == 200
         data = json.loads(body)
         assert data["path"] == "/api/sanity-check"
@@ -1062,7 +1091,7 @@ class TestMixedTrafficStress:
     connections and requests to try to trigger issues.
     """
 
-    def test_many_parallel_http_with_active_ws(self, mixed_proxy):
+    async def test_many_parallel_http_with_active_ws(self, mixed_proxy):
         """20 parallel HTTP requests while WS connection has active traffic"""
         ws = make_ws_connection()
         errors = []
@@ -1088,11 +1117,11 @@ class TestMixedTrafficStress:
 
         try:
             # Give WS thread a moment to start
-            time.sleep(0.1)
+            await asyncio.sleep(0.1)
 
             def do_http(i):
                 try:
-                    status, _, body = make_http_request(f"/api/stress/{i}")
+                    status, _, body = make_http_request_sync(f"/api/stress/{i}")
                     return i, status, json.loads(body)["path"]
                 except Exception as e:
                     return i, -1, str(e)
@@ -1116,7 +1145,7 @@ class TestMixedTrafficStress:
 
         assert not errors, f"WS errors during stress: {errors}"
 
-    def test_sequential_ws_http_many_rounds(self, mixed_proxy):
+    async def test_sequential_ws_http_many_rounds(self, mixed_proxy):
         """Many rounds of: open WS, exchange message, close WS, make HTTP request"""
         for i in range(10):
             ws = make_ws_connection()
@@ -1129,10 +1158,10 @@ class TestMixedTrafficStress:
                 ws.sendall(ws_frame(b"", opcode=0x8))
                 ws.close()
 
-            status, _, body = make_http_request(f"/api/round/{i}")
+            status, _, body = await make_http_request(f"/api/round/{i}")
             assert status == 200, f"Round {i} HTTP: status {status}"
 
-    def test_burst_mixed_connections(self, mixed_proxy):
+    async def test_burst_mixed_connections(self, mixed_proxy):
         """Burst of mixed WS and HTTP connections"""
         errors = []
         ws_connections = []
@@ -1155,7 +1184,7 @@ class TestMixedTrafficStress:
 
         def burst_http(i):
             try:
-                status, _, body = make_http_request(f"/api/burst/{i}")
+                status, _, body = make_http_request_sync(f"/api/burst/{i}")
                 if status != 200:
                     errors.append(f"Burst HTTP {i}: status {status}")
                 return True
@@ -1195,21 +1224,21 @@ class TestMixedEdgeCases:
     - Connection abandonment during page navigation
     """
 
-    def test_abrupt_ws_close_then_http(self, mixed_proxy):
+    async def test_abrupt_ws_close_then_http(self, mixed_proxy):
         """Close WS connection without close frame, then make HTTP request"""
         ws = make_ws_connection()
         ws.sendall(ws_frame(b"before-abrupt-close"))
         read_ws_frame(ws)
         # Abrupt close - no close frame
         ws.close()
-        time.sleep(0.2)
+        await asyncio.sleep(0.2)
 
         # HTTP should still work
-        status, _, body = make_http_request("/api/after-abrupt-ws")
+        status, _, body = await make_http_request("/api/after-abrupt-ws")
         assert status == 200
         assert json.loads(body)["path"] == "/api/after-abrupt-ws"
 
-    def test_abrupt_ws_close_with_rst_then_http(self, mixed_proxy):
+    async def test_abrupt_ws_close_with_rst_then_http(self, mixed_proxy):
         """Force RST on WS connection, then make HTTP request"""
         ws = make_ws_connection()
         ws.sendall(ws_frame(b"before-rst"))
@@ -1222,14 +1251,14 @@ class TestMixedEdgeCases:
             underlying.close()
         except Exception:
             ws.close()
-        time.sleep(0.3)
+        await asyncio.sleep(0.3)
 
         # HTTP should still work
-        status, _, body = make_http_request("/api/after-rst-ws")
+        status, _, body = await make_http_request("/api/after-rst-ws")
         assert status == 200
         assert json.loads(body)["path"] == "/api/after-rst-ws"
 
-    def test_http_pipelining_while_ws_active(self, mixed_proxy):
+    async def test_http_pipelining_while_ws_active(self, mixed_proxy):
         """Send multiple HTTP requests pipelined (without waiting for responses)
         while a WS connection is active"""
         ws = make_ws_connection()
@@ -1259,7 +1288,7 @@ class TestMixedEdgeCases:
             ws.sendall(ws_frame(b"", opcode=0x8))
             ws.close()
 
-    def test_http_pipelining_post_while_ws_active(self, mixed_proxy):
+    async def test_http_pipelining_post_while_ws_active(self, mixed_proxy):
         """Pipeline POST requests with bodies while WS active"""
         ws = make_ws_connection()
         try:
@@ -1289,7 +1318,7 @@ class TestMixedEdgeCases:
             ws.sendall(ws_frame(b"", opcode=0x8))
             ws.close()
 
-    def test_ws_active_during_http_pipelining_mixed(self, mixed_proxy):
+    async def test_ws_active_during_http_pipelining_mixed(self, mixed_proxy):
         """Pipeline GET+POST+GET while WS is exchanging messages"""
         ws = make_ws_connection()
         errors = []
@@ -1351,7 +1380,7 @@ class TestMixedEdgeCases:
                 pass
             ws.close()
 
-    def test_page_navigation_simulation(self, mixed_proxy):
+    async def test_page_navigation_simulation(self, mixed_proxy):
         """
         Simulate realistic SPA page navigation:
         1. Load page 1: HTTP GET + open WS
@@ -1361,7 +1390,7 @@ class TestMixedEdgeCases:
         """
         for page in range(1, 4):
             # "Load" the page
-            status, _, body = make_http_request(f"/page/{page}")
+            status, _, body = await make_http_request(f"/page/{page}")
             assert status == 200, f"Page {page} load: status {status}"
 
             # Open WS for this page
@@ -1369,7 +1398,7 @@ class TestMixedEdgeCases:
             try:
                 # Make some API calls while WS is open
                 for i in range(3):
-                    status, _, body = make_http_request(f"/api/page{page}/data/{i}")
+                    status, _, body = await make_http_request(f"/api/page{page}/data/{i}")
                     assert status == 200, f"Page {page} API {i}: status {status}"
 
                 # WS activity
@@ -1382,13 +1411,13 @@ class TestMixedEdgeCases:
                 if page < 3:
                     # Abrupt close (simulating navigation)
                     ws.close()
-                    time.sleep(0.1)
+                    await asyncio.sleep(0.1)
                 else:
                     # Clean close on last page
                     ws.sendall(ws_frame(b"", opcode=0x8))
                     ws.close()
 
-    def test_ws_established_after_keepalive_requests(self, mixed_proxy):
+    async def test_ws_established_after_keepalive_requests(self, mixed_proxy):
         """
         Make several keep-alive HTTP requests, then open WS, then more HTTP.
         This simulates an app that loads data first, then establishes WS.
@@ -1413,13 +1442,13 @@ class TestMixedEdgeCases:
 
             # More HTTP requests while WS open
             for i in range(3):
-                status, _, body = make_http_request(f"/api/post-ws/{i}")
+                status, _, body = await make_http_request(f"/api/post-ws/{i}")
                 assert status == 200, f"Post-WS {i}: status {status}"
         finally:
             ws.sendall(ws_frame(b"", opcode=0x8))
             ws.close()
 
-    def test_ws_and_http_keepalive_concurrent(self, mixed_proxy):
+    async def test_ws_and_http_keepalive_concurrent(self, mixed_proxy):
         """
         HTTP keep-alive connection and WS connection used concurrently.
         Both threads actively send/receive at the same time.
@@ -1483,7 +1512,7 @@ class TestMixedEdgeCases:
 
         assert not errors, f"Concurrent ka errors: {errors}"
 
-    def test_ws_high_frequency_with_http(self, mixed_proxy):
+    async def test_ws_high_frequency_with_http(self, mixed_proxy):
         """
         High frequency WS messages (no delay) while HTTP requests also happen.
         Tests that rapid WS traffic doesn't starve HTTP connections.
@@ -1512,7 +1541,7 @@ class TestMixedEdgeCases:
                 for i in range(5):
                     if stop.is_set():
                         break
-                    status, _, body = make_http_request(f"/api/during-rapid-ws/{i}")
+                    status, _, body = make_http_request_sync(f"/api/during-rapid-ws/{i}")
                     if status != 200:
                         errors.append(f"HTTP during rapid WS {i}: status {status}")
                     time.sleep(0.05)
@@ -1535,7 +1564,7 @@ class TestMixedEdgeCases:
 
         assert not errors, f"Rapid WS + HTTP errors: {errors}"
 
-    def test_multiple_keepalive_connections_with_ws_lifecycle(self, mixed_proxy):
+    async def test_multiple_keepalive_connections_with_ws_lifecycle(self, mixed_proxy):
         """
         Multiple HTTP keep-alive connections + WS lifecycle (open/close/reopen).
         Simulates a real browser session with connection pooling.
@@ -1605,7 +1634,7 @@ class TestMixedEdgeCases:
             ka1.close()
             ka2.close()
 
-    def test_http_post_with_body_close_to_buffer_boundary_with_ws(self, mixed_proxy):
+    async def test_http_post_with_body_close_to_buffer_boundary_with_ws(self, mixed_proxy):
         """POST with body sizes near 32KB buffer boundary while WS active"""
         ws = make_ws_connection()
         try:
@@ -1614,7 +1643,7 @@ class TestMixedEdgeCases:
                 body = os.urandom(size)
                 body_hash = hashlib.md5(body).hexdigest()
 
-                status, _, resp = make_http_request(
+                status, _, resp = await make_http_request(
                     f"/api/boundary/{size}", method="POST", body=body, timeout=15
                 )
                 assert status == 200, f"Size {size}: expected 200, got {status}"
@@ -1631,7 +1660,7 @@ class TestMixedEdgeCases:
             ws.sendall(ws_frame(b"", opcode=0x8))
             ws.close()
 
-    def test_ws_abrupt_close_during_active_http_keepalive(self, mixed_proxy):
+    async def test_ws_abrupt_close_during_active_http_keepalive(self, mixed_proxy):
         """WS connection is abruptly closed while HTTP keep-alive requests are in flight"""
         ws = make_ws_connection()
         ws.sendall(ws_frame(b"setup"))
@@ -1648,7 +1677,7 @@ class TestMixedEdgeCases:
 
             # Abruptly close WS mid-session
             ws.close()
-            time.sleep(0.1)
+            await asyncio.sleep(0.1)
 
             # HTTP keep-alive should still work
             ssock.sendall(
@@ -1668,7 +1697,7 @@ class TestMixedEdgeCases:
         finally:
             ssock.close()
 
-    def test_many_ws_open_close_cycles_with_continuous_http(self, mixed_proxy):
+    async def test_many_ws_open_close_cycles_with_continuous_http(self, mixed_proxy):
         """
         Rapidly cycle WS connections while HTTP traffic is continuous.
         This is the most realistic simulation of SPA navigation.
@@ -1682,7 +1711,7 @@ class TestMixedEdgeCases:
                 for i in range(20):
                     if stop.is_set():
                         break
-                    status, _, body = make_http_request(f"/api/continuous/{i}")
+                    status, _, body = make_http_request_sync(f"/api/continuous/{i}")
                     if status != 200:
                         errors.append(f"Continuous HTTP {i}: status {status}")
                     time.sleep(0.05)

@@ -13,6 +13,7 @@ Covers untested code paths:
 - Connection lifecycle edge cases
 """
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -20,7 +21,6 @@ import os
 import socket
 import ssl
 import struct
-import subprocess
 import sys
 import threading
 import time
@@ -28,6 +28,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 
 import pytest
+import pytest_asyncio
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_revpx import (
@@ -46,29 +47,43 @@ from test_revpx import (
 )
 
 
+EDGE_HTTPS_PORT = 19443
+EDGE_HTTP_PORT = 19480
+EDGE_BACKEND_PORT = 19400
+
+# Shadow imported defaults so this module can run in parallel with test_revpx.py.
+HTTPS_PORT = EDGE_HTTPS_PORT
+HTTP_PORT = EDGE_HTTP_PORT
+BACKEND_PORT = EDGE_BACKEND_PORT
+
+
 # ============================================================================
 # Fixtures
 # ============================================================================
 
-@pytest.fixture(scope="module")
-def backend():
+@pytest_asyncio.fixture(scope="module")
+async def backend():
     server = BackendServer(BACKEND_PORT)
-    server.start()
+    await asyncio.to_thread(server.start)
     yield server
-    server.stop()
+    await asyncio.to_thread(server.stop)
 
 
-@pytest.fixture(scope="module")
-def proxy(backend):
-    p = RevPxProxy()
-    p.start()
+@pytest_asyncio.fixture(scope="module")
+async def proxy(backend):
+    p = RevPxProxy(
+        https_port=HTTPS_PORT,
+        http_port=HTTP_PORT,
+        backend_port=BACKEND_PORT,
+    )
+    await p.start()
     yield p
-    p.stop()
+    await p.stop()
 
 
 @pytest.fixture
 def client(proxy):
-    return ProxyClient()
+    return ProxyClient(port=HTTPS_PORT)
 
 
 @pytest.fixture(autouse=True)
@@ -105,6 +120,24 @@ class RawSSLClient:
                     return response
         except Exception:
             return None
+
+
+pytestmark = pytest.mark.asyncio
+
+
+async def async_send_raw(raw: RawSSLClient, data: bytes, timeout: float = 5.0) -> Optional[bytes]:
+    return await asyncio.to_thread(raw.send_raw, data, timeout)
+
+
+async def async_request(
+    client: ProxyClient,
+    method: str = "GET",
+    path: str = "/",
+    headers: dict | None = None,
+    body: bytes | None = None,
+    timeout: float = 10.0,
+) -> tuple[int, dict, bytes]:
+    return await client.request(method, path, headers, body, timeout)
 
 
 _SOCKET_RESPONSE_BUFFER = {}
@@ -170,6 +203,52 @@ def wait_for_tcp_port(port: int, timeout: float = 5.0):
     raise RuntimeError(f"Port {port} not ready within {timeout}s (last error: {last_error})")
 
 
+async def async_wait_for_tcp_port(port: int, timeout: float = 5.0):
+    """Async variant of wait_for_tcp_port for async test paths."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    last_error = None
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                return
+        except OSError as exc:
+            last_error = exc
+            await asyncio.sleep(0.02)
+    raise RuntimeError(f"Port {port} not ready within {timeout}s (last error: {last_error})")
+
+
+async def async_start_revpx(config_file: str, https_port: int, http_port: int) -> asyncio.subprocess.Process:
+    env = os.environ.copy()
+    env["REVPX_PORT"] = str(https_port)
+    env["REVPX_PORT_PLAIN"] = str(http_port)
+
+    process = await asyncio.create_subprocess_exec(
+        REVPX_BINARY,
+        "-f",
+        config_file,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=PROJECT_ROOT,
+        env=env,
+    )
+    await async_wait_for_tcp_port(https_port, timeout=5.0)
+
+    if process.returncode is not None:
+        stdout, stderr = await process.communicate()
+        raise RuntimeError(f"Proxy failed to start:\n{stdout.decode()}\n{stderr.decode()}")
+
+    return process
+
+
+async def async_stop_process(process: asyncio.subprocess.Process, timeout: float = 5.0):
+    process.terminate()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+
+
 # ============================================================================
 # 1. TestForwardedHeaders
 # ============================================================================
@@ -177,9 +256,9 @@ def wait_for_tcp_port(port: int, timeout: float = 5.0):
 class TestForwardedHeaders:
     """Verify X-Forwarded-* header injection by the proxy"""
 
-    def test_x_forwarded_for_injected(self, client):
+    async def test_x_forwarded_for_injected(self, client):
         """Proxy should inject X-Forwarded-For with client IP"""
-        status, _, body = client.request("GET", "/fwd-test")
+        status, _, body = await async_request(client, "GET", "/fwd-test")
         assert status == 200
         data = json.loads(body)
         xff = data["headers"].get("X-Forwarded-For", "")
@@ -187,42 +266,42 @@ class TestForwardedHeaders:
         # Should be a valid IP (127.0.0.1 or ::1)
         assert "127.0.0.1" in xff or "::1" in xff
 
-    def test_x_real_ip_injected(self, client):
+    async def test_x_real_ip_injected(self, client):
         """Proxy should inject X-Real-IP"""
-        status, _, body = client.request("GET", "/fwd-test")
+        status, _, body = await async_request(client, "GET", "/fwd-test")
         assert status == 200
         data = json.loads(body)
         xri = data["headers"].get("X-Real-Ip", data["headers"].get("X-Real-IP", ""))
         assert xri != "", "X-Real-IP header should be injected"
 
-    def test_x_forwarded_proto_is_https(self, client):
+    async def test_x_forwarded_proto_is_https(self, client):
         """Proxy should set X-Forwarded-Proto to https"""
-        status, _, body = client.request("GET", "/fwd-test")
+        status, _, body = await async_request(client, "GET", "/fwd-test")
         assert status == 200
         data = json.loads(body)
         proto = data["headers"].get("X-Forwarded-Proto", "")
         assert proto == "https"
 
-    def test_x_forwarded_host_injected(self, client):
+    async def test_x_forwarded_host_injected(self, client):
         """Proxy should inject X-Forwarded-Host matching the Host header"""
-        status, _, body = client.request("GET", "/fwd-test")
+        status, _, body = await async_request(client, "GET", "/fwd-test")
         assert status == 200
         data = json.loads(body)
         xfh = data["headers"].get("X-Forwarded-Host", "")
         assert TEST_DOMAIN in xfh
 
-    def test_forwarded_header_injected(self, client):
+    async def test_forwarded_header_injected(self, client):
         """Proxy should inject RFC 7239 Forwarded header"""
-        status, _, body = client.request("GET", "/fwd-test")
+        status, _, body = await async_request(client, "GET", "/fwd-test")
         assert status == 200
         data = json.loads(body)
         fwd = data["headers"].get("Forwarded", "")
         assert "proto=https" in fwd
         assert "for=" in fwd
 
-    def test_forwarded_ipv6_for_value_is_quoted_or_bracketed(self, client):
+    async def test_forwarded_ipv6_for_value_is_quoted_or_bracketed(self, client):
         """RFC 7239: IPv6-like for= values must be quoted/bracketed, not raw tokens."""
-        status, _, body = client.request("GET", "/fwd-rfc7239")
+        status, _, body = await async_request(client, "GET", "/fwd-rfc7239")
         assert status == 200
         data = json.loads(body)
         fwd = data["headers"].get("Forwarded", "")
@@ -249,7 +328,7 @@ class TestForwardedHeaders:
         assert is_quoted or is_bracketed, \
             f"Forwarded for= value is not RFC-compliant for IPv6-like address: {value!r}"
 
-    def test_forwarded_host_with_port_is_quoted(self, proxy):
+    async def test_forwarded_host_with_port_is_quoted(self, proxy):
         """RFC 7239: host= value containing ':' (host:port) should be quoted."""
         raw = RawSSLClient()
         request = (
@@ -258,7 +337,7 @@ class TestForwardedHeaders:
             f"\r\n"
         ).encode()
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None and b"200" in response
 
         req = BackendHandler.captured_requests[-1]
@@ -272,14 +351,14 @@ class TestForwardedHeaders:
         assert host_value.startswith('"') and host_value.endswith('"'), \
             f"Forwarded host= is not quoted for host:port value: {host_value!r}"
 
-    def test_existing_forwarded_headers_stripped(self, client):
+    async def test_existing_forwarded_headers_stripped(self, client):
         """Proxy should strip pre-existing forwarded headers to prevent spoofing"""
         spoofed_headers = {
             "X-Forwarded-For": "1.2.3.4",
             "X-Real-IP": "1.2.3.4",
             "X-Forwarded-Proto": "http",
         }
-        status, _, body = client.request("GET", "/fwd-test", headers=spoofed_headers)
+        status, _, body = await async_request(client, "GET", "/fwd-test", headers=spoofed_headers)
         assert status == 200
         data = json.loads(body)
 
@@ -293,7 +372,7 @@ class TestForwardedHeaders:
         assert xri != "1.2.3.4", "X-Real-IP should be overwritten with actual client IP"
         assert proto == "https", "X-Forwarded-Proto should be overwritten to https"
 
-    def test_spoofed_xff_value_is_not_preserved(self, client):
+    async def test_spoofed_xff_value_is_not_preserved(self, client):
         """Spoofed X-Forwarded-For must be removed, not carried over."""
         spoofed_headers = {
             "X-Forwarded-For": "203.0.113.10",
@@ -301,7 +380,7 @@ class TestForwardedHeaders:
             "Forwarded": "for=203.0.113.10;proto=http",
         }
 
-        status, _, body = client.request("GET", "/fwd-spoof", headers=spoofed_headers)
+        status, _, body = await async_request(client, "GET", "/fwd-spoof", headers=spoofed_headers)
         assert status == 200
         data = json.loads(body)
 
@@ -314,7 +393,7 @@ class TestForwardedHeaders:
         assert "203.0.113.10" not in forwarded, \
             "Spoofed Forwarded value leaked into backend-visible header"
 
-    def test_forwarded_headers_on_keepalive(self, proxy):
+    async def test_forwarded_headers_on_keepalive(self, proxy):
         """Forwarded headers should be injected on each keep-alive request"""
         ssock = make_ssl_connection()
         try:
@@ -866,9 +945,9 @@ WS_MISSING_CONN_UPGRADE_DOMAIN = "wsmissconn.localhost"
 WS_MISSING_UPGRADE_DOMAIN = "wsmissup.localhost"
 
 
-@pytest.fixture(scope="module")
-def ws_proxy(ws_backend, ws_reject_backend, ws_fragmented_backend, ws_dup_conn_backend, ws_raw_dup_conn_backend,
-             ws_raw_dup_upgrade_backend, ws_missing_conn_upgrade_backend, ws_missing_upgrade_backend):
+@pytest_asyncio.fixture(scope="module")
+async def ws_proxy(ws_backend, ws_reject_backend, ws_fragmented_backend, ws_dup_conn_backend, ws_raw_dup_conn_backend,
+                   ws_raw_dup_upgrade_backend, ws_missing_conn_upgrade_backend, ws_missing_upgrade_backend):
     """Proxy configured with WebSocket backend domains"""
     p = RevPxProxy(
         https_port=18543,
@@ -931,32 +1010,11 @@ def ws_proxy(ws_backend, ws_reject_backend, ws_fragmented_backend, ws_dup_conn_b
     with open(config_file, "w") as f:
         json.dump(config, f)
 
-    import subprocess
-    env = os.environ.copy()
-    env["REVPX_PORT"] = "18543"
-    env["REVPX_PORT_PLAIN"] = "18580"
-
-    binary = os.path.join(PROJECT_ROOT, "build", "revpx")
-    process = subprocess.Popen(
-        [binary, "-f", config_file],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        cwd=PROJECT_ROOT,
-        env=env,
-    )
-    wait_for_tcp_port(18543, timeout=5.0)
-    if process.poll() is not None:
-        stdout, stderr = process.communicate()
-        raise RuntimeError(f"WS proxy failed to start:\n{stdout.decode()}\n{stderr.decode()}")
+    process = await async_start_revpx(config_file, https_port=18543, http_port=18580)
 
     yield process
 
-    process.terminate()
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
+    await async_stop_process(process, timeout=5.0)
     if os.path.exists(config_file):
         os.remove(config_file)
 
@@ -1010,7 +1068,7 @@ def read_ws_frame(ssock) -> bytes:
 class TestWebSocket:
     """Test WebSocket upgrade and tunneling"""
 
-    def test_upgrade_header_without_connection_upgrade_token_is_not_forced_ws(self, proxy):
+    async def test_upgrade_header_without_connection_upgrade_token_is_not_forced_ws(self, proxy):
         """A request with Upgrade:websocket but without Connection: Upgrade should remain normal HTTP."""
         raw = RawSSLClient()
         request = (
@@ -1021,12 +1079,12 @@ class TestWebSocket:
             f"\r\n"
         ).encode()
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         assert b"200" in response.split(b"\r\n", 1)[0], \
             f"False WebSocket detection: expected normal HTTP response, got {response[:160]}"
 
-    def test_upgrade_header_prefix_websocketx_is_not_treated_as_websocket(self, proxy):
+    async def test_upgrade_header_prefix_websocketx_is_not_treated_as_websocket(self, proxy):
         """Upgrade token must match exactly websocket, not websocketX prefix variants."""
         raw = RawSSLClient()
         request = (
@@ -1037,12 +1095,12 @@ class TestWebSocket:
             f"\r\n"
         ).encode()
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         assert b"200" in response.split(b"\r\n", 1)[0], \
             f"False WebSocket detection with Upgrade:websocketX, got {response[:160]}"
 
-    def test_websocket_upgrade_echo(self, ws_proxy):
+    async def test_websocket_upgrade_echo(self, ws_proxy):
         """Full WebSocket handshake and echo through the proxy"""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -1084,7 +1142,7 @@ class TestWebSocket:
                 # Send close frame
                 ssock.sendall(ws_frame(b"", opcode=0x8))
 
-    def test_websocket_upgrade_with_duplicate_connection_headers(self, ws_proxy):
+    async def test_websocket_upgrade_with_duplicate_connection_headers(self, ws_proxy):
         """Repeated Connection headers containing Upgrade should still allow WS tunneling."""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -1121,7 +1179,7 @@ class TestWebSocket:
 
                 ssock.sendall(ws_frame(b"", opcode=0x8))
 
-    def test_websocket_binary_frames(self, ws_proxy):
+    async def test_websocket_binary_frames(self, ws_proxy):
         """Binary WebSocket frames through the proxy tunnel"""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -1160,7 +1218,7 @@ class TestWebSocket:
 
                 ssock.sendall(ws_frame(b"", opcode=0x8))
 
-    def test_websocket_upgrade_with_raw_duplicate_connection_headers(self, ws_proxy):
+    async def test_websocket_upgrade_with_raw_duplicate_connection_headers(self, ws_proxy):
         """Raw repeated Connection field-lines containing Upgrade should allow WS tunneling."""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -1197,7 +1255,7 @@ class TestWebSocket:
 
                 ssock.sendall(ws_frame(b"", opcode=0x8))
 
-    def test_websocket_upgrade_with_raw_duplicate_upgrade_headers(self, ws_proxy):
+    async def test_websocket_upgrade_with_raw_duplicate_upgrade_headers(self, ws_proxy):
         """Raw repeated Upgrade field-lines should match websocket token across all lines."""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -1234,7 +1292,7 @@ class TestWebSocket:
 
                 ssock.sendall(ws_frame(b"", opcode=0x8))
 
-    def test_websocket_failed_upgrade(self, ws_proxy):
+    async def test_websocket_failed_upgrade(self, ws_proxy):
         """Backend rejects WebSocket upgrade → proxy returns 502"""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -1268,7 +1326,7 @@ class TestWebSocket:
 
                 assert b"502" in response, f"Expected 502, got: {response[:200]}"
 
-    def test_websocket_101_missing_connection_upgrade_is_rejected(self, ws_proxy):
+    async def test_websocket_101_missing_connection_upgrade_is_rejected(self, ws_proxy):
         """Backend 101 without Connection: Upgrade must be rejected with 502."""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -1302,7 +1360,7 @@ class TestWebSocket:
 
                 assert b"502" in response, f"Expected 502 for missing Connection: Upgrade, got: {response[:220]}"
 
-    def test_websocket_101_missing_upgrade_websocket_is_rejected(self, ws_proxy):
+    async def test_websocket_101_missing_upgrade_websocket_is_rejected(self, ws_proxy):
         """Backend 101 without Upgrade: websocket must be rejected with 502."""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -1344,7 +1402,7 @@ class TestWebSocket:
 class TestBackendErrors:
     """Test backend error handling"""
 
-    def test_backend_connection_refused(self, proxy):
+    async def test_backend_connection_refused(self, proxy):
         """When backend is down, proxy should return 502"""
         # Use a separate proxy instance that points to a port with nothing listening
         config_file = os.path.join(PROJECT_ROOT, "tests", "test_502_config.json")
@@ -1357,20 +1415,7 @@ class TestBackendErrors:
         with open(config_file, "w") as f:
             json.dump(config, f)
 
-        import subprocess
-        env = os.environ.copy()
-        env["REVPX_PORT"] = "18643"
-        env["REVPX_PORT_PLAIN"] = "18680"
-
-        binary = os.path.join(PROJECT_ROOT, "build", "revpx")
-        process = subprocess.Popen(
-            [binary, "-f", config_file],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=PROJECT_ROOT,
-            env=env,
-        )
-        wait_for_tcp_port(18643, timeout=5.0)
+        process = await async_start_revpx(config_file, https_port=18643, http_port=18680)
 
         try:
             ctx = ssl.create_default_context()
@@ -1395,12 +1440,11 @@ class TestBackendErrors:
 
                     assert b"502" in response, f"Expected 502, got: {response[:200]}"
         finally:
-            process.terminate()
-            process.wait(timeout=5)
+            await async_stop_process(process, timeout=5.0)
             if os.path.exists(config_file):
                 os.remove(config_file)
 
-    def test_unknown_domain_returns_421(self, proxy):
+    async def test_unknown_domain_returns_421(self, proxy):
         """Request for unknown domain should return 421 Misdirected Request"""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -1425,7 +1469,7 @@ class TestBackendErrors:
 
                 assert b"421" in response, f"Expected 421, got: {response[:200]}"
 
-    def test_backend_closes_immediately(self, proxy):
+    async def test_backend_closes_immediately(self, proxy):
         """Backend that accepts then immediately closes should not crash the proxy"""
         # Start a backend that immediately closes connections
         close_port = 18003
@@ -1456,20 +1500,7 @@ class TestBackendErrors:
         with open(config_file, "w") as f:
             json.dump(config, f)
 
-        import subprocess
-        env = os.environ.copy()
-        env["REVPX_PORT"] = "18743"
-        env["REVPX_PORT_PLAIN"] = "18780"
-
-        binary = os.path.join(PROJECT_ROOT, "build", "revpx")
-        process = subprocess.Popen(
-            [binary, "-f", config_file],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=PROJECT_ROOT,
-            env=env,
-        )
-        wait_for_tcp_port(18743, timeout=5.0)
+        process = await async_start_revpx(config_file, https_port=18743, http_port=18780)
 
         try:
             ctx = ssl.create_default_context()
@@ -1491,10 +1522,9 @@ class TestBackendErrors:
                 pass
 
             # Verify proxy is still alive by checking process
-            assert process.poll() is None, "Proxy process should still be running"
+            assert process.returncode is None, "Proxy process should still be running"
         finally:
-            process.terminate()
-            process.wait(timeout=5)
+            await async_stop_process(process, timeout=5.0)
             srv.close()
             if os.path.exists(config_file):
                 os.remove(config_file)
@@ -1507,7 +1537,7 @@ class TestBackendErrors:
 class TestHeaderLimits:
     """Test header size limit enforcement"""
 
-    def test_headers_exceeding_buffer_returns_431(self, proxy):
+    async def test_headers_exceeding_buffer_returns_431(self, proxy):
         """Headers larger than 32KB buffer should return 431"""
         raw = RawSSLClient()
         # Generate total request > 32KB (RP_BUF_SIZE)
@@ -1520,14 +1550,14 @@ class TestHeaderLimits:
             f"\r\n"
         ).encode()
 
-        response = raw.send_raw(request, timeout=5)
+        response = await async_send_raw(raw, request, timeout=5)
         assert response is not None
         assert b"431" in response, f"Expected 431, got: {response[:200]}"
 
-    def test_headers_within_buffer_succeeds(self, client):
+    async def test_headers_within_buffer_succeeds(self, client):
         """Headers well within 32KB limit should succeed"""
         headers = {f"X-H-{i}": "v" * 50 for i in range(20)}
-        status, _, _ = client.request("GET", "/", headers=headers)
+        status, _, _ = await async_request(client, "GET", "/", headers=headers)
         assert status == 200
 
 
@@ -1538,7 +1568,7 @@ class TestHeaderLimits:
 class TestChunkedRequestEdgeCases:
     """Test chunked transfer encoding edge cases"""
 
-    def test_chunked_request_with_extensions(self, proxy):
+    async def test_chunked_request_with_extensions(self, proxy):
         """Chunked request with chunk extensions (;key=value)"""
         raw = RawSSLClient()
         body_data = b"Hello with extensions"
@@ -1552,14 +1582,14 @@ class TestChunkedRequestEdgeCases:
             f"\r\n"
         ).encode() + chunked_body
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         assert b"200" in response
 
         req = BackendHandler.captured_requests[-1]
         assert req.body == body_data
 
-    def test_chunked_request_with_trailers(self, proxy):
+    async def test_chunked_request_with_trailers(self, proxy):
         """Chunked request with trailer headers"""
         raw = RawSSLClient()
         body_data = b"Body with trailers"
@@ -1578,14 +1608,14 @@ class TestChunkedRequestEdgeCases:
             f"\r\n"
         ).encode() + chunked_body
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         assert b"200" in response
 
         req = BackendHandler.captured_requests[-1]
         assert req.body == body_data
 
-    def test_multiple_chunked_requests_keepalive(self, proxy):
+    async def test_multiple_chunked_requests_keepalive(self, proxy):
         """Multiple chunked POST requests on the same keep-alive connection"""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -1613,7 +1643,7 @@ class TestChunkedRequestEdgeCases:
                     assert data["body_length"] == len(body_data), \
                         f"Request {i}: expected body_length {len(body_data)}, got {data['body_length']}"
 
-    def test_chunked_request_large_body(self, proxy):
+    async def test_chunked_request_large_body(self, proxy):
         """Chunked request with body larger than 32KB buffer"""
         raw = RawSSLClient()
         body_data = os.urandom(64 * 1024)  # 64KB
@@ -1634,14 +1664,14 @@ class TestChunkedRequestEdgeCases:
             f"\r\n"
         ).encode() + chunked
 
-        response = raw.send_raw(request, timeout=15)
+        response = await async_send_raw(raw, request, timeout=15)
         assert response is not None
         assert b"200" in response, f"Expected 200, got: {response[:200]}"
 
         req = BackendHandler.captured_requests[-1]
         assert hashlib.md5(req.body).hexdigest() == body_hash
 
-    def test_chunked_request_single_byte_chunks(self, proxy):
+    async def test_chunked_request_single_byte_chunks(self, proxy):
         """Chunked request with single-byte chunks"""
         raw = RawSSLClient()
         body_data = b"ABCDEFGHIJ"
@@ -1658,14 +1688,14 @@ class TestChunkedRequestEdgeCases:
             f"\r\n"
         ).encode() + chunked
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         assert b"200" in response
 
         req = BackendHandler.captured_requests[-1]
         assert req.body == body_data
 
-    def test_chunked_request_empty_body(self, proxy):
+    async def test_chunked_request_empty_body(self, proxy):
         """Chunked request with empty body (just final chunk)"""
         raw = RawSSLClient()
         request = (
@@ -1677,7 +1707,7 @@ class TestChunkedRequestEdgeCases:
             f"\r\n"
         ).encode()
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         assert b"200" in response
 
@@ -1708,7 +1738,7 @@ class TestHTTPRedirectDetails:
                 pass
             return response
 
-    def test_redirect_preserves_path(self, proxy):
+    async def test_redirect_preserves_path(self, proxy):
         """Redirect Location should preserve the request path"""
         request = f"GET /some/path HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\n\r\n".encode()
         response = self._http_request(request)
@@ -1722,7 +1752,7 @@ class TestHTTPRedirectDetails:
                 assert location.startswith("https://")
                 break
 
-    def test_redirect_preserves_query_string(self, proxy):
+    async def test_redirect_preserves_query_string(self, proxy):
         """Redirect Location should preserve query string"""
         request = f"GET /search?q=test&page=1 HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\n\r\n".encode()
         response = self._http_request(request)
@@ -1734,7 +1764,7 @@ class TestHTTPRedirectDetails:
                 assert "q=test" in location, f"Query string not preserved: {location}"
                 break
 
-    def test_redirect_includes_non_standard_port(self, proxy):
+    async def test_redirect_includes_non_standard_port(self, proxy):
         """Redirect Location should include port when not 443"""
         request = f"GET / HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\n\r\n".encode()
         response = self._http_request(request)
@@ -1748,7 +1778,7 @@ class TestHTTPRedirectDetails:
                     f"Non-standard port {HTTPS_PORT} not in Location: {location}"
                 break
 
-    def test_redirect_no_host_returns_400(self, proxy):
+    async def test_redirect_no_host_returns_400(self, proxy):
         """HTTP request without Host header should return 400"""
         request = b"GET / HTTP/1.1\r\n\r\n"
         response = self._http_request(request)
@@ -1763,7 +1793,7 @@ class TestHTTPRedirectDetails:
 class TestKeepAliveRequestBoundaries:
     """Test request boundary tracking across keep-alive connections"""
 
-    def test_keepalive_get_then_post_then_get(self, proxy):
+    async def test_keepalive_get_then_post_then_get(self, proxy):
         """Alternating GET and POST on same connection"""
         ssock = make_ssl_connection()
         try:
@@ -1805,7 +1835,7 @@ class TestKeepAliveRequestBoundaries:
         finally:
             ssock.close()
 
-    def test_keepalive_post_with_no_body(self, proxy):
+    async def test_keepalive_post_with_no_body(self, proxy):
         """POST with Content-Length: 0 between other requests"""
         ssock = make_ssl_connection()
         try:
@@ -1843,7 +1873,7 @@ class TestKeepAliveRequestBoundaries:
         finally:
             ssock.close()
 
-    def test_keepalive_post_body_exactly_buffer_size(self, proxy):
+    async def test_keepalive_post_body_exactly_buffer_size(self, proxy):
         """POST with body exactly 32KB on keep-alive, followed by another request"""
         ssock = make_ssl_connection()
         try:
@@ -1875,7 +1905,7 @@ class TestKeepAliveRequestBoundaries:
         finally:
             ssock.close()
 
-    def test_keepalive_many_small_gets(self, proxy):
+    async def test_keepalive_many_small_gets(self, proxy):
         """20+ GETs on the same keep-alive connection"""
         ssock = make_ssl_connection()
         try:
@@ -1898,7 +1928,7 @@ class TestKeepAliveRequestBoundaries:
 class TestConnectionEdgeCases:
     """Test connection lifecycle edge cases"""
 
-    def test_client_sends_rst(self, proxy):
+    async def test_client_sends_rst(self, proxy):
         """Client sending RST should not crash proxy"""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -1921,14 +1951,14 @@ class TestConnectionEdgeCases:
         except Exception:
             pass
 
-        time.sleep(0.5)
+        await asyncio.sleep(0.5)
 
         # Proxy should still work
-        client = ProxyClient()
-        status, _, _ = client.request("GET", "/after-rst")
+        client = ProxyClient(port=HTTPS_PORT)
+        status, _, _ = await async_request(client, "GET", "/after-rst")
         assert status == 200
 
-    def test_half_close(self, proxy):
+    async def test_half_close(self, proxy):
         """Client shutting down write side"""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -1953,13 +1983,13 @@ class TestConnectionEdgeCases:
 
                 assert b"200" in response
 
-    def test_backend_slow_connect(self, proxy):
+    async def test_backend_slow_connect(self, proxy):
         """Test that client data is buffered during ST_CONNECTING"""
         # This is implicitly tested by large POST tests, but let's be explicit
         # Send a POST where the body arrives before backend connects
-        client = ProxyClient()
+        client = ProxyClient(port=HTTPS_PORT)
         body = b"data-while-connecting" * 100
-        status, _, resp_body = client.request("POST", "/slow-connect-test", body=body, timeout=15)
+        status, _, resp_body = await async_request(client, "POST", "/slow-connect-test", body=body, timeout=15)
 
         assert status == 200
         data = json.loads(resp_body)
@@ -1978,7 +2008,7 @@ class TestPipelinedForwardedHeaders:
     saved_body bytes (belonging to the next request) are forwarded with
     req_need_header=false when req_body_left==0."""
 
-    def test_pipelined_gets_both_have_forwarded_headers(self, proxy):
+    async def test_pipelined_gets_both_have_forwarded_headers(self, proxy):
         """Two pipelined GETs sent in one write - both must have X-Forwarded-For"""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -2018,7 +2048,7 @@ class TestPipelinedForwardedHeaders:
                 assert "X-Forwarded-Proto" in data2["headers"], \
                     "Second pipelined request missing X-Forwarded-Proto"
 
-    def test_pipelined_post_cl0_then_get_both_have_forwarded_headers(self, proxy):
+    async def test_pipelined_post_cl0_then_get_both_have_forwarded_headers(self, proxy):
         """POST with Content-Length: 0 followed by GET in one write"""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -2050,7 +2080,7 @@ class TestPipelinedForwardedHeaders:
                 assert "X-Forwarded-For" in data2["headers"], \
                     "Request after CL:0 POST missing X-Forwarded-For"
 
-    def test_pipelined_post_with_body_then_get_forwarded_headers(self, proxy):
+    async def test_pipelined_post_with_body_then_get_forwarded_headers(self, proxy):
         """POST with body followed by GET in one write - verify correct boundary"""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -2086,7 +2116,7 @@ class TestPipelinedForwardedHeaders:
                 assert "X-Forwarded-For" in data2["headers"], \
                     "GET after POST missing X-Forwarded-For"
 
-    def test_three_pipelined_gets_all_have_forwarded_headers(self, proxy):
+    async def test_three_pipelined_gets_all_have_forwarded_headers(self, proxy):
         """Three pipelined GETs in one write"""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -2125,7 +2155,7 @@ class TestSTUpgradingBugs:
     instead of `c->len` (total accumulated bytes) for the 101 check
     and when copying response to client buffer."""
 
-    def test_websocket_large_101_response(self, ws_proxy):
+    async def test_websocket_large_101_response(self, ws_proxy):
         """WebSocket upgrade with a 101 response that includes extra headers.
         The response may arrive in multiple reads; the proxy must accumulate."""
         ctx = ssl.create_default_context()
@@ -2165,7 +2195,7 @@ class TestSTUpgradingBugs:
 
                 ssock.sendall(ws_frame(b"", opcode=0x8))
 
-    def test_websocket_101_fragmented_status_line(self, ws_proxy):
+    async def test_websocket_101_fragmented_status_line(self, ws_proxy):
         """A fragmented 101 response must not be treated as an immediate upgrade failure."""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -2213,7 +2243,7 @@ class TestPipelinedChunkedThenGet:
     Exercises advance_chunked → req_need_header transition when leftover
     bytes after chunk terminator belong to a new request."""
 
-    def test_chunked_post_then_get_in_one_write(self, proxy):
+    async def test_chunked_post_then_get_in_one_write(self, proxy):
         """Chunked POST + GET pipelined in a single write"""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -2255,7 +2285,7 @@ class TestPipelinedChunkedThenGet:
                 assert "X-Forwarded-For" in data2["headers"], \
                     "GET after pipelined chunked POST missing X-Forwarded-For"
 
-    def test_chunked_post_with_trailers_then_get(self, proxy):
+    async def test_chunked_post_with_trailers_then_get(self, proxy):
         """Chunked POST with trailers + GET pipelined in one write"""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -2302,7 +2332,7 @@ class TestPipelinedChunkedThenGet:
 class TestHostHeaderEdgeCases:
     """Test Host header parsing edge cases in extract_host()."""
 
-    def test_host_with_port(self, proxy):
+    async def test_host_with_port(self, proxy):
         """Host: test.localhost:18443 should strip port for domain lookup"""
         raw = RawSSLClient()
         request = (
@@ -2311,12 +2341,12 @@ class TestHostHeaderEdgeCases:
             f"\r\n"
         ).encode()
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         # Should route correctly (200), NOT 421 Misdirected
         assert b"200" in response, f"Host with port failed: {response[:200]}"
 
-    def test_host_case_insensitive(self, proxy):
+    async def test_host_case_insensitive(self, proxy):
         """Host header should be case-insensitive for domain matching"""
         raw = RawSSLClient()
         request = (
@@ -2325,12 +2355,12 @@ class TestHostHeaderEdgeCases:
             f"\r\n"
         ).encode()
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         # strcasecmp on domain lookup should handle this
         assert b"200" in response, f"Case-insensitive host failed: {response[:200]}"
 
-    def test_host_with_tab_whitespace(self, proxy):
+    async def test_host_with_tab_whitespace(self, proxy):
         """Host header with tab after colon"""
         raw = RawSSLClient()
         request = (
@@ -2339,11 +2369,11 @@ class TestHostHeaderEdgeCases:
             b"\r\n"
         )
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         assert b"200" in response, f"Host with tab whitespace failed: {response[:200]}"
 
-    def test_host_with_multiple_spaces(self, proxy):
+    async def test_host_with_multiple_spaces(self, proxy):
         """Host header with extra spaces around value"""
         raw = RawSSLClient()
         request = (
@@ -2352,7 +2382,7 @@ class TestHostHeaderEdgeCases:
             b"\r\n"
         )
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         # Trailing spaces may be included in host — could cause 421
         # This tests whether extract_host trims trailing whitespace
@@ -2369,7 +2399,7 @@ class TestHostHeaderEdgeCases:
 class TestMalformedRequests:
     """Test error handling for malformed HTTP requests."""
 
-    def test_transfer_encoding_chunked_in_second_header_is_honored(self, proxy):
+    async def test_transfer_encoding_chunked_in_second_header_is_honored(self, proxy):
         """If chunked appears in a later Transfer-Encoding header, proxy should still parse as chunked."""
         te_backend_port = 18010
         te_domain = "te-dup.localhost"
@@ -2436,9 +2466,11 @@ class TestMalformedRequests:
                 if b"0\r\n\r\n" not in body:
                     body += read_chunked_body(conn)
 
-                # Minimal decoding for expected test payload: 5\r\nhello\r\n0\r\n\r\n
+                # Accept either representation:
+                # - raw chunk framing preserved
+                # - de-chunked payload forwarded as plain body
                 decoded = b""
-                if b"5\r\nhello\r\n0\r\n\r\n" in body:
+                if b"5\r\nhello\r\n0\r\n\r\n" in body or b"hello" in body:
                     decoded = b"hello"
 
                 resp_body = json.dumps({"decoded": decoded.decode(errors="ignore")}).encode()
@@ -2467,18 +2499,7 @@ class TestMalformedRequests:
         with open(config_file, "w") as f:
             json.dump(config, f)
 
-        env = os.environ.copy()
-        env["REVPX_PORT"] = str(te_https_port)
-        env["REVPX_PORT_PLAIN"] = str(te_http_port)
-
-        process = subprocess.Popen(
-            [REVPX_BINARY, "-f", config_file],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=PROJECT_ROOT,
-            env=env,
-        )
-        wait_for_tcp_port(te_https_port, timeout=5.0)
+        process = await async_start_revpx(config_file, https_port=te_https_port, http_port=te_http_port)
 
         try:
             raw = RawSSLClient(host=te_domain, port=te_https_port)
@@ -2492,24 +2513,19 @@ class TestMalformedRequests:
                 f"\r\n"
             ).encode() + chunked_body
 
-            response = raw.send_raw(request, timeout=8.0)
+            response = await async_send_raw(raw, request, timeout=8.0)
             assert response is not None
             assert b"200" in response.split(b"\r\n", 1)[0], \
                 f"Expected 200 when chunked is in second TE header, got: {response[:200]}"
             assert b'"decoded": "hello"' in response, \
                 f"Second Transfer-Encoding header was ignored, response={response[:240]}"
         finally:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+            await async_stop_process(process, timeout=5.0)
             if os.path.exists(config_file):
                 os.remove(config_file)
             backend_thread.join(timeout=2.0)
 
-    def test_transfer_encoding_substring_not_treated_as_chunked(self):
+    async def test_transfer_encoding_substring_not_treated_as_chunked(self):
         """Transfer-Encoding token matching must be exact (notchunked != chunked)."""
         te_backend_port = 18006
         te_domain = "te.localhost"
@@ -2558,18 +2574,7 @@ class TestMalformedRequests:
         with open(config_file, "w") as f:
             json.dump(config, f)
 
-        env = os.environ.copy()
-        env["REVPX_PORT"] = str(te_https_port)
-        env["REVPX_PORT_PLAIN"] = str(te_http_port)
-
-        process = subprocess.Popen(
-            [REVPX_BINARY, "-f", config_file],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=PROJECT_ROOT,
-            env=env,
-        )
-        wait_for_tcp_port(te_https_port, timeout=5.0)
+        process = await async_start_revpx(config_file, https_port=te_https_port, http_port=te_http_port)
 
         try:
             raw = RawSSLClient(host=te_domain, port=te_https_port)
@@ -2583,23 +2588,18 @@ class TestMalformedRequests:
                 f"\r\n"
             ).encode() + body
 
-            response = raw.send_raw(request, timeout=8.0)
+            response = await async_send_raw(raw, request, timeout=8.0)
             assert response is not None
             # If proxy falsely treats 'notchunked' as chunked, it returns 400.
             assert b"200" in response.split(b"\r\n", 1)[0], \
                 f"Unexpected response for TE:notchunked: {response[:200]}"
         finally:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+            await async_stop_process(process, timeout=5.0)
             if os.path.exists(config_file):
                 os.remove(config_file)
             backend_thread.join(timeout=2.0)
 
-    def test_transfer_encoding_chunked_with_spaces_and_params_is_honored(self, proxy):
+    async def test_transfer_encoding_chunked_with_spaces_and_params_is_honored(self, proxy):
         """Chunked token with surrounding spaces/params must still be detected."""
         raw = RawSSLClient()
         request = (
@@ -2611,12 +2611,12 @@ class TestMalformedRequests:
             f"5\r\nhello\r\n0\r\n\r\n"
         ).encode()
 
-        response = raw.send_raw(request, timeout=8.0)
+        response = await async_send_raw(raw, request, timeout=8.0)
         assert response is not None
         assert b"200" in response.split(b"\r\n", 1)[0], \
             f"Expected 200 for TE with spacing/params around chunked token, got: {response[:220]}"
 
-    def test_malformed_chunk_hex(self, proxy):
+    async def test_malformed_chunk_hex(self, proxy):
         """Invalid hex in chunk size should return 400"""
         raw = RawSSLClient()
         request = (
@@ -2630,11 +2630,11 @@ class TestMalformedRequests:
             f"\r\n"
         ).encode()
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         assert b"400" in response, f"Expected 400 for bad chunk hex, got: {response[:200]}"
 
-    def test_chunk_size_overflow(self, proxy):
+    async def test_chunk_size_overflow(self, proxy):
         """Chunk size with >16 hex digits should return 400"""
         raw = RawSSLClient()
         # 17 hex digits
@@ -2649,11 +2649,11 @@ class TestMalformedRequests:
             f"\r\n"
         ).encode()
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         assert b"400" in response, f"Expected 400 for chunk size overflow, got: {response[:200]}"
 
-    def test_post_without_content_length_or_te(self, proxy):
+    async def test_post_without_content_length_or_te(self, proxy):
         """POST with no Content-Length or Transfer-Encoding → treated as no body"""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -2686,7 +2686,7 @@ class TestMalformedRequests:
                 data2 = json.loads(body2)
                 assert data2["path"] == "/no-cl/2"
 
-    def test_chunked_and_content_length_both_present(self, proxy):
+    async def test_chunked_and_content_length_both_present(self, proxy):
         """When both Transfer-Encoding: chunked and Content-Length are present,
         chunked should take precedence per RFC 7230 §3.3.3"""
         raw = RawSSLClient()
@@ -2701,7 +2701,7 @@ class TestMalformedRequests:
             f"\r\n"
         ).encode() + chunked
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         assert b"200" in response, f"Expected 200, got: {response[:200]}"
 
@@ -2718,7 +2718,7 @@ class TestForwardedHeaderOverflow:
     """Test inject_forwarded_headers with very long existing X-Forwarded-For.
     The internal ff[512] buffer may truncate. Verify no crash."""
 
-    def test_long_xff_chain_no_crash(self, proxy):
+    async def test_long_xff_chain_no_crash(self, proxy):
         """Request with a very long existing X-Forwarded-For chain"""
         # Build a 600-byte X-Forwarded-For value (exceeds ff[512])
         long_xff = ", ".join([f"10.0.0.{i % 256}" for i in range(60)])
@@ -2732,12 +2732,12 @@ class TestForwardedHeaderOverflow:
             f"\r\n"
         ).encode()
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         # Main assertion: proxy didn't crash, returned some response
         assert b"HTTP/1.1" in response
 
-    def test_long_forwarded_header_no_crash(self, proxy):
+    async def test_long_forwarded_header_no_crash(self, proxy):
         """Request with a very long Forwarded header"""
         long_fwd = "; ".join([f"for=10.0.0.{i % 256}" for i in range(60)])
         assert len(long_fwd) > 512
@@ -2750,7 +2750,7 @@ class TestForwardedHeaderOverflow:
             f"\r\n"
         ).encode()
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         assert b"HTTP/1.1" in response
 
@@ -2762,7 +2762,7 @@ class TestForwardedHeaderOverflow:
 class TestRequestLineEdgeCases:
     """Test edge cases in request line parsing (extract_target, etc.)"""
 
-    def test_very_long_url(self, proxy):
+    async def test_very_long_url(self, proxy):
         """Request with a very long URL path (near buffer limit)"""
         raw = RawSSLClient()
         # 4KB URL - well within 32KB but exercises extract_target with long path
@@ -2773,14 +2773,14 @@ class TestRequestLineEdgeCases:
             f"\r\n"
         ).encode()
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         assert b"200" in response
 
         req = BackendHandler.captured_requests[-1]
         assert req.path == long_path
 
-    def test_url_with_query_and_fragment(self, proxy):
+    async def test_url_with_query_and_fragment(self, proxy):
         """Request with query string preserved through proxy"""
         raw = RawSSLClient()
         request = (
@@ -2789,7 +2789,7 @@ class TestRequestLineEdgeCases:
             f"\r\n"
         ).encode()
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         assert b"200" in response
 
@@ -2797,7 +2797,7 @@ class TestRequestLineEdgeCases:
         assert "key=value" in req.path
         assert "arr[]=1" in req.path
 
-    def test_http_10_request(self, proxy):
+    async def test_http_10_request(self, proxy):
         """HTTP/1.0 request should be proxied"""
         raw = RawSSLClient()
         request = (
@@ -2806,7 +2806,7 @@ class TestRequestLineEdgeCases:
             f"\r\n"
         ).encode()
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         assert b"200" in response
 
@@ -2818,7 +2818,7 @@ class TestRequestLineEdgeCases:
 class TestSNIMismatch:
     """Test SNI vs Host header routing behavior"""
 
-    def test_sni_mismatch_host_takes_precedence(self, proxy):
+    async def test_sni_mismatch_host_takes_precedence(self, proxy):
         """When SNI doesn't match Host, Host header is used for routing"""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -2853,7 +2853,7 @@ class TestRapidKeepaliveTransitions:
     """Test rapid alternation of request types on keep-alive connections
     to stress-test request boundary tracking."""
 
-    def test_get_post_chunked_post_cl_get_sequence(self, proxy):
+    async def test_get_post_chunked_post_cl_get_sequence(self, proxy):
         """Mixed sequence: GET, chunked POST, CL POST, GET on one connection"""
         ssock = make_ssl_connection()
         try:
@@ -2911,7 +2911,7 @@ class TestRapidKeepaliveTransitions:
         finally:
             ssock.close()
 
-    def test_many_chunked_posts_keepalive(self, proxy):
+    async def test_many_chunked_posts_keepalive(self, proxy):
         """10 chunked POSTs on the same connection"""
         ssock = make_ssl_connection()
         try:
@@ -2945,7 +2945,7 @@ class TestContentLengthParsing:
     The proxy uses strtoull(tmp, NULL, 10) to parse Content-Length.
     Malicious or malformed values can cause incorrect request boundary tracking."""
 
-    def test_negative_content_length_keepalive(self, proxy):
+    async def test_negative_content_length_keepalive(self, proxy):
         """Negative Content-Length must be rejected with 400 and connection close."""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -2979,7 +2979,7 @@ class TestContentLengthParsing:
                     )
                     read_http_response(ssock)
 
-    def test_zero_content_length_keepalive(self, proxy):
+    async def test_zero_content_length_keepalive(self, proxy):
         """Content-Length: 0 should be treated as no body, next request parsed correctly"""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -3009,7 +3009,7 @@ class TestContentLengthParsing:
                 data2 = json.loads(body2)
                 assert data2["path"] == "/zero-cl/2"
 
-    def test_content_length_with_leading_plus(self, proxy):
+    async def test_content_length_with_leading_plus(self, proxy):
         """Content-Length: +5 (with leading plus sign) should be rejected."""
         raw = RawSSLClient()
         body = b"hello"
@@ -3020,11 +3020,11 @@ class TestContentLengthParsing:
             f"\r\n"
         ).encode() + body
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         assert b"400" in response.split(b"\r\n", 1)[0]
 
-    def test_content_length_with_leading_spaces(self, proxy):
+    async def test_content_length_with_leading_spaces(self, proxy):
         """Content-Length with leading spaces in value"""
         raw = RawSSLClient()
         body = b"hello"
@@ -3035,11 +3035,11 @@ class TestContentLengthParsing:
             f"\r\n"
         ).encode() + body
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         assert b"200" in response
 
-    def test_content_length_with_trailing_whitespace_is_accepted(self, proxy):
+    async def test_content_length_with_trailing_whitespace_is_accepted(self, proxy):
         """Content-Length with trailing SP/HTAB should remain valid."""
         raw = RawSSLClient()
         body = b"hello"
@@ -3050,12 +3050,12 @@ class TestContentLengthParsing:
             f"\r\n"
         ).encode() + body
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         assert b"200" in response.split(b"\r\n", 1)[0], \
             f"Expected 200 for Content-Length with trailing whitespace, got: {response[:180]}"
 
-    def test_content_length_with_suffix_is_rejected(self, proxy):
+    async def test_content_length_with_suffix_is_rejected(self, proxy):
         """Malformed Content-Length (e.g. 5abc) should be rejected with 400."""
         raw = RawSSLClient()
         request = (
@@ -3067,12 +3067,12 @@ class TestContentLengthParsing:
             f"hello"
         ).encode()
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         assert b"400" in response.split(b"\r\n", 1)[0], \
             f"Expected 400 for malformed Content-Length, got: {response[:160]}"
 
-    def test_empty_content_length_is_rejected(self, proxy):
+    async def test_empty_content_length_is_rejected(self, proxy):
         """Empty Content-Length header should be rejected with 400."""
         raw = RawSSLClient()
         request = (
@@ -3083,12 +3083,12 @@ class TestContentLengthParsing:
             f"\r\n"
         ).encode()
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         assert b"400" in response.split(b"\r\n", 1)[0], \
             f"Expected 400 for empty Content-Length, got: {response[:160]}"
 
-    def test_duplicate_content_length_conflict_is_rejected(self, proxy):
+    async def test_duplicate_content_length_conflict_is_rejected(self, proxy):
         """Conflicting duplicate Content-Length headers should be rejected with 400."""
         raw = RawSSLClient()
         request = (
@@ -3101,12 +3101,12 @@ class TestContentLengthParsing:
             f"hello"
         ).encode()
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         assert b"400" in response.split(b"\r\n", 1)[0], \
             f"Expected 400 for duplicate conflicting Content-Length, got: {response[:160]}"
 
-    def test_duplicate_content_length_identical_is_rejected(self, proxy):
+    async def test_duplicate_content_length_identical_is_rejected(self, proxy):
         """Duplicate identical Content-Length headers should be rejected to prevent smuggling ambiguity."""
         raw = RawSSLClient()
         request = (
@@ -3119,12 +3119,12 @@ class TestContentLengthParsing:
             f"hello"
         ).encode()
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         assert b"400" in response.split(b"\r\n", 1)[0], \
             f"Expected 400 for duplicate identical Content-Length, got: {response[:160]}"
 
-    def test_content_length_list_value_is_rejected(self, proxy):
+    async def test_content_length_list_value_is_rejected(self, proxy):
         """Comma-separated Content-Length list must be rejected to avoid ambiguity."""
         raw = RawSSLClient()
         request = (
@@ -3136,12 +3136,12 @@ class TestContentLengthParsing:
             f"hello"
         ).encode()
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         assert b"400" in response.split(b"\r\n", 1)[0], \
             f"Expected 400 for list-form Content-Length, got: {response[:160]}"
 
-    def test_very_large_content_length_keepalive(self, proxy):
+    async def test_very_large_content_length_keepalive(self, proxy):
         """Content-Length: 999999999999 with small body → keepalive broken"""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -3190,7 +3190,7 @@ class TestContentLengthParsing:
                     # but Content-Length: -1 is a clear security issue.
                     pass
 
-    def test_content_length_numeric_overflow_is_rejected(self, proxy):
+    async def test_content_length_numeric_overflow_is_rejected(self, proxy):
         """Content-Length values that overflow size_t must be rejected with 400."""
         raw = RawSSLClient()
         request = (
@@ -3201,7 +3201,7 @@ class TestContentLengthParsing:
             f"\r\n"
         ).encode()
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         assert b"400" in response.split(b"\r\n", 1)[0], \
             f"Expected 400 for overflowing Content-Length, got: {response[:180]}"
@@ -3216,7 +3216,7 @@ class TestHostTrailingWhitespace:
     extract_host() trims leading whitespace but NOT trailing whitespace,
     causing domain lookup to fail (421) for valid domains."""
 
-    def test_host_trailing_space_routes_correctly(self, proxy):
+    async def test_host_trailing_space_routes_correctly(self, proxy):
         """Host: 'test.localhost ' (trailing space) should still route correctly"""
         raw = RawSSLClient()
         # Trailing space before \r\n
@@ -3226,7 +3226,7 @@ class TestHostTrailingWhitespace:
             b"\r\n"
         )
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         # BUG: extract_host doesn't trim trailing whitespace, so
         # strcasecmp("test.localhost ", "test.localhost") fails → 421
@@ -3234,7 +3234,7 @@ class TestHostTrailingWhitespace:
         assert b"200" in response, \
             f"Trailing space in Host caused routing failure: {response[:200]}"
 
-    def test_host_trailing_tab_routes_correctly(self, proxy):
+    async def test_host_trailing_tab_routes_correctly(self, proxy):
         """Host: 'test.localhost\\t' (trailing tab) should still route correctly"""
         raw = RawSSLClient()
         request = (
@@ -3243,7 +3243,7 @@ class TestHostTrailingWhitespace:
             b"\r\n"
         )
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         assert b"200" in response, \
             f"Trailing tab in Host caused routing failure: {response[:200]}"
@@ -3257,7 +3257,7 @@ class TestBodyExceedsContentLength:
     """Test that bytes beyond Content-Length are treated as the next request,
     not silently discarded or forwarded as extra body."""
 
-    def test_extra_bytes_after_cl_body_are_next_request(self, proxy):
+    async def test_extra_bytes_after_cl_body_are_next_request(self, proxy):
         """POST with CL:5 sends 5 body bytes + GET on same connection.
         The proxy must track the CL boundary and parse the GET as a new request."""
         ctx = ssl.create_default_context()
@@ -3298,7 +3298,7 @@ class TestBodyExceedsContentLength:
                 assert data2["method"] == "GET"
                 assert "X-Forwarded-For" in data2["headers"]
 
-    def test_short_body_then_next_request(self, proxy):
+    async def test_short_body_then_next_request(self, proxy):
         """POST with CL:3 but body 'AB' followed by GET.
         The GET's first byte 'G' should NOT be consumed as the 3rd body byte."""
         ctx = ssl.create_default_context()
@@ -3341,7 +3341,7 @@ class TestBodyExceedsContentLength:
 class TestChunkedFinalChunkExtension:
     """Test chunked encoding where the final 0-size chunk has extensions."""
 
-    def test_final_chunk_with_extension_then_get(self, proxy):
+    async def test_final_chunk_with_extension_then_get(self, proxy):
         """Chunked body ending with '0;ext=val\\r\\n\\r\\n' followed by GET"""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -3390,7 +3390,7 @@ class TestChunkedFinalChunkExtension:
 class TestEmptyHostFallback:
     """Test Host header edge cases for domain resolution fallback."""
 
-    def test_empty_host_value_ssl(self, proxy):
+    async def test_empty_host_value_ssl(self, proxy):
         """Host header with empty value on SSL connection should fall back to SNI"""
         raw = RawSSLClient()
         request = (
@@ -3399,14 +3399,14 @@ class TestEmptyHostFallback:
             b"\r\n"
         )
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         # With empty Host and valid SNI, proxy falls back to SNI → test.localhost
         # Then falls through to first domain if SNI also empty
         # Either way, should get a response (200 or 421), not crash
         assert b"HTTP/1.1" in response
 
-    def test_missing_host_header_ssl(self, proxy):
+    async def test_missing_host_header_ssl(self, proxy):
         """No Host header on SSL connection - should use SNI or fall back to first domain"""
         raw = RawSSLClient()
         request = (
@@ -3414,7 +3414,7 @@ class TestEmptyHostFallback:
             b"\r\n"
         )
 
-        response = raw.send_raw(request)
+        response = await async_send_raw(raw, request)
         assert response is not None
         # extract_host returns empty, falls back to SNI (test.localhost)
         # SNI matches, routes to backend → 200
@@ -3428,7 +3428,7 @@ class TestEmptyHostFallback:
 class TestConnectionCloseInChunkedBody:
     """Test that client disconnecting mid-chunked-body doesn't crash proxy."""
 
-    def test_disconnect_mid_chunk(self, proxy):
+    async def test_disconnect_mid_chunk(self, proxy):
         """Client sends partial chunked body then disconnects"""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -3459,14 +3459,14 @@ class TestConnectionCloseInChunkedBody:
         except Exception:
             pass
 
-        time.sleep(0.5)
+        await asyncio.sleep(0.5)
 
         # Proxy should still be alive
-        client = ProxyClient()
-        status, _, _ = client.request("GET", "/after-mid-chunk")
+        client = ProxyClient(port=HTTPS_PORT)
+        status, _, _ = await async_request(client, "GET", "/after-mid-chunk")
         assert status == 200
 
-    def test_disconnect_between_chunks(self, proxy):
+    async def test_disconnect_between_chunks(self, proxy):
         """Client sends one complete chunk then disconnects before next"""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -3495,11 +3495,11 @@ class TestConnectionCloseInChunkedBody:
         except Exception:
             pass
 
-        time.sleep(0.5)
+        await asyncio.sleep(0.5)
 
         # Proxy should still be alive
-        client = ProxyClient()
-        status, _, _ = client.request("GET", "/after-between-chunks")
+        client = ProxyClient(port=HTTPS_PORT)
+        status, _, _ = await async_request(client, "GET", "/after-between-chunks")
         assert status == 200
 
 
@@ -3510,7 +3510,7 @@ class TestConnectionCloseInChunkedBody:
 class TestBodyContainingHeaderPattern:
     """Verify that body data containing \\r\\n\\r\\n isn't mistakenly parsed as headers"""
 
-    def test_body_with_double_crlf(self, proxy):
+    async def test_body_with_double_crlf(self, proxy):
         """POST body containing \\r\\n\\r\\n should be forwarded as body, not treated as headers"""
         ssock = make_ssl_connection()
         try:
@@ -3544,7 +3544,7 @@ class TestBodyContainingHeaderPattern:
         finally:
             ssock.close()
 
-    def test_large_body_with_fake_request_inside(self, proxy):
+    async def test_large_body_with_fake_request_inside(self, proxy):
         """POST body that contains a fake HTTP request should be forwarded as body"""
         ssock = make_ssl_connection()
         try:
@@ -3585,7 +3585,7 @@ class TestBodyContainingHeaderPattern:
 class TestMultipleTransferEncodings:
     """Test handling of Transfer-Encoding with multiple values"""
 
-    def test_gzip_chunked_detected_as_chunked(self, proxy):
+    async def test_gzip_chunked_detected_as_chunked(self, proxy):
         """Transfer-Encoding: gzip, chunked should be treated as chunked"""
         ssock = make_ssl_connection()
         try:
@@ -3625,7 +3625,7 @@ class TestMultipleTransferEncodings:
 class TestKeepAliveStateSwitching:
     """Test state machine transitions between CL and chunked on keep-alive"""
 
-    def test_cl_then_chunked_then_cl(self, proxy):
+    async def test_cl_then_chunked_then_cl(self, proxy):
         """CL POST → chunked POST → CL POST on same connection"""
         ssock = make_ssl_connection()
         try:
@@ -3677,7 +3677,7 @@ class TestKeepAliveStateSwitching:
         finally:
             ssock.close()
 
-    def test_chunked_then_get_then_chunked(self, proxy):
+    async def test_chunked_then_get_then_chunked(self, proxy):
         """Chunked POST → GET → Chunked POST on same connection"""
         ssock = make_ssl_connection()
         try:
@@ -3730,7 +3730,7 @@ class TestKeepAliveStateSwitching:
 class TestSlowHeaderDelivery:
     """Test handling of headers arriving in small fragments"""
 
-    def test_header_byte_by_byte(self, proxy):
+    async def test_header_byte_by_byte(self, proxy):
         """Headers sent one byte at a time should still be parsed"""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -3746,7 +3746,7 @@ class TestSlowHeaderDelivery:
             # Send in small chunks to simulate slow delivery
             for i in range(0, len(request), 3):
                 ssock.sendall(request[i:i+3])
-                time.sleep(0.01)
+                await asyncio.sleep(0.01)
 
             status, _, body = read_http_response(ssock)
             assert status == 200
@@ -3755,7 +3755,7 @@ class TestSlowHeaderDelivery:
         finally:
             ssock.close()
 
-    def test_header_split_at_crlf(self, proxy):
+    async def test_header_split_at_crlf(self, proxy):
         """Headers split exactly at \\r\\n boundary"""
         ssock = make_ssl_connection()
         try:
@@ -3764,9 +3764,9 @@ class TestSlowHeaderDelivery:
             part3 = b"\n\r\n"
 
             ssock.sendall(part1)
-            time.sleep(0.05)
+            await asyncio.sleep(0.05)
             ssock.sendall(part2)
-            time.sleep(0.05)
+            await asyncio.sleep(0.05)
             ssock.sendall(part3)
 
             status, _, body = read_http_response(ssock)
@@ -3782,7 +3782,7 @@ class TestSlowHeaderDelivery:
 class TestBackendClosesAfterResponse:
     """Test behavior when backend closes the connection after responding"""
 
-    def test_backend_conn_close_then_new_request(self, proxy):
+    async def test_backend_conn_close_then_new_request(self, proxy):
         """After backend returns Connection: close, next request should still work"""
         ssock = make_ssl_connection()
         try:
@@ -3800,7 +3800,7 @@ class TestBackendClosesAfterResponse:
             # Backend may or may not close — the proxy should handle either case.
             # Try a second request. If the proxy creates a new backend connection
             # or keeps using the old one, it should work either way.
-            time.sleep(0.1)
+            await asyncio.sleep(0.1)
             req2 = (
                 f"GET /close-test-2 HTTP/1.1\r\n"
                 f"Host: {TEST_DOMAIN}\r\n"
@@ -3822,7 +3822,7 @@ class TestBackendClosesAfterResponse:
 class TestContentLengthBoundaryPrecision:
     """Test that Content-Length body boundaries are tracked precisely"""
 
-    def test_two_posts_exact_cl_boundaries(self, proxy):
+    async def test_two_posts_exact_cl_boundaries(self, proxy):
         """Two POSTs with exact CL boundaries pipelined"""
         ssock = make_ssl_connection()
         try:
@@ -3857,7 +3857,7 @@ class TestContentLengthBoundaryPrecision:
         finally:
             ssock.close()
 
-    def test_post_cl_1_byte_body(self, proxy):
+    async def test_post_cl_1_byte_body(self, proxy):
         """POST with Content-Length: 1 followed by GET"""
         ssock = make_ssl_connection()
         try:
@@ -3886,7 +3886,7 @@ class TestContentLengthBoundaryPrecision:
         finally:
             ssock.close()
 
-    def test_multiple_posts_varying_sizes(self, proxy):
+    async def test_multiple_posts_varying_sizes(self, proxy):
         """5 POSTs with different body sizes, all pipelined"""
         ssock = make_ssl_connection()
         try:
@@ -3920,7 +3920,7 @@ class TestContentLengthBoundaryPrecision:
 class TestCROnlyLineEndings:
     """Test that requests with CR-only (no LF) line endings are handled"""
 
-    def test_cr_only_headers_rejected(self, proxy):
+    async def test_cr_only_headers_rejected(self, proxy):
         """Request with \\r-only line endings should not be parsed as valid"""
         raw = RawSSLClient()
         # Use \r instead of \r\n — find_headers_end won't find \r\n\r\n
@@ -3929,7 +3929,7 @@ class TestCROnlyLineEndings:
             f"Host: {TEST_DOMAIN}\r"
             f"\r"
         ).encode()
-        resp = raw.send_raw(data)
+        resp = await async_send_raw(raw, data)
         # Should timeout waiting for headers (no \r\n\r\n found) or return 431
         # The proxy keeps reading until buffer full → 431
         if resp:
@@ -3943,7 +3943,7 @@ class TestCROnlyLineEndings:
 class TestChunkedBodyWithLargeChunkSize:
     """Test chunked encoding with individual chunks larger than buffer"""
 
-    def test_single_large_chunk(self, proxy):
+    async def test_single_large_chunk(self, proxy):
         """Single chunk larger than 32KB, split across multiple forward_client_bytes calls"""
         ssock = make_ssl_connection()
         try:
@@ -3976,7 +3976,7 @@ class TestChunkedBodyWithLargeChunkSize:
         finally:
             ssock.close()
 
-    def test_many_medium_chunks_then_get(self, proxy):
+    async def test_many_medium_chunks_then_get(self, proxy):
         """10 chunks of 4KB each, followed by a GET on same connection"""
         ssock = make_ssl_connection()
         try:
@@ -4022,7 +4022,7 @@ class TestChunkedBodyWithLargeChunkSize:
 class TestRequestSmuggling:
     """Test request smuggling prevention"""
 
-    def test_cl_te_smuggling_attempt(self, proxy):
+    async def test_cl_te_smuggling_attempt(self, proxy):
         """Both CL and TE present — chunked should take precedence"""
         ssock = make_ssl_connection()
         try:
@@ -4058,7 +4058,7 @@ class TestRequestSmuggling:
         finally:
             ssock.close()
 
-    def test_cl_with_duplicate_te_chunked_and_pipelined_get(self, proxy):
+    async def test_cl_with_duplicate_te_chunked_and_pipelined_get(self, proxy):
         """Duplicate TE lines + conflicting CL must still use chunked framing and preserve next request boundary."""
         ssock = make_ssl_connection()
         try:
@@ -4098,7 +4098,7 @@ class TestRequestSmuggling:
         finally:
             ssock.close()
 
-    def test_double_content_length(self, proxy):
+    async def test_double_content_length(self, proxy):
         """Duplicate Content-Length headers (even identical) should be rejected."""
         ssock = make_ssl_connection()
         try:
@@ -4134,7 +4134,7 @@ class TestRequestSmuggling:
 class TestContentLengthLeadingZeros:
     """Test Content-Length with unusual but valid formatting"""
 
-    def test_cl_with_leading_zeros(self, proxy):
+    async def test_cl_with_leading_zeros(self, proxy):
         """Content-Length: 005 should be parsed as 5"""
         ssock = make_ssl_connection()
         try:
@@ -4173,7 +4173,7 @@ class TestContentLengthLeadingZeros:
 class TestLargeBodyKeepalive:
     """Test keep-alive with body sizes near and exceeding buffer boundaries"""
 
-    def test_body_32kb_minus_1(self, proxy):
+    async def test_body_32kb_minus_1(self, proxy):
         """POST with body exactly 32767 bytes (buffer - 1) then GET"""
         ssock = make_ssl_connection()
         try:
@@ -4204,7 +4204,7 @@ class TestLargeBodyKeepalive:
         finally:
             ssock.close()
 
-    def test_body_64kb_then_get(self, proxy):
+    async def test_body_64kb_then_get(self, proxy):
         """POST with 64KB body (2x buffer) then GET"""
         ssock = make_ssl_connection()
         try:
@@ -4234,7 +4234,7 @@ class TestLargeBodyKeepalive:
         finally:
             ssock.close()
 
-    def test_three_large_posts_keepalive(self, proxy):
+    async def test_three_large_posts_keepalive(self, proxy):
         """Three 50KB POSTs on same connection"""
         ssock = make_ssl_connection()
         try:
@@ -4264,7 +4264,7 @@ class TestLargeBodyKeepalive:
 class TestIPv6HostHeader:
     """Test Host header parsing with IPv6 addresses"""
 
-    def test_ipv6_host_header(self, proxy):
+    async def test_ipv6_host_header(self, proxy):
         """IPv6 Host header like [::1]:port should be parsed correctly"""
         raw = RawSSLClient()
         # Send request with IPv6 host — domain won't match, expect 421
@@ -4273,7 +4273,7 @@ class TestIPv6HostHeader:
             f"Host: [::1]:8080\r\n"
             f"\r\n"
         ).encode()
-        resp = raw.send_raw(data)
+        resp = await async_send_raw(raw, data)
         # Should return 421 since [::1] won't match any configured domain
         assert resp is not None
         assert b"421" in resp
@@ -4286,7 +4286,7 @@ class TestIPv6HostHeader:
 class TestMultipleChunkedPostsWithDifferentSizes:
     """Test multiple chunked POSTs with varying chunk patterns on keep-alive"""
 
-    def test_alternating_chunk_sizes(self, proxy):
+    async def test_alternating_chunk_sizes(self, proxy):
         """Multiple chunked POSTs with alternating single/multi chunk patterns"""
         ssock = make_ssl_connection()
         try:
@@ -4358,7 +4358,7 @@ class TestMultipleChunkedPostsWithDifferentSizes:
 class TestBackpressureSafety:
     """Ensure large uploads do not get silently truncated under backend backpressure."""
 
-    def test_large_post_not_silently_truncated(self):
+    async def test_large_post_not_silently_truncated(self):
         slow_backend_port = 18005
         slow_domain = "slowrecv.localhost"
         https_port = 18743
@@ -4444,19 +4444,8 @@ class TestBackpressureSafety:
         with open(config_file, "w") as f:
             json.dump(config, f)
 
-        env = os.environ.copy()
-        env["REVPX_PORT"] = str(https_port)
-        env["REVPX_PORT_PLAIN"] = str(http_port)
-
-        binary = os.path.join(PROJECT_ROOT, "build", "revpx")
-        process = subprocess.Popen(
-            [binary, "-f", config_file],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=PROJECT_ROOT,
-            env=env,
-        )
-        time.sleep(1.0)
+        process = await async_start_revpx(config_file, https_port=https_port, http_port=http_port)
+        await asyncio.sleep(1.0)
 
         try:
             payload = b"P" * (2 * 1024 * 1024)
@@ -4487,17 +4476,12 @@ class TestBackpressureSafety:
                 # Any explicit failure is acceptable; silent truncation is not.
                 assert status in (413, 502), f"Unexpected status: {status}"
         finally:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+            await async_stop_process(process, timeout=5.0)
             if os.path.exists(config_file):
                 os.remove(config_file)
             backend_thread.join(timeout=2.0)
 
-    def test_large_post_then_pipelined_get_keeps_request_boundary(self):
+    async def test_large_post_then_pipelined_get_keeps_request_boundary(self):
         """Large POST body followed by GET in same write should produce two clean responses."""
         slow_backend_port = 18011
         slow_domain = "slowpipe.localhost"
@@ -4613,18 +4597,8 @@ class TestBackpressureSafety:
         with open(config_file, "w") as f:
             json.dump(config, f)
 
-        env = os.environ.copy()
-        env["REVPX_PORT"] = str(https_port)
-        env["REVPX_PORT_PLAIN"] = str(http_port)
-
-        process = subprocess.Popen(
-            [REVPX_BINARY, "-f", config_file],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=PROJECT_ROOT,
-            env=env,
-        )
-        time.sleep(1.0)
+        process = await async_start_revpx(config_file, https_port=https_port, http_port=http_port)
+        await asyncio.sleep(1.0)
 
         try:
             payload = b"Q" * (1024 * 1024)
@@ -4671,12 +4645,7 @@ class TestBackpressureSafety:
                 "GET /after-slow-pipe HTTP/1.1"
             )
         finally:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+            await async_stop_process(process, timeout=5.0)
             if os.path.exists(config_file):
                 os.remove(config_file)
             backend_thread.join(timeout=2.0)
@@ -4689,7 +4658,7 @@ class TestBackpressureSafety:
 class TestBackendAddressResolution:
     """Regression tests for backend address resolution."""
 
-    def test_backend_host_localhost_falls_back_to_ipv4(self):
+    async def test_backend_host_localhost_falls_back_to_ipv4(self):
         """Proxy should try all getaddrinfo entries when connecting to backend host.
 
         On many macOS setups localhost resolves to [::1, 127.0.0.1]. If the backend
@@ -4703,7 +4672,7 @@ class TestBackendAddressResolution:
         backend = HTTPServer(("127.0.0.1", backend_port), BackendHandler)
         backend_thread = threading.Thread(target=backend.serve_forever, daemon=True)
         backend_thread.start()
-        time.sleep(0.1)
+        await asyncio.sleep(0.1)
 
         config_file = os.path.join(PROJECT_ROOT, "tests", "test_localhost_backend_config.json")
         config = [{
@@ -4716,25 +4685,14 @@ class TestBackendAddressResolution:
         with open(config_file, "w") as f:
             json.dump(config, f)
 
-        env = os.environ.copy()
-        env["REVPX_PORT"] = str(https_port)
-        env["REVPX_PORT_PLAIN"] = str(http_port)
-
-        binary = os.path.join(PROJECT_ROOT, "build", "revpx")
-        process = subprocess.Popen(
-            [binary, "-f", config_file],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=PROJECT_ROOT,
-            env=env,
-        )
-        time.sleep(1)
+        process = await async_start_revpx(config_file, https_port=https_port, http_port=http_port)
+        await asyncio.sleep(1)
 
         try:
-            assert process.poll() is None, "Proxy exited unexpectedly"
+            assert process.returncode is None, "Proxy exited unexpectedly"
 
             client = ProxyClient(host=domain, port=https_port)
-            status, _, body = client.request("GET", "/localhost-fallback")
+            status, _, body = await async_request(client, "GET", "/localhost-fallback")
 
             assert status == 200, (
                 "Expected successful routing via IPv4 localhost fallback; "
@@ -4744,12 +4702,7 @@ class TestBackendAddressResolution:
             data = json.loads(body)
             assert data["path"] == "/localhost-fallback"
         finally:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+            await async_stop_process(process, timeout=5.0)
 
             backend.shutdown()
             backend.server_close()
