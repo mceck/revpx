@@ -1040,54 +1040,64 @@ class TestConnectionHandling:
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
 
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
-            with context.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                # First request
-                request1 = (
-                    f"GET /first HTTP/1.1\r\n"
-                    f"Host: {TEST_DOMAIN}\r\n"
-                    f"Connection: keep-alive\r\n"
-                    f"\r\n"
-                ).encode()
-                ssock.sendall(request1)
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", HTTPS_PORT, ssl=context, server_hostname=TEST_DOMAIN
+        )
+        try:
+            # First request
+            request1 = (
+                f"GET /first HTTP/1.1\r\n"
+                f"Host: {TEST_DOMAIN}\r\n"
+                f"Connection: keep-alive\r\n"
+                f"\r\n"
+            ).encode()
+            writer.write(request1)
+            await writer.drain()
 
-                # Read response
-                response1 = b""
-                while b"\r\n\r\n" not in response1:
-                    response1 += ssock.recv(4096)
+            # Read response
+            response1 = b""
+            while b"\r\n\r\n" not in response1:
+                response1 += await reader.read(4096)
 
-                header_end = response1.index(b"\r\n\r\n") + 4
-                content_length = 0
-                for line in response1[:header_end].decode().split("\r\n"):
-                    if line.lower().startswith("content-length:"):
-                        content_length = int(line.split(":")[1].strip())
+            header_end = response1.index(b"\r\n\r\n") + 4
+            content_length = 0
+            for line in response1[:header_end].decode().split("\r\n"):
+                if line.lower().startswith("content-length:"):
+                    content_length = int(line.split(":")[1].strip())
 
-                while len(response1) < header_end + content_length:
-                    response1 += ssock.recv(4096)
+            while len(response1) < header_end + content_length:
+                response1 += await reader.read(4096)
 
-                assert b"200" in response1.split(b"\r\n")[0]
+            assert b"200" in response1.split(b"\r\n")[0]
 
-                # Second request on same connection
-                request2 = (
-                    f"GET /second HTTP/1.1\r\n"
-                    f"Host: {TEST_DOMAIN}\r\n"
-                    f"Connection: close\r\n"
-                    f"\r\n"
-                ).encode()
-                ssock.sendall(request2)
+            # Second request on same connection
+            request2 = (
+                f"GET /second HTTP/1.1\r\n"
+                f"Host: {TEST_DOMAIN}\r\n"
+                f"Connection: close\r\n"
+                f"\r\n"
+            ).encode()
+            writer.write(request2)
+            await writer.drain()
 
-                # Read second response
-                response2 = b""
-                try:
-                    while True:
-                        chunk = ssock.recv(4096)
-                        if not chunk:
-                            break
-                        response2 += chunk
-                except:
-                    pass
+            # Read second response
+            response2 = b""
+            try:
+                while True:
+                    chunk = await reader.read(4096)
+                    if not chunk:
+                        break
+                    response2 += chunk
+            except Exception:
+                pass
 
-                assert b"200" in response2.split(b"\r\n")[0]
+            assert b"200" in response2.split(b"\r\n")[0]
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -1287,12 +1297,21 @@ class TestSSL:
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
 
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
-            with context.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                request = f"GET / HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\n\r\n".encode()
-                ssock.sendall(request)
-                response = ssock.recv(4096)
-                assert b"200" in response
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", HTTPS_PORT, ssl=context, server_hostname=TEST_DOMAIN
+        )
+        try:
+            request = f"GET / HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\n\r\n".encode()
+            writer.write(request)
+            await writer.drain()
+            response = await reader.read(4096)
+            assert b"200" in response
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -1304,17 +1323,22 @@ class TestHTTPRedirect:
 
     async def test_http_redirects_to_https(self, proxy):
         """Test that HTTP requests are redirected to HTTPS"""
-        sock = socket.create_connection(("127.0.0.1", HTTP_PORT), timeout=10)
+        reader, writer = await asyncio.open_connection("127.0.0.1", HTTP_PORT)
         try:
             request = f"GET / HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\n\r\n".encode()
-            sock.sendall(request)
-            response = sock.recv(4096).decode()
+            writer.write(request)
+            await writer.drain()
+            response = (await reader.read(4096)).decode()
 
             # Should get a redirect response
             assert "301" in response or "302" in response or "307" in response or "308" in response
             assert "https" in response.lower() or "Location" in response
         finally:
-            sock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -1426,51 +1450,60 @@ class TestKeepAliveWithPayloads:
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
 
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=15) as sock:
-            with context.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                for i in range(5):
-                    body = os.urandom(10 * 1024)  # 10KB
-                    body_hash = hashlib.md5(body).hexdigest()
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", HTTPS_PORT, ssl=context, server_hostname=TEST_DOMAIN
+        )
+        try:
+            for i in range(5):
+                body = os.urandom(10 * 1024)  # 10KB
+                body_hash = hashlib.md5(body).hexdigest()
 
-                    request = (
-                        f"POST /keepalive/{i} HTTP/1.1\r\n"
-                        f"Host: {TEST_DOMAIN}\r\n"
-                        f"Content-Length: {len(body)}\r\n"
-                        f"Connection: keep-alive\r\n"
-                        f"\r\n"
-                    ).encode() + body
+                request = (
+                    f"POST /keepalive/{i} HTTP/1.1\r\n"
+                    f"Host: {TEST_DOMAIN}\r\n"
+                    f"Content-Length: {len(body)}\r\n"
+                    f"Connection: keep-alive\r\n"
+                    f"\r\n"
+                ).encode() + body
 
-                    ssock.sendall(request)
+                writer.write(request)
+                await writer.drain()
 
-                    # Read response headers
-                    response = b""
-                    while b"\r\n\r\n" not in response:
-                        chunk = ssock.recv(8192)
-                        if not chunk:
-                            break
-                        response += chunk
+                # Read response headers
+                response = b""
+                while b"\r\n\r\n" not in response:
+                    chunk = await reader.read(8192)
+                    if not chunk:
+                        break
+                    response += chunk
 
-                    assert b"\r\n\r\n" in response, f"Iteration {i}: incomplete response headers"
+                assert b"\r\n\r\n" in response, f"Iteration {i}: incomplete response headers"
 
-                    header_end = response.index(b"\r\n\r\n") + 4
-                    headers_part = response[:header_end].decode()
+                header_end = response.index(b"\r\n\r\n") + 4
+                headers_part = response[:header_end].decode()
 
-                    content_length = 0
-                    for line in headers_part.split("\r\n"):
-                        if line.lower().startswith("content-length:"):
-                            content_length = int(line.split(":")[1].strip())
+                content_length = 0
+                for line in headers_part.split("\r\n"):
+                    if line.lower().startswith("content-length:"):
+                        content_length = int(line.split(":")[1].strip())
 
-                    body_data = response[header_end:]
-                    while len(body_data) < content_length:
-                        chunk = ssock.recv(8192)
-                        if not chunk:
-                            break
-                        body_data += chunk
+                body_data = response[header_end:]
+                while len(body_data) < content_length:
+                    chunk = await reader.read(8192)
+                    if not chunk:
+                        break
+                    body_data += chunk
 
-                    assert b"200" in response.split(b"\r\n")[0], f"Iteration {i}: not 200"
+                assert b"200" in response.split(b"\r\n")[0], f"Iteration {i}: not 200"
 
-                    data = json.loads(body_data[:content_length])
-                    assert data["body_hash"] == body_hash, f"Iteration {i}: body hash mismatch"
+                data = json.loads(body_data[:content_length])
+                assert data["body_hash"] == body_hash, f"Iteration {i}: body hash mismatch"
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_keepalive_mixed_sizes(self, proxy):
         """Test keep-alive with alternating small and large requests"""
@@ -1480,49 +1513,58 @@ class TestKeepAliveWithPayloads:
 
         sizes = [100, 50000, 200, 80000, 50]
 
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=30) as sock:
-            with context.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                for i, size in enumerate(sizes):
-                    body = os.urandom(size)
-                    body_hash = hashlib.md5(body).hexdigest()
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", HTTPS_PORT, ssl=context, server_hostname=TEST_DOMAIN
+        )
+        try:
+            for i, size in enumerate(sizes):
+                body = os.urandom(size)
+                body_hash = hashlib.md5(body).hexdigest()
 
-                    request = (
-                        f"POST /mixed-sizes/{i} HTTP/1.1\r\n"
-                        f"Host: {TEST_DOMAIN}\r\n"
-                        f"Content-Length: {len(body)}\r\n"
-                        f"Connection: keep-alive\r\n"
-                        f"\r\n"
-                    ).encode() + body
+                request = (
+                    f"POST /mixed-sizes/{i} HTTP/1.1\r\n"
+                    f"Host: {TEST_DOMAIN}\r\n"
+                    f"Content-Length: {len(body)}\r\n"
+                    f"Connection: keep-alive\r\n"
+                    f"\r\n"
+                ).encode() + body
 
-                    ssock.sendall(request)
+                writer.write(request)
+                await writer.drain()
 
-                    response = b""
-                    while b"\r\n\r\n" not in response:
-                        chunk = ssock.recv(8192)
-                        if not chunk:
-                            break
-                        response += chunk
+                response = b""
+                while b"\r\n\r\n" not in response:
+                    chunk = await reader.read(8192)
+                    if not chunk:
+                        break
+                    response += chunk
 
-                    assert b"\r\n\r\n" in response
+                assert b"\r\n\r\n" in response
 
-                    header_end = response.index(b"\r\n\r\n") + 4
-                    headers_part = response[:header_end].decode()
+                header_end = response.index(b"\r\n\r\n") + 4
+                headers_part = response[:header_end].decode()
 
-                    content_length = 0
-                    for line in headers_part.split("\r\n"):
-                        if line.lower().startswith("content-length:"):
-                            content_length = int(line.split(":")[1].strip())
+                content_length = 0
+                for line in headers_part.split("\r\n"):
+                    if line.lower().startswith("content-length:"):
+                        content_length = int(line.split(":")[1].strip())
 
-                    body_data = response[header_end:]
-                    while len(body_data) < content_length:
-                        chunk = ssock.recv(8192)
-                        if not chunk:
-                            break
-                        body_data += chunk
+                body_data = response[header_end:]
+                while len(body_data) < content_length:
+                    chunk = await reader.read(8192)
+                    if not chunk:
+                        break
+                    body_data += chunk
 
-                    assert b"200" in response.split(b"\r\n")[0]
-                    data = json.loads(body_data[:content_length])
-                    assert data["body_hash"] == body_hash, f"Size {size}: body hash mismatch"
+                assert b"200" in response.split(b"\r\n")[0]
+                data = json.loads(body_data[:content_length])
+                assert data["body_hash"] == body_hash, f"Size {size}: body hash mismatch"
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -1551,21 +1593,30 @@ class TestHTTPPipelining:
                 f"\r\n"
             ).encode() + body
 
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=15) as sock:
-            with context.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                ssock.sendall(all_requests)
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", HTTPS_PORT, ssl=context, server_hostname=TEST_DOMAIN
+        )
+        try:
+            writer.write(all_requests)
+            await writer.drain()
 
-                # Read all responses
-                all_data = b""
-                responses_found = 0
-                while responses_found < len(bodies):
-                    chunk = ssock.recv(8192)
-                    if not chunk:
-                        break
-                    all_data += chunk
-                    responses_found = all_data.count(b"HTTP/1.1 200")
+            # Read all responses
+            all_data = b""
+            responses_found = 0
+            while responses_found < len(bodies):
+                chunk = await reader.read(8192)
+                if not chunk:
+                    break
+                all_data += chunk
+                responses_found = all_data.count(b"HTTP/1.1 200")
 
-                assert responses_found == len(bodies), f"Expected {len(bodies)} responses, got {responses_found}"
+            assert responses_found == len(bodies), f"Expected {len(bodies)} responses, got {responses_found}"
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================

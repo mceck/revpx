@@ -129,6 +129,81 @@ async def async_send_raw(raw: RawSSLClient, data: bytes, timeout: float = 5.0) -
     return await asyncio.to_thread(raw.send_raw, data, timeout)
 
 
+async def async_make_ssl_connection(host=TEST_DOMAIN, port=HTTPS_PORT):
+    """Create an async SSL connection to the proxy"""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    reader, writer = await asyncio.open_connection(
+        "127.0.0.1", port, ssl=ctx, server_hostname=host
+    )
+    return reader, writer
+
+
+_ASYNC_RESPONSE_BUFFER = {}
+
+
+async def async_read_http_response(reader, writer):
+    """Read one HTTP response from an async stream, preserving extra bytes for pipelining."""
+    buf_id = id(reader)
+    response = _ASYNC_RESPONSE_BUFFER.pop(buf_id, b"")
+    while b"\r\n\r\n" not in response:
+        chunk = await reader.read(8192)
+        if not chunk:
+            raise ConnectionError("Connection closed before headers complete")
+        response += chunk
+
+    header_end = response.index(b"\r\n\r\n") + 4
+    headers_raw = response[:header_end].decode()
+    body_data = response[header_end:]
+
+    status_line = headers_raw.split("\r\n")[0]
+    status = int(status_line.split()[1])
+
+    headers = {}
+    for line in headers_raw.split("\r\n")[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            headers[k.strip()] = v.strip()
+
+    content_length = int(headers.get("Content-Length", 0))
+    while len(body_data) < content_length:
+        chunk = await reader.read(8192)
+        if not chunk:
+            break
+        body_data += chunk
+
+    if len(body_data) > content_length:
+        _ASYNC_RESPONSE_BUFFER[buf_id] = body_data[content_length:]
+
+    return status, headers, body_data[:content_length]
+
+
+async def async_read_ws_frame(reader, timeout=5.0):
+    """Read a WebSocket frame from an async stream and return payload"""
+    async def _read_exact(n):
+        data = b""
+        while len(data) < n:
+            chunk = await reader.read(n - len(data))
+            if not chunk:
+                raise ConnectionError("Connection closed reading WS frame")
+            data += chunk
+        return data
+
+    header = await asyncio.wait_for(_read_exact(2), timeout=timeout)
+
+    payload_len = header[1] & 0x7F
+    if payload_len == 126:
+        ext = await _read_exact(2)
+        payload_len = struct.unpack(">H", ext)[0]
+    elif payload_len == 127:
+        ext = await _read_exact(8)
+        payload_len = struct.unpack(">Q", ext)[0]
+
+    payload = await _read_exact(payload_len)
+    return payload
+
+
 async def async_request(
     client: ProxyClient,
     method: str = "GET",
@@ -395,7 +470,7 @@ class TestForwardedHeaders:
 
     async def test_forwarded_headers_on_keepalive(self, proxy):
         """Forwarded headers should be injected on each keep-alive request"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             for i in range(3):
                 request = (
@@ -404,15 +479,20 @@ class TestForwardedHeaders:
                     f"Connection: keep-alive\r\n"
                     f"\r\n"
                 ).encode()
-                ssock.sendall(request)
+                writer.write(request)
+                await writer.drain()
 
-                status, _, body = read_http_response(ssock)
+                status, _, body = await async_read_http_response(reader, writer)
                 assert status == 200, f"Request {i}: expected 200, got {status}"
                 data = json.loads(body)
                 assert data["headers"].get("X-Forwarded-Proto") == "https", \
                     f"Request {i}: missing X-Forwarded-Proto"
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -846,12 +926,12 @@ class WebSocketMissingUpgradeHeaderHandler(BaseHTTPRequestHandler):
 WS_BACKEND_PORT = 18001
 
 
-@pytest.fixture(scope="module")
-def ws_backend():
+@pytest_asyncio.fixture(scope="module")
+async def ws_backend():
     server = HTTPServer(("127.0.0.1", WS_BACKEND_PORT), WebSocketBackendHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    wait_for_tcp_port(WS_BACKEND_PORT, timeout=2.0)
+    await async_wait_for_tcp_port(WS_BACKEND_PORT, timeout=2.0)
     yield server
     server.shutdown()
 
@@ -865,72 +945,72 @@ WS_MISSING_CONN_UPGRADE_PORT = 18012
 WS_MISSING_UPGRADE_PORT = 18013
 
 
-@pytest.fixture(scope="module")
-def ws_reject_backend():
+@pytest_asyncio.fixture(scope="module")
+async def ws_reject_backend():
     server = HTTPServer(("127.0.0.1", WS_REJECT_PORT), WebSocketRejectHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    wait_for_tcp_port(WS_REJECT_PORT, timeout=2.0)
+    await async_wait_for_tcp_port(WS_REJECT_PORT, timeout=2.0)
     yield server
     server.shutdown()
 
 
-@pytest.fixture(scope="module")
-def ws_fragmented_backend():
+@pytest_asyncio.fixture(scope="module")
+async def ws_fragmented_backend():
     server = HTTPServer(("127.0.0.1", WS_FRAGMENTED_PORT), WebSocketFragmented101Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    wait_for_tcp_port(WS_FRAGMENTED_PORT, timeout=2.0)
+    await async_wait_for_tcp_port(WS_FRAGMENTED_PORT, timeout=2.0)
     yield server
     server.shutdown()
 
 
-@pytest.fixture(scope="module")
-def ws_dup_conn_backend():
+@pytest_asyncio.fixture(scope="module")
+async def ws_dup_conn_backend():
     server = HTTPServer(("127.0.0.1", WS_DUP_CONN_PORT), WebSocketDuplicateConnectionHeaderHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    wait_for_tcp_port(WS_DUP_CONN_PORT, timeout=2.0)
+    await async_wait_for_tcp_port(WS_DUP_CONN_PORT, timeout=2.0)
     yield server
     server.shutdown()
 
 
-@pytest.fixture(scope="module")
-def ws_raw_dup_conn_backend():
+@pytest_asyncio.fixture(scope="module")
+async def ws_raw_dup_conn_backend():
     server = HTTPServer(("127.0.0.1", WS_RAW_DUP_CONN_PORT), WebSocketRawDuplicateConnectionHeaderHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    wait_for_tcp_port(WS_RAW_DUP_CONN_PORT, timeout=2.0)
+    await async_wait_for_tcp_port(WS_RAW_DUP_CONN_PORT, timeout=2.0)
     yield server
     server.shutdown()
 
 
-@pytest.fixture(scope="module")
-def ws_raw_dup_upgrade_backend():
+@pytest_asyncio.fixture(scope="module")
+async def ws_raw_dup_upgrade_backend():
     server = HTTPServer(("127.0.0.1", WS_RAW_DUP_UPGRADE_PORT), WebSocketRawDuplicateUpgradeHeaderHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    wait_for_tcp_port(WS_RAW_DUP_UPGRADE_PORT, timeout=2.0)
+    await async_wait_for_tcp_port(WS_RAW_DUP_UPGRADE_PORT, timeout=2.0)
     yield server
     server.shutdown()
 
 
-@pytest.fixture(scope="module")
-def ws_missing_conn_upgrade_backend():
+@pytest_asyncio.fixture(scope="module")
+async def ws_missing_conn_upgrade_backend():
     server = HTTPServer(("127.0.0.1", WS_MISSING_CONN_UPGRADE_PORT), WebSocketMissingConnectionUpgradeHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    wait_for_tcp_port(WS_MISSING_CONN_UPGRADE_PORT, timeout=2.0)
+    await async_wait_for_tcp_port(WS_MISSING_CONN_UPGRADE_PORT, timeout=2.0)
     yield server
     server.shutdown()
 
 
-@pytest.fixture(scope="module")
-def ws_missing_upgrade_backend():
+@pytest_asyncio.fixture(scope="module")
+async def ws_missing_upgrade_backend():
     server = HTTPServer(("127.0.0.1", WS_MISSING_UPGRADE_PORT), WebSocketMissingUpgradeHeaderHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    wait_for_tcp_port(WS_MISSING_UPGRADE_PORT, timeout=2.0)
+    await async_wait_for_tcp_port(WS_MISSING_UPGRADE_PORT, timeout=2.0)
     yield server
     server.shutdown()
 
@@ -1102,10 +1182,6 @@ class TestWebSocket:
 
     async def test_websocket_upgrade_echo(self, ws_proxy):
         """Full WebSocket handshake and echo through the proxy"""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
         ws_key = base64.b64encode(os.urandom(16)).decode()
         request = (
             f"GET /ws HTTP/1.1\r\n"
@@ -1117,37 +1193,42 @@ class TestWebSocket:
             f"\r\n"
         ).encode()
 
-        with socket.create_connection(("127.0.0.1", 18543), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=WS_DOMAIN) as ssock:
-                ssock.sendall(request)
+        reader, writer = await async_make_ssl_connection(host=WS_DOMAIN, port=18543)
+        try:
+            writer.write(request)
+            await writer.drain()
 
-                # Read 101 response
-                response = b""
-                while b"\r\n\r\n" not in response:
-                    chunk = ssock.recv(4096)
-                    if not chunk:
-                        break
-                    response += chunk
+            # Read 101 response
+            response = b""
+            while b"\r\n\r\n" not in response:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    break
+                response += chunk
 
-                assert b"101" in response.split(b"\r\n")[0], f"Expected 101, got: {response[:100]}"
+            assert b"101" in response.split(b"\r\n")[0], f"Expected 101, got: {response[:100]}"
 
-                # Send a text frame
-                message = b"Hello through proxy!"
-                ssock.sendall(ws_frame(message, opcode=0x1))
+            # Send a text frame
+            message = b"Hello through proxy!"
+            writer.write(ws_frame(message, opcode=0x1))
+            await writer.drain()
 
-                # Read echo
-                echoed = read_ws_frame(ssock)
-                assert echoed == message, f"Expected {message!r}, got {echoed!r}"
+            # Read echo
+            echoed = await async_read_ws_frame(reader)
+            assert echoed == message, f"Expected {message!r}, got {echoed!r}"
 
-                # Send close frame
-                ssock.sendall(ws_frame(b"", opcode=0x8))
+            # Send close frame
+            writer.write(ws_frame(b"", opcode=0x8))
+            await writer.drain()
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_websocket_upgrade_with_duplicate_connection_headers(self, ws_proxy):
         """Repeated Connection headers containing Upgrade should still allow WS tunneling."""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
         ws_key = base64.b64encode(os.urandom(16)).decode()
         request = (
             f"GET /ws-dup-conn HTTP/1.1\r\n"
@@ -1159,32 +1240,37 @@ class TestWebSocket:
             f"\r\n"
         ).encode()
 
-        with socket.create_connection(("127.0.0.1", 18543), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=WS_DUP_CONN_DOMAIN) as ssock:
-                ssock.sendall(request)
+        reader, writer = await async_make_ssl_connection(host=WS_DUP_CONN_DOMAIN, port=18543)
+        try:
+            writer.write(request)
+            await writer.drain()
 
-                response = b""
-                while b"\r\n\r\n" not in response:
-                    chunk = ssock.recv(4096)
-                    if not chunk:
-                        break
-                    response += chunk
+            response = b""
+            while b"\r\n\r\n" not in response:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    break
+                response += chunk
 
-                assert b"101" in response.split(b"\r\n")[0], f"Expected 101, got: {response[:120]}"
+            assert b"101" in response.split(b"\r\n")[0], f"Expected 101, got: {response[:120]}"
 
-                message = b"dup-conn-works"
-                ssock.sendall(ws_frame(message, opcode=0x1))
-                echoed = read_ws_frame(ssock)
-                assert echoed == message
+            message = b"dup-conn-works"
+            writer.write(ws_frame(message, opcode=0x1))
+            await writer.drain()
+            echoed = await async_read_ws_frame(reader)
+            assert echoed == message
 
-                ssock.sendall(ws_frame(b"", opcode=0x8))
+            writer.write(ws_frame(b"", opcode=0x8))
+            await writer.drain()
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_websocket_binary_frames(self, ws_proxy):
         """Binary WebSocket frames through the proxy tunnel"""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
         ws_key = base64.b64encode(os.urandom(16)).decode()
         request = (
             f"GET /ws-bin HTTP/1.1\r\n"
@@ -1196,34 +1282,39 @@ class TestWebSocket:
             f"\r\n"
         ).encode()
 
-        with socket.create_connection(("127.0.0.1", 18543), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=WS_DOMAIN) as ssock:
-                ssock.sendall(request)
+        reader, writer = await async_make_ssl_connection(host=WS_DOMAIN, port=18543)
+        try:
+            writer.write(request)
+            await writer.drain()
 
-                response = b""
-                while b"\r\n\r\n" not in response:
-                    chunk = ssock.recv(4096)
-                    if not chunk:
-                        break
-                    response += chunk
+            response = b""
+            while b"\r\n\r\n" not in response:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    break
+                response += chunk
 
-                assert b"101" in response.split(b"\r\n")[0]
+            assert b"101" in response.split(b"\r\n")[0]
 
-                # Send binary frame
-                binary_data = bytes(range(256))
-                ssock.sendall(ws_frame(binary_data, opcode=0x2))
+            # Send binary frame
+            binary_data = bytes(range(256))
+            writer.write(ws_frame(binary_data, opcode=0x2))
+            await writer.drain()
 
-                echoed = read_ws_frame(ssock)
-                assert echoed == binary_data
+            echoed = await async_read_ws_frame(reader)
+            assert echoed == binary_data
 
-                ssock.sendall(ws_frame(b"", opcode=0x8))
+            writer.write(ws_frame(b"", opcode=0x8))
+            await writer.drain()
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_websocket_upgrade_with_raw_duplicate_connection_headers(self, ws_proxy):
         """Raw repeated Connection field-lines containing Upgrade should allow WS tunneling."""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
         ws_key = base64.b64encode(os.urandom(16)).decode()
         request = (
             f"GET /ws-raw-dup-conn HTTP/1.1\r\n"
@@ -1235,32 +1326,37 @@ class TestWebSocket:
             f"\r\n"
         ).encode()
 
-        with socket.create_connection(("127.0.0.1", 18543), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=WS_RAW_DUP_CONN_DOMAIN) as ssock:
-                ssock.sendall(request)
+        reader, writer = await async_make_ssl_connection(host=WS_RAW_DUP_CONN_DOMAIN, port=18543)
+        try:
+            writer.write(request)
+            await writer.drain()
 
-                response = b""
-                while b"\r\n\r\n" not in response:
-                    chunk = ssock.recv(4096)
-                    if not chunk:
-                        break
-                    response += chunk
+            response = b""
+            while b"\r\n\r\n" not in response:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    break
+                response += chunk
 
-                assert b"101" in response.split(b"\r\n")[0], f"Expected 101, got: {response[:160]}"
+            assert b"101" in response.split(b"\r\n")[0], f"Expected 101, got: {response[:160]}"
 
-                message = b"raw-dup-conn-works"
-                ssock.sendall(ws_frame(message, opcode=0x1))
-                echoed = read_ws_frame(ssock)
-                assert echoed == message
+            message = b"raw-dup-conn-works"
+            writer.write(ws_frame(message, opcode=0x1))
+            await writer.drain()
+            echoed = await async_read_ws_frame(reader)
+            assert echoed == message
 
-                ssock.sendall(ws_frame(b"", opcode=0x8))
+            writer.write(ws_frame(b"", opcode=0x8))
+            await writer.drain()
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_websocket_upgrade_with_raw_duplicate_upgrade_headers(self, ws_proxy):
         """Raw repeated Upgrade field-lines should match websocket token across all lines."""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
         ws_key = base64.b64encode(os.urandom(16)).decode()
         request = (
             f"GET /ws-raw-dup-upgrade HTTP/1.1\r\n"
@@ -1272,32 +1368,37 @@ class TestWebSocket:
             f"\r\n"
         ).encode()
 
-        with socket.create_connection(("127.0.0.1", 18543), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=WS_RAW_DUP_UPGRADE_DOMAIN) as ssock:
-                ssock.sendall(request)
+        reader, writer = await async_make_ssl_connection(host=WS_RAW_DUP_UPGRADE_DOMAIN, port=18543)
+        try:
+            writer.write(request)
+            await writer.drain()
 
-                response = b""
-                while b"\r\n\r\n" not in response:
-                    chunk = ssock.recv(4096)
-                    if not chunk:
-                        break
-                    response += chunk
+            response = b""
+            while b"\r\n\r\n" not in response:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    break
+                response += chunk
 
-                assert b"101" in response.split(b"\r\n")[0], f"Expected 101, got: {response[:160]}"
+            assert b"101" in response.split(b"\r\n")[0], f"Expected 101, got: {response[:160]}"
 
-                message = b"raw-dup-upgrade-works"
-                ssock.sendall(ws_frame(message, opcode=0x1))
-                echoed = read_ws_frame(ssock)
-                assert echoed == message
+            message = b"raw-dup-upgrade-works"
+            writer.write(ws_frame(message, opcode=0x1))
+            await writer.drain()
+            echoed = await async_read_ws_frame(reader)
+            assert echoed == message
 
-                ssock.sendall(ws_frame(b"", opcode=0x8))
+            writer.write(ws_frame(b"", opcode=0x8))
+            await writer.drain()
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_websocket_failed_upgrade(self, ws_proxy):
         """Backend rejects WebSocket upgrade → proxy returns 502"""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
         ws_key = base64.b64encode(os.urandom(16)).decode()
         request = (
             f"GET /ws HTTP/1.1\r\n"
@@ -1309,29 +1410,31 @@ class TestWebSocket:
             f"\r\n"
         ).encode()
 
-        with socket.create_connection(("127.0.0.1", 18543), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=WS_REJECT_DOMAIN) as ssock:
-                ssock.sendall(request)
+        reader, writer = await async_make_ssl_connection(host=WS_REJECT_DOMAIN, port=18543)
+        try:
+            writer.write(request)
+            await writer.drain()
 
-                response = b""
-                ssock.settimeout(3.0)
-                try:
-                    while True:
-                        chunk = ssock.recv(4096)
-                        if not chunk:
-                            break
-                        response += chunk
-                except socket.timeout:
-                    pass
+            response = b""
+            try:
+                while True:
+                    chunk = await asyncio.wait_for(reader.read(4096), timeout=3.0)
+                    if not chunk:
+                        break
+                    response += chunk
+            except asyncio.TimeoutError:
+                pass
 
-                assert b"502" in response, f"Expected 502, got: {response[:200]}"
+            assert b"502" in response, f"Expected 502, got: {response[:200]}"
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_websocket_101_missing_connection_upgrade_is_rejected(self, ws_proxy):
         """Backend 101 without Connection: Upgrade must be rejected with 502."""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
         ws_key = base64.b64encode(os.urandom(16)).decode()
         request = (
             f"GET /ws-missing-conn-upgrade HTTP/1.1\r\n"
@@ -1343,29 +1446,31 @@ class TestWebSocket:
             f"\r\n"
         ).encode()
 
-        with socket.create_connection(("127.0.0.1", 18543), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=WS_MISSING_CONN_UPGRADE_DOMAIN) as ssock:
-                ssock.sendall(request)
+        reader, writer = await async_make_ssl_connection(host=WS_MISSING_CONN_UPGRADE_DOMAIN, port=18543)
+        try:
+            writer.write(request)
+            await writer.drain()
 
-                response = b""
-                ssock.settimeout(3.0)
-                try:
-                    while True:
-                        chunk = ssock.recv(4096)
-                        if not chunk:
-                            break
-                        response += chunk
-                except socket.timeout:
-                    pass
+            response = b""
+            try:
+                while True:
+                    chunk = await asyncio.wait_for(reader.read(4096), timeout=3.0)
+                    if not chunk:
+                        break
+                    response += chunk
+            except asyncio.TimeoutError:
+                pass
 
-                assert b"502" in response, f"Expected 502 for missing Connection: Upgrade, got: {response[:220]}"
+            assert b"502" in response, f"Expected 502 for missing Connection: Upgrade, got: {response[:220]}"
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_websocket_101_missing_upgrade_websocket_is_rejected(self, ws_proxy):
         """Backend 101 without Upgrade: websocket must be rejected with 502."""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
         ws_key = base64.b64encode(os.urandom(16)).decode()
         request = (
             f"GET /ws-missing-upgrade-token HTTP/1.1\r\n"
@@ -1377,22 +1482,28 @@ class TestWebSocket:
             f"\r\n"
         ).encode()
 
-        with socket.create_connection(("127.0.0.1", 18543), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=WS_MISSING_UPGRADE_DOMAIN) as ssock:
-                ssock.sendall(request)
+        reader, writer = await async_make_ssl_connection(host=WS_MISSING_UPGRADE_DOMAIN, port=18543)
+        try:
+            writer.write(request)
+            await writer.drain()
 
-                response = b""
-                ssock.settimeout(3.0)
-                try:
-                    while True:
-                        chunk = ssock.recv(4096)
-                        if not chunk:
-                            break
-                        response += chunk
-                except socket.timeout:
-                    pass
+            response = b""
+            try:
+                while True:
+                    chunk = await asyncio.wait_for(reader.read(4096), timeout=3.0)
+                    if not chunk:
+                        break
+                    response += chunk
+            except asyncio.TimeoutError:
+                pass
 
-                assert b"502" in response, f"Expected 502 for missing Upgrade:websocket, got: {response[:220]}"
+            assert b"502" in response, f"Expected 502 for missing Upgrade:websocket, got: {response[:220]}"
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -1418,27 +1529,29 @@ class TestBackendErrors:
         process = await async_start_revpx(config_file, https_port=18643, http_port=18680)
 
         try:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
+            reader, writer = await async_make_ssl_connection(host="nobackend.localhost", port=18643)
+            try:
+                request = f"GET / HTTP/1.1\r\nHost: nobackend.localhost\r\n\r\n".encode()
+                writer.write(request)
+                await writer.drain()
 
-            with socket.create_connection(("127.0.0.1", 18643), timeout=10) as sock:
-                with ctx.wrap_socket(sock, server_hostname="nobackend.localhost") as ssock:
-                    request = f"GET / HTTP/1.1\r\nHost: nobackend.localhost\r\n\r\n".encode()
-                    ssock.sendall(request)
+                response = b""
+                try:
+                    while True:
+                        chunk = await asyncio.wait_for(reader.read(4096), timeout=5.0)
+                        if not chunk:
+                            break
+                        response += chunk
+                except asyncio.TimeoutError:
+                    pass
 
-                    response = b""
-                    ssock.settimeout(5.0)
-                    try:
-                        while True:
-                            chunk = ssock.recv(4096)
-                            if not chunk:
-                                break
-                            response += chunk
-                    except socket.timeout:
-                        pass
-
-                    assert b"502" in response, f"Expected 502, got: {response[:200]}"
+                assert b"502" in response, f"Expected 502, got: {response[:200]}"
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
         finally:
             await async_stop_process(process, timeout=5.0)
             if os.path.exists(config_file):
@@ -1446,28 +1559,30 @@ class TestBackendErrors:
 
     async def test_unknown_domain_returns_421(self, proxy):
         """Request for unknown domain should return 421 Misdirected Request"""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
         # Connect with SNI for test.localhost but send Host header for unknown domain
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                request = f"GET / HTTP/1.1\r\nHost: unknown.example.com\r\n\r\n".encode()
-                ssock.sendall(request)
+        reader, writer = await async_make_ssl_connection()
+        try:
+            request = f"GET / HTTP/1.1\r\nHost: unknown.example.com\r\n\r\n".encode()
+            writer.write(request)
+            await writer.drain()
 
-                response = b""
-                ssock.settimeout(3.0)
-                try:
-                    while True:
-                        chunk = ssock.recv(4096)
-                        if not chunk:
-                            break
-                        response += chunk
-                except socket.timeout:
-                    pass
+            response = b""
+            try:
+                while True:
+                    chunk = await asyncio.wait_for(reader.read(4096), timeout=3.0)
+                    if not chunk:
+                        break
+                    response += chunk
+            except asyncio.TimeoutError:
+                pass
 
-                assert b"421" in response, f"Expected 421, got: {response[:200]}"
+            assert b"421" in response, f"Expected 421, got: {response[:200]}"
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_backend_closes_immediately(self, proxy):
         """Backend that accepts then immediately closes should not crash the proxy"""
@@ -1509,15 +1624,21 @@ class TestBackendErrors:
 
             # This may return an error or close - main thing is proxy doesn't crash
             try:
-                with socket.create_connection(("127.0.0.1", 18743), timeout=10) as sock:
-                    with ctx.wrap_socket(sock, server_hostname="closeme.localhost") as ssock:
-                        request = f"GET / HTTP/1.1\r\nHost: closeme.localhost\r\n\r\n".encode()
-                        ssock.sendall(request)
-                        ssock.settimeout(3.0)
-                        try:
-                            ssock.recv(4096)
-                        except (socket.timeout, ssl.SSLError):
-                            pass
+                reader, writer = await async_make_ssl_connection(host="closeme.localhost", port=18743)
+                try:
+                    request = f"GET / HTTP/1.1\r\nHost: closeme.localhost\r\n\r\n".encode()
+                    writer.write(request)
+                    await writer.drain()
+                    try:
+                        await asyncio.wait_for(reader.read(4096), timeout=3.0)
+                    except (asyncio.TimeoutError, ssl.SSLError):
+                        pass
+                finally:
+                    writer.close()
+                    try:
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
             except (ConnectionError, ssl.SSLError, OSError):
                 pass
 
@@ -1617,31 +1738,34 @@ class TestChunkedRequestEdgeCases:
 
     async def test_multiple_chunked_requests_keepalive(self, proxy):
         """Multiple chunked POST requests on the same keep-alive connection"""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
         bodies = [b"first-chunked", b"second-chunked-body", b"third"]
 
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=15) as sock:
-            with ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                for i, body_data in enumerate(bodies):
-                    chunked = f"{len(body_data):x}\r\n".encode() + body_data + b"\r\n0\r\n\r\n"
-                    request = (
-                        f"POST /chunked-ka/{i} HTTP/1.1\r\n"
-                        f"Host: {TEST_DOMAIN}\r\n"
-                        f"Transfer-Encoding: chunked\r\n"
-                        f"Connection: keep-alive\r\n"
-                        f"\r\n"
-                    ).encode() + chunked
+        reader, writer = await async_make_ssl_connection()
+        try:
+            for i, body_data in enumerate(bodies):
+                chunked = f"{len(body_data):x}\r\n".encode() + body_data + b"\r\n0\r\n\r\n"
+                request = (
+                    f"POST /chunked-ka/{i} HTTP/1.1\r\n"
+                    f"Host: {TEST_DOMAIN}\r\n"
+                    f"Transfer-Encoding: chunked\r\n"
+                    f"Connection: keep-alive\r\n"
+                    f"\r\n"
+                ).encode() + chunked
 
-                    ssock.sendall(request)
-                    status, _, resp_body = read_http_response(ssock)
-                    assert status == 200, f"Request {i}: expected 200, got {status}"
+                writer.write(request)
+                await writer.drain()
+                status, _, resp_body = await async_read_http_response(reader, writer)
+                assert status == 200, f"Request {i}: expected 200, got {status}"
 
-                    data = json.loads(resp_body)
-                    assert data["body_length"] == len(body_data), \
-                        f"Request {i}: expected body_length {len(body_data)}, got {data['body_length']}"
+                data = json.loads(resp_body)
+                assert data["body_length"] == len(body_data), \
+                    f"Request {i}: expected body_length {len(body_data)}, got {data['body_length']}"
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_chunked_request_large_body(self, proxy):
         """Chunked request with body larger than 32KB buffer"""
@@ -1722,26 +1846,33 @@ class TestChunkedRequestEdgeCases:
 class TestHTTPRedirectDetails:
     """Test HTTP→HTTPS redirect specifics"""
 
-    def _http_request(self, request_data: bytes, port: int = HTTP_PORT, timeout: float = 5.0) -> bytes:
+    async def _http_request(self, request_data: bytes, port: int = HTTP_PORT, timeout: float = 5.0) -> bytes:
         """Send raw HTTP (non-SSL) request"""
-        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
-            sock.sendall(request_data)
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(request_data)
+            await writer.drain()
             response = b""
-            sock.settimeout(2.0)
             try:
                 while True:
-                    chunk = sock.recv(4096)
+                    chunk = await asyncio.wait_for(reader.read(4096), timeout=2.0)
                     if not chunk:
                         break
                     response += chunk
-            except socket.timeout:
+            except asyncio.TimeoutError:
                 pass
             return response
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_redirect_preserves_path(self, proxy):
         """Redirect Location should preserve the request path"""
         request = f"GET /some/path HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\n\r\n".encode()
-        response = self._http_request(request)
+        response = await self._http_request(request)
 
         assert b"301" in response
         # Find Location header
@@ -1755,7 +1886,7 @@ class TestHTTPRedirectDetails:
     async def test_redirect_preserves_query_string(self, proxy):
         """Redirect Location should preserve query string"""
         request = f"GET /search?q=test&page=1 HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\n\r\n".encode()
-        response = self._http_request(request)
+        response = await self._http_request(request)
 
         assert b"301" in response
         for line in response.decode(errors="replace").split("\r\n"):
@@ -1767,7 +1898,7 @@ class TestHTTPRedirectDetails:
     async def test_redirect_includes_non_standard_port(self, proxy):
         """Redirect Location should include port when not 443"""
         request = f"GET / HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\n\r\n".encode()
-        response = self._http_request(request)
+        response = await self._http_request(request)
 
         assert b"301" in response
         for line in response.decode(errors="replace").split("\r\n"):
@@ -1781,7 +1912,7 @@ class TestHTTPRedirectDetails:
     async def test_redirect_no_host_returns_400(self, proxy):
         """HTTP request without Host header should return 400"""
         request = b"GET / HTTP/1.1\r\n\r\n"
-        response = self._http_request(request)
+        response = await self._http_request(request)
 
         assert b"400" in response, f"Expected 400 for missing Host, got: {response[:200]}"
 
@@ -1795,20 +1926,21 @@ class TestKeepAliveRequestBoundaries:
 
     async def test_keepalive_get_then_post_then_get(self, proxy):
         """Alternating GET and POST on same connection"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             # GET
-            ssock.sendall(
+            writer.write(
                 f"GET /ka-mixed/1 HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\nConnection: keep-alive\r\n\r\n".encode()
             )
-            status, _, body = read_http_response(ssock)
+            await writer.drain()
+            status, _, body = await async_read_http_response(reader, writer)
             assert status == 200
             data = json.loads(body)
             assert data["method"] == "GET"
 
             # POST with body
             post_body = b"post-body-data"
-            ssock.sendall(
+            writer.write(
                 (
                     f"POST /ka-mixed/2 HTTP/1.1\r\n"
                     f"Host: {TEST_DOMAIN}\r\n"
@@ -1817,37 +1949,44 @@ class TestKeepAliveRequestBoundaries:
                     f"\r\n"
                 ).encode() + post_body
             )
-            status, _, body = read_http_response(ssock)
+            await writer.drain()
+            status, _, body = await async_read_http_response(reader, writer)
             assert status == 200
             data = json.loads(body)
             assert data["method"] == "POST"
             assert data["body_length"] == len(post_body)
 
             # GET again
-            ssock.sendall(
+            writer.write(
                 f"GET /ka-mixed/3 HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\nConnection: keep-alive\r\n\r\n".encode()
             )
-            status, _, body = read_http_response(ssock)
+            await writer.drain()
+            status, _, body = await async_read_http_response(reader, writer)
             assert status == 200
             data = json.loads(body)
             assert data["method"] == "GET"
             assert data["path"] == "/ka-mixed/3"
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_keepalive_post_with_no_body(self, proxy):
         """POST with Content-Length: 0 between other requests"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             # GET
-            ssock.sendall(
+            writer.write(
                 f"GET /ka-zero/1 HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\nConnection: keep-alive\r\n\r\n".encode()
             )
-            status, _, _ = read_http_response(ssock)
+            await writer.drain()
+            status, _, _ = await async_read_http_response(reader, writer)
             assert status == 200
 
             # POST with empty body
-            ssock.sendall(
+            writer.write(
                 (
                     f"POST /ka-zero/2 HTTP/1.1\r\n"
                     f"Host: {TEST_DOMAIN}\r\n"
@@ -1856,31 +1995,37 @@ class TestKeepAliveRequestBoundaries:
                     f"\r\n"
                 ).encode()
             )
-            status, _, body = read_http_response(ssock)
+            await writer.drain()
+            status, _, body = await async_read_http_response(reader, writer)
             assert status == 200
             data = json.loads(body)
             assert data["body_length"] == 0
 
             # Another GET
-            ssock.sendall(
+            writer.write(
                 f"GET /ka-zero/3 HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\nConnection: keep-alive\r\n\r\n".encode()
             )
-            status, _, body = read_http_response(ssock)
+            await writer.drain()
+            status, _, body = await async_read_http_response(reader, writer)
             assert status == 200
             data = json.loads(body)
             assert data["method"] == "GET"
             assert data["path"] == "/ka-zero/3"
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_keepalive_post_body_exactly_buffer_size(self, proxy):
         """POST with body exactly 32KB on keep-alive, followed by another request"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             body_32k = b"A" * (32 * 1024)
             body_hash = hashlib.md5(body_32k).hexdigest()
 
-            ssock.sendall(
+            writer.write(
                 (
                     f"POST /ka-buf/1 HTTP/1.1\r\n"
                     f"Host: {TEST_DOMAIN}\r\n"
@@ -1889,36 +2034,47 @@ class TestKeepAliveRequestBoundaries:
                     f"\r\n"
                 ).encode() + body_32k
             )
-            status, _, body = read_http_response(ssock)
+            await writer.drain()
+            status, _, body = await async_read_http_response(reader, writer)
             assert status == 200
             data = json.loads(body)
             assert data["body_hash"] == body_hash
 
             # Follow-up GET
-            ssock.sendall(
+            writer.write(
                 f"GET /ka-buf/2 HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\nConnection: keep-alive\r\n\r\n".encode()
             )
-            status, _, body = read_http_response(ssock)
+            await writer.drain()
+            status, _, body = await async_read_http_response(reader, writer)
             assert status == 200
             data = json.loads(body)
             assert data["path"] == "/ka-buf/2"
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_keepalive_many_small_gets(self, proxy):
         """20+ GETs on the same keep-alive connection"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             for i in range(25):
-                ssock.sendall(
+                writer.write(
                     f"GET /ka-many/{i} HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\nConnection: keep-alive\r\n\r\n".encode()
                 )
-                status, _, body = read_http_response(ssock)
+                await writer.drain()
+                status, _, body = await async_read_http_response(reader, writer)
                 assert status == 200, f"Request {i}: expected 200, got {status}"
                 data = json.loads(body)
                 assert data["path"] == f"/ka-many/{i}", f"Request {i}: wrong path"
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -1930,27 +2086,28 @@ class TestConnectionEdgeCases:
 
     async def test_client_sends_rst(self, proxy):
         """Client sending RST should not crash proxy"""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        def _sync_rst():
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            try:
+                sock = socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=5)
+                ssock = ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN)
+                ssock.sendall(
+                    f"GET / HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\n\r\n".encode()
+                )
+                # Force RST by setting SO_LINGER to 0
+                l_onoff = 1
+                l_linger = 0
+                import struct as _struct
+                ssock.unwrap()
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                _struct.pack('ii', l_onoff, l_linger))
+                sock.close()
+            except Exception:
+                pass
 
-        try:
-            sock = socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=5)
-            ssock = ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN)
-            ssock.sendall(
-                f"GET / HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\n\r\n".encode()
-            )
-            # Force RST by setting SO_LINGER to 0
-            l_onoff = 1
-            l_linger = 0
-            import struct as _struct
-            ssock.unwrap()
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
-                            _struct.pack('ii', l_onoff, l_linger))
-            sock.close()
-        except Exception:
-            pass
-
+        await asyncio.to_thread(_sync_rst)
         await asyncio.sleep(0.5)
 
         # Proxy should still work
@@ -1964,24 +2121,32 @@ class TestConnectionEdgeCases:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                ssock.sendall(
-                    f"GET / HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\nConnection: close\r\n\r\n".encode()
-                )
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", HTTPS_PORT, ssl=ctx, server_hostname=TEST_DOMAIN
+        )
+        try:
+            writer.write(
+                f"GET / HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\nConnection: close\r\n\r\n".encode()
+            )
+            await writer.drain()
 
-                # Read the response
-                response = b""
-                try:
-                    while True:
-                        chunk = ssock.recv(4096)
-                        if not chunk:
-                            break
-                        response += chunk
-                except socket.timeout:
-                    pass
+            response = b""
+            try:
+                while True:
+                    chunk = await reader.read(4096)
+                    if not chunk:
+                        break
+                    response += chunk
+            except Exception:
+                pass
 
-                assert b"200" in response
+            assert b"200" in response
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_backend_slow_connect(self, proxy):
         """Test that client data is buffered during ST_CONNECTING"""
@@ -2010,10 +2175,6 @@ class TestPipelinedForwardedHeaders:
 
     async def test_pipelined_gets_both_have_forwarded_headers(self, proxy):
         """Two pipelined GETs sent in one write - both must have X-Forwarded-For"""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
         # Send two GETs in a single write so they arrive in one TCP segment
         requests = (
             f"GET /pipe-fwd/1 HTTP/1.1\r\n"
@@ -2026,34 +2187,37 @@ class TestPipelinedForwardedHeaders:
             f"\r\n"
         ).encode()
 
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                ssock.sendall(requests)
+        reader, writer = await async_make_ssl_connection()
+        try:
+            writer.write(requests)
+            await writer.drain()
 
-                # Read first response
-                status1, _, body1 = read_http_response(ssock)
-                assert status1 == 200
-                data1 = json.loads(body1)
-                assert data1["path"] == "/pipe-fwd/1"
-                assert "X-Forwarded-For" in data1["headers"], \
-                    "First pipelined request missing X-Forwarded-For"
+            # Read first response
+            status1, _, body1 = await async_read_http_response(reader, writer)
+            assert status1 == 200
+            data1 = json.loads(body1)
+            assert data1["path"] == "/pipe-fwd/1"
+            assert "X-Forwarded-For" in data1["headers"], \
+                "First pipelined request missing X-Forwarded-For"
 
-                # Read second response
-                status2, _, body2 = read_http_response(ssock)
-                assert status2 == 200
-                data2 = json.loads(body2)
-                assert data2["path"] == "/pipe-fwd/2"
-                assert "X-Forwarded-For" in data2["headers"], \
-                    "Second pipelined request missing X-Forwarded-For"
-                assert "X-Forwarded-Proto" in data2["headers"], \
-                    "Second pipelined request missing X-Forwarded-Proto"
+            # Read second response
+            status2, _, body2 = await async_read_http_response(reader, writer)
+            assert status2 == 200
+            data2 = json.loads(body2)
+            assert data2["path"] == "/pipe-fwd/2"
+            assert "X-Forwarded-For" in data2["headers"], \
+                "Second pipelined request missing X-Forwarded-For"
+            assert "X-Forwarded-Proto" in data2["headers"], \
+                "Second pipelined request missing X-Forwarded-Proto"
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_pipelined_post_cl0_then_get_both_have_forwarded_headers(self, proxy):
         """POST with Content-Length: 0 followed by GET in one write"""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
         requests = (
             f"POST /pipe-cl0/1 HTTP/1.1\r\n"
             f"Host: {TEST_DOMAIN}\r\n"
@@ -2066,26 +2230,29 @@ class TestPipelinedForwardedHeaders:
             f"\r\n"
         ).encode()
 
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                ssock.sendall(requests)
+        reader, writer = await async_make_ssl_connection()
+        try:
+            writer.write(requests)
+            await writer.drain()
 
-                status1, _, body1 = read_http_response(ssock)
-                assert status1 == 200
+            status1, _, body1 = await async_read_http_response(reader, writer)
+            assert status1 == 200
 
-                status2, _, body2 = read_http_response(ssock)
-                assert status2 == 200
-                data2 = json.loads(body2)
-                assert data2["path"] == "/pipe-cl0/2"
-                assert "X-Forwarded-For" in data2["headers"], \
-                    "Request after CL:0 POST missing X-Forwarded-For"
+            status2, _, body2 = await async_read_http_response(reader, writer)
+            assert status2 == 200
+            data2 = json.loads(body2)
+            assert data2["path"] == "/pipe-cl0/2"
+            assert "X-Forwarded-For" in data2["headers"], \
+                "Request after CL:0 POST missing X-Forwarded-For"
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_pipelined_post_with_body_then_get_forwarded_headers(self, proxy):
         """POST with body followed by GET in one write - verify correct boundary"""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
         post_body = b"hello"
         requests = (
             f"POST /pipe-body/1 HTTP/1.1\r\n"
@@ -2100,28 +2267,31 @@ class TestPipelinedForwardedHeaders:
             f"\r\n"
         ).encode()
 
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                ssock.sendall(requests)
+        reader, writer = await async_make_ssl_connection()
+        try:
+            writer.write(requests)
+            await writer.drain()
 
-                status1, _, body1 = read_http_response(ssock)
-                assert status1 == 200
-                data1 = json.loads(body1)
-                assert data1["body_length"] == 5
+            status1, _, body1 = await async_read_http_response(reader, writer)
+            assert status1 == 200
+            data1 = json.loads(body1)
+            assert data1["body_length"] == 5
 
-                status2, _, body2 = read_http_response(ssock)
-                assert status2 == 200
-                data2 = json.loads(body2)
-                assert data2["path"] == "/pipe-body/2"
-                assert "X-Forwarded-For" in data2["headers"], \
-                    "GET after POST missing X-Forwarded-For"
+            status2, _, body2 = await async_read_http_response(reader, writer)
+            assert status2 == 200
+            data2 = json.loads(body2)
+            assert data2["path"] == "/pipe-body/2"
+            assert "X-Forwarded-For" in data2["headers"], \
+                "GET after POST missing X-Forwarded-For"
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_three_pipelined_gets_all_have_forwarded_headers(self, proxy):
         """Three pipelined GETs in one write"""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
         requests = b""
         for i in range(3):
             requests += (
@@ -2131,17 +2301,24 @@ class TestPipelinedForwardedHeaders:
                 f"\r\n"
             ).encode()
 
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                ssock.sendall(requests)
+        reader, writer = await async_make_ssl_connection()
+        try:
+            writer.write(requests)
+            await writer.drain()
 
-                for i in range(3):
-                    status, _, body = read_http_response(ssock)
-                    assert status == 200, f"Request {i}: expected 200, got {status}"
-                    data = json.loads(body)
-                    assert data["path"] == f"/pipe3/{i}"
-                    assert "X-Forwarded-For" in data["headers"], \
-                        f"Pipelined request {i} missing X-Forwarded-For"
+            for i in range(3):
+                status, _, body = await async_read_http_response(reader, writer)
+                assert status == 200, f"Request {i}: expected 200, got {status}"
+                data = json.loads(body)
+                assert data["path"] == f"/pipe3/{i}"
+                assert "X-Forwarded-For" in data["headers"], \
+                    f"Pipelined request {i} missing X-Forwarded-For"
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -2158,10 +2335,6 @@ class TestSTUpgradingBugs:
     async def test_websocket_large_101_response(self, ws_proxy):
         """WebSocket upgrade with a 101 response that includes extra headers.
         The response may arrive in multiple reads; the proxy must accumulate."""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
         ws_key = base64.b64encode(os.urandom(16)).decode()
         request = (
             f"GET /ws-large HTTP/1.1\r\n"
@@ -2173,34 +2346,39 @@ class TestSTUpgradingBugs:
             f"\r\n"
         ).encode()
 
-        with socket.create_connection(("127.0.0.1", 18543), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=WS_DOMAIN) as ssock:
-                ssock.sendall(request)
+        reader, writer = await async_make_ssl_connection(host=WS_DOMAIN, port=18543)
+        try:
+            writer.write(request)
+            await writer.drain()
 
-                response = b""
-                while b"\r\n\r\n" not in response:
-                    chunk = ssock.recv(4096)
-                    if not chunk:
-                        break
-                    response += chunk
+            response = b""
+            while b"\r\n\r\n" not in response:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    break
+                response += chunk
 
-                assert b"101" in response.split(b"\r\n")[0], \
-                    f"Expected 101, got: {response[:100]}"
+            assert b"101" in response.split(b"\r\n")[0], \
+                f"Expected 101, got: {response[:100]}"
 
-                # Verify we can still communicate after upgrade
-                message = b"after-upgrade-test"
-                ssock.sendall(ws_frame(message, opcode=0x1))
-                echoed = read_ws_frame(ssock)
-                assert echoed == message
+            # Verify we can still communicate after upgrade
+            message = b"after-upgrade-test"
+            writer.write(ws_frame(message, opcode=0x1))
+            await writer.drain()
+            echoed = await async_read_ws_frame(reader)
+            assert echoed == message
 
-                ssock.sendall(ws_frame(b"", opcode=0x8))
+            writer.write(ws_frame(b"", opcode=0x8))
+            await writer.drain()
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_websocket_101_fragmented_status_line(self, ws_proxy):
         """A fragmented 101 response must not be treated as an immediate upgrade failure."""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
         ws_key = base64.b64encode(os.urandom(16)).decode()
         request = (
             f"GET /ws-frag HTTP/1.1\r\n"
@@ -2212,26 +2390,35 @@ class TestSTUpgradingBugs:
             f"\r\n"
         ).encode()
 
-        with socket.create_connection(("127.0.0.1", 18543), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=WS_FRAGMENTED_DOMAIN) as ssock:
-                ssock.sendall(request)
+        reader, writer = await async_make_ssl_connection(host=WS_FRAGMENTED_DOMAIN, port=18543)
+        try:
+            writer.write(request)
+            await writer.drain()
 
-                response = b""
-                while b"\r\n\r\n" not in response:
-                    chunk = ssock.recv(4096)
-                    if not chunk:
-                        break
-                    response += chunk
+            response = b""
+            while b"\r\n\r\n" not in response:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    break
+                response += chunk
 
-                assert b"101" in response.split(b"\r\n")[0], \
-                    f"Expected 101, got: {response[:120]}"
+            assert b"101" in response.split(b"\r\n")[0], \
+                f"Expected 101, got: {response[:120]}"
 
-                message = b"frag-works"
-                ssock.sendall(ws_frame(message, opcode=0x1))
-                echoed = read_ws_frame(ssock)
-                assert echoed == message
+            message = b"frag-works"
+            writer.write(ws_frame(message, opcode=0x1))
+            await writer.drain()
+            echoed = await async_read_ws_frame(reader)
+            assert echoed == message
 
-                ssock.sendall(ws_frame(b"", opcode=0x8))
+            writer.write(ws_frame(b"", opcode=0x8))
+            await writer.drain()
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -2245,10 +2432,6 @@ class TestPipelinedChunkedThenGet:
 
     async def test_chunked_post_then_get_in_one_write(self, proxy):
         """Chunked POST + GET pipelined in a single write"""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
         post_body = b"pipelined-chunked"
         chunked = f"{len(post_body):x}\r\n".encode() + post_body + b"\r\n0\r\n\r\n"
 
@@ -2265,32 +2448,35 @@ class TestPipelinedChunkedThenGet:
             f"\r\n"
         ).encode()
 
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                ssock.sendall(requests)
+        reader, writer = await async_make_ssl_connection()
+        try:
+            writer.write(requests)
+            await writer.drain()
 
-                # Read chunked POST response
-                status1, _, body1 = read_http_response(ssock)
-                assert status1 == 200
-                data1 = json.loads(body1)
-                assert data1["body_length"] == len(post_body)
+            # Read chunked POST response
+            status1, _, body1 = await async_read_http_response(reader, writer)
+            assert status1 == 200
+            data1 = json.loads(body1)
+            assert data1["body_length"] == len(post_body)
 
-                # Read GET response
-                status2, _, body2 = read_http_response(ssock)
-                assert status2 == 200
-                data2 = json.loads(body2)
-                assert data2["path"] == "/pipe-chunked/2"
-                assert data2["method"] == "GET"
-                # Verify forwarded headers injected on the GET too
-                assert "X-Forwarded-For" in data2["headers"], \
-                    "GET after pipelined chunked POST missing X-Forwarded-For"
+            # Read GET response
+            status2, _, body2 = await async_read_http_response(reader, writer)
+            assert status2 == 200
+            data2 = json.loads(body2)
+            assert data2["path"] == "/pipe-chunked/2"
+            assert data2["method"] == "GET"
+            # Verify forwarded headers injected on the GET too
+            assert "X-Forwarded-For" in data2["headers"], \
+                "GET after pipelined chunked POST missing X-Forwarded-For"
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_chunked_post_with_trailers_then_get(self, proxy):
         """Chunked POST with trailers + GET pipelined in one write"""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
         post_body = b"with-trailers"
         chunked = (
             f"{len(post_body):x}\r\n".encode() + post_body + b"\r\n"
@@ -2312,17 +2498,24 @@ class TestPipelinedChunkedThenGet:
             f"\r\n"
         ).encode()
 
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                ssock.sendall(requests)
+        reader, writer = await async_make_ssl_connection()
+        try:
+            writer.write(requests)
+            await writer.drain()
 
-                status1, _, body1 = read_http_response(ssock)
-                assert status1 == 200
+            status1, _, body1 = await async_read_http_response(reader, writer)
+            assert status1 == 200
 
-                status2, _, body2 = read_http_response(ssock)
-                assert status2 == 200
-                data2 = json.loads(body2)
-                assert data2["path"] == "/pipe-chunk-trailer/2"
+            status2, _, body2 = await async_read_http_response(reader, writer)
+            assert status2 == 200
+            data2 = json.loads(body2)
+            assert data2["path"] == "/pipe-chunk-trailer/2"
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -2655,10 +2848,6 @@ class TestMalformedRequests:
 
     async def test_post_without_content_length_or_te(self, proxy):
         """POST with no Content-Length or Transfer-Encoding → treated as no body"""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
         requests = (
             f"POST /no-cl/1 HTTP/1.1\r\n"
             f"Host: {TEST_DOMAIN}\r\n"
@@ -2670,21 +2859,28 @@ class TestMalformedRequests:
             f"\r\n"
         ).encode()
 
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                ssock.sendall(requests)
+        reader, writer = await async_make_ssl_connection()
+        try:
+            writer.write(requests)
+            await writer.drain()
 
-                # POST should succeed with body_length=0
-                status1, _, body1 = read_http_response(ssock)
-                assert status1 == 200
-                data1 = json.loads(body1)
-                assert data1["body_length"] == 0
+            # POST should succeed with body_length=0
+            status1, _, body1 = await async_read_http_response(reader, writer)
+            assert status1 == 200
+            data1 = json.loads(body1)
+            assert data1["body_length"] == 0
 
-                # GET should also succeed
-                status2, _, body2 = read_http_response(ssock)
-                assert status2 == 200
-                data2 = json.loads(body2)
-                assert data2["path"] == "/no-cl/2"
+            # GET should also succeed
+            status2, _, body2 = await async_read_http_response(reader, writer)
+            assert status2 == 200
+            data2 = json.loads(body2)
+            assert data2["path"] == "/no-cl/2"
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_chunked_and_content_length_both_present(self, proxy):
         """When both Transfer-Encoding: chunked and Content-Length are present,
@@ -2820,29 +3016,31 @@ class TestSNIMismatch:
 
     async def test_sni_mismatch_host_takes_precedence(self, proxy):
         """When SNI doesn't match Host, Host header is used for routing"""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
         # Connect with SNI for test.localhost (valid) but send Host for unknown domain
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                request = f"GET / HTTP/1.1\r\nHost: nonexistent.domain\r\n\r\n".encode()
-                ssock.sendall(request)
+        reader, writer = await async_make_ssl_connection()
+        try:
+            request = f"GET / HTTP/1.1\r\nHost: nonexistent.domain\r\n\r\n".encode()
+            writer.write(request)
+            await writer.drain()
 
-                response = b""
-                ssock.settimeout(3.0)
-                try:
-                    while True:
-                        chunk = ssock.recv(4096)
-                        if not chunk:
-                            break
-                        response += chunk
-                except socket.timeout:
-                    pass
+            response = b""
+            try:
+                while True:
+                    chunk = await asyncio.wait_for(reader.read(4096), timeout=3.0)
+                    if not chunk:
+                        break
+                    response += chunk
+            except asyncio.TimeoutError:
+                pass
 
-                # Host header takes precedence → domain not found → 421
-                assert b"421" in response, f"Expected 421, got: {response[:200]}"
+            # Host header takes precedence → domain not found → 421
+            assert b"421" in response, f"Expected 421, got: {response[:200]}"
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -2855,13 +3053,14 @@ class TestRapidKeepaliveTransitions:
 
     async def test_get_post_chunked_post_cl_get_sequence(self, proxy):
         """Mixed sequence: GET, chunked POST, CL POST, GET on one connection"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             # 1. GET
-            ssock.sendall(
+            writer.write(
                 f"GET /rapid/1 HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\nConnection: keep-alive\r\n\r\n".encode()
             )
-            status, _, body = read_http_response(ssock)
+            await writer.drain()
+            status, _, body = await async_read_http_response(reader, writer)
             assert status == 200
             data = json.loads(body)
             assert data["method"] == "GET"
@@ -2869,7 +3068,7 @@ class TestRapidKeepaliveTransitions:
             # 2. Chunked POST
             chunk_body = b"chunked-data"
             chunked = f"{len(chunk_body):x}\r\n".encode() + chunk_body + b"\r\n0\r\n\r\n"
-            ssock.sendall(
+            writer.write(
                 (
                     f"POST /rapid/2 HTTP/1.1\r\n"
                     f"Host: {TEST_DOMAIN}\r\n"
@@ -2878,14 +3077,15 @@ class TestRapidKeepaliveTransitions:
                     f"\r\n"
                 ).encode() + chunked
             )
-            status, _, body = read_http_response(ssock)
+            await writer.drain()
+            status, _, body = await async_read_http_response(reader, writer)
             assert status == 200
             data = json.loads(body)
             assert data["body_length"] == len(chunk_body)
 
             # 3. CL POST
             cl_body = b"cl-body-data"
-            ssock.sendall(
+            writer.write(
                 (
                     f"POST /rapid/3 HTTP/1.1\r\n"
                     f"Host: {TEST_DOMAIN}\r\n"
@@ -2894,31 +3094,37 @@ class TestRapidKeepaliveTransitions:
                     f"\r\n"
                 ).encode() + cl_body
             )
-            status, _, body = read_http_response(ssock)
+            await writer.drain()
+            status, _, body = await async_read_http_response(reader, writer)
             assert status == 200
             data = json.loads(body)
             assert data["body_length"] == len(cl_body)
 
             # 4. GET
-            ssock.sendall(
+            writer.write(
                 f"GET /rapid/4 HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\nConnection: keep-alive\r\n\r\n".encode()
             )
-            status, _, body = read_http_response(ssock)
+            await writer.drain()
+            status, _, body = await async_read_http_response(reader, writer)
             assert status == 200
             data = json.loads(body)
             assert data["path"] == "/rapid/4"
             assert "X-Forwarded-For" in data["headers"]
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_many_chunked_posts_keepalive(self, proxy):
         """10 chunked POSTs on the same connection"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             for i in range(10):
                 body_data = f"chunk-{i}-payload".encode()
                 chunked = f"{len(body_data):x}\r\n".encode() + body_data + b"\r\n0\r\n\r\n"
-                ssock.sendall(
+                writer.write(
                     (
                         f"POST /many-chunk/{i} HTTP/1.1\r\n"
                         f"Host: {TEST_DOMAIN}\r\n"
@@ -2927,13 +3133,18 @@ class TestRapidKeepaliveTransitions:
                         f"\r\n"
                     ).encode() + chunked
                 )
-                status, _, body = read_http_response(ssock)
+                await writer.drain()
+                status, _, body = await async_read_http_response(reader, writer)
                 assert status == 200, f"Request {i}: expected 200, got {status}"
                 data = json.loads(body)
                 assert data["body_length"] == len(body_data), \
                     f"Request {i}: expected {len(body_data)}, got {data['body_length']}"
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -2947,67 +3158,73 @@ class TestContentLengthParsing:
 
     async def test_negative_content_length_keepalive(self, proxy):
         """Negative Content-Length must be rejected with 400 and connection close."""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        reader, writer = await async_make_ssl_connection()
+        try:
+            writer.write(
+                (
+                    f"POST /neg-cl/1 HTTP/1.1\r\n"
+                    f"Host: {TEST_DOMAIN}\r\n"
+                    f"Content-Length: -1\r\n"
+                    f"Connection: keep-alive\r\n"
+                    f"\r\n"
+                ).encode()
+            )
+            await writer.drain()
 
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                ssock.sendall(
+            status1, _, _ = await async_read_http_response(reader, writer)
+            assert status1 == 400
+
+            # After malformed CL, proxy should not keep the connection alive.
+            with pytest.raises((asyncio.TimeoutError, ConnectionError, ssl.SSLError, OSError, ValueError)):
+                writer.write(
                     (
-                        f"POST /neg-cl/1 HTTP/1.1\r\n"
+                        f"GET /neg-cl/2 HTTP/1.1\r\n"
                         f"Host: {TEST_DOMAIN}\r\n"
-                        f"Content-Length: -1\r\n"
                         f"Connection: keep-alive\r\n"
                         f"\r\n"
                     ).encode()
                 )
-
-                ssock.settimeout(3.0)
-                status1, _, _ = read_http_response(ssock)
-                assert status1 == 400
-
-                # After malformed CL, proxy should not keep the connection alive.
-                with pytest.raises((socket.timeout, ConnectionError, ssl.SSLError, OSError, ValueError)):
-                    ssock.sendall(
-                        (
-                            f"GET /neg-cl/2 HTTP/1.1\r\n"
-                            f"Host: {TEST_DOMAIN}\r\n"
-                            f"Connection: keep-alive\r\n"
-                            f"\r\n"
-                        ).encode()
-                    )
-                    read_http_response(ssock)
+                await writer.drain()
+                await async_read_http_response(reader, writer)
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_zero_content_length_keepalive(self, proxy):
         """Content-Length: 0 should be treated as no body, next request parsed correctly"""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        reader, writer = await async_make_ssl_connection()
+        try:
+            writer.write(
+                (
+                    f"POST /zero-cl/1 HTTP/1.1\r\n"
+                    f"Host: {TEST_DOMAIN}\r\n"
+                    f"Content-Length: 0\r\n"
+                    f"Connection: keep-alive\r\n"
+                    f"\r\n"
+                    f"GET /zero-cl/2 HTTP/1.1\r\n"
+                    f"Host: {TEST_DOMAIN}\r\n"
+                    f"Connection: keep-alive\r\n"
+                    f"\r\n"
+                ).encode()
+            )
+            await writer.drain()
 
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                ssock.sendall(
-                    (
-                        f"POST /zero-cl/1 HTTP/1.1\r\n"
-                        f"Host: {TEST_DOMAIN}\r\n"
-                        f"Content-Length: 0\r\n"
-                        f"Connection: keep-alive\r\n"
-                        f"\r\n"
-                        f"GET /zero-cl/2 HTTP/1.1\r\n"
-                        f"Host: {TEST_DOMAIN}\r\n"
-                        f"Connection: keep-alive\r\n"
-                        f"\r\n"
-                    ).encode()
-                )
+            status1, _, body1 = await async_read_http_response(reader, writer)
+            assert status1 == 200
 
-                status1, _, body1 = read_http_response(ssock)
-                assert status1 == 200
-
-                status2, _, body2 = read_http_response(ssock)
-                assert status2 == 200
-                data2 = json.loads(body2)
-                assert data2["path"] == "/zero-cl/2"
+            status2, _, body2 = await async_read_http_response(reader, writer)
+            assert status2 == 200
+            data2 = json.loads(body2)
+            assert data2["path"] == "/zero-cl/2"
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_content_length_with_leading_plus(self, proxy):
         """Content-Length: +5 (with leading plus sign) should be rejected."""
@@ -3143,52 +3360,59 @@ class TestContentLengthParsing:
 
     async def test_very_large_content_length_keepalive(self, proxy):
         """Content-Length: 999999999999 with small body → keepalive broken"""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        reader, writer = await async_make_ssl_connection()
+        try:
+            # POST with huge CL but only 5 bytes of body
+            writer.write(
+                (
+                    f"POST /huge-cl/1 HTTP/1.1\r\n"
+                    f"Host: {TEST_DOMAIN}\r\n"
+                    f"Content-Length: 999999999999\r\n"
+                    f"Connection: keep-alive\r\n"
+                    f"\r\n"
+                    f"hello"
+                ).encode()
+            )
+            await writer.drain()
 
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                # POST with huge CL but only 5 bytes of body
-                ssock.sendall(
-                    (
-                        f"POST /huge-cl/1 HTTP/1.1\r\n"
-                        f"Host: {TEST_DOMAIN}\r\n"
-                        f"Content-Length: 999999999999\r\n"
-                        f"Connection: keep-alive\r\n"
-                        f"\r\n"
-                        f"hello"
-                    ).encode()
+            # Read whatever response we get
+            try:
+                status1, _, _ = await asyncio.wait_for(
+                    async_read_http_response(reader, writer), timeout=3.0
                 )
+            except (asyncio.TimeoutError, ConnectionError):
+                pass  # May timeout waiting for body
 
-                # Read whatever response we get
-                ssock.settimeout(3.0)
-                try:
-                    status1, _, _ = read_http_response(ssock)
-                except (socket.timeout, ConnectionError):
-                    pass  # May timeout waiting for body
+            # Now send a GET - it should NOT be treated as body of the POST
+            writer.write(
+                (
+                    f"GET /huge-cl/2 HTTP/1.1\r\n"
+                    f"Host: {TEST_DOMAIN}\r\n"
+                    f"Connection: keep-alive\r\n"
+                    f"\r\n"
+                ).encode()
+            )
+            await writer.drain()
 
-                # Now send a GET - it should NOT be treated as body of the POST
-                ssock.sendall(
-                    (
-                        f"GET /huge-cl/2 HTTP/1.1\r\n"
-                        f"Host: {TEST_DOMAIN}\r\n"
-                        f"Connection: keep-alive\r\n"
-                        f"\r\n"
-                    ).encode()
+            try:
+                status2, _, body2 = await asyncio.wait_for(
+                    async_read_http_response(reader, writer), timeout=3.0
                 )
-
-                try:
-                    status2, _, body2 = read_http_response(ssock)
-                    data2 = json.loads(body2)
-                    assert data2["path"] == "/huge-cl/2", \
-                        "GET swallowed as body of POST with huge Content-Length"
-                except (socket.timeout, ConnectionError, json.JSONDecodeError):
-                    # This is expected to fail - the proxy treats GET bytes as
-                    # body of the POST because CL is huge. This is technically
-                    # correct per HTTP spec (CL says how many bytes to read),
-                    # but Content-Length: -1 is a clear security issue.
-                    pass
+                data2 = json.loads(body2)
+                assert data2["path"] == "/huge-cl/2", \
+                    "GET swallowed as body of POST with huge Content-Length"
+            except (asyncio.TimeoutError, ConnectionError, json.JSONDecodeError):
+                # This is expected to fail - the proxy treats GET bytes as
+                # body of the POST because CL is huge. This is technically
+                # correct per HTTP spec (CL says how many bytes to read),
+                # but Content-Length: -1 is a clear security issue.
+                pass
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_content_length_numeric_overflow_is_rejected(self, proxy):
         """Content-Length values that overflow size_t must be rejected with 400."""
@@ -3260,78 +3484,84 @@ class TestBodyExceedsContentLength:
     async def test_extra_bytes_after_cl_body_are_next_request(self, proxy):
         """POST with CL:5 sends 5 body bytes + GET on same connection.
         The proxy must track the CL boundary and parse the GET as a new request."""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
         body = b"AAAAA"  # exactly 5 bytes
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                # Send POST + body + immediate GET in one write
-                ssock.sendall(
-                    (
-                        f"POST /cl-boundary/1 HTTP/1.1\r\n"
-                        f"Host: {TEST_DOMAIN}\r\n"
-                        f"Content-Length: 5\r\n"
-                        f"Connection: keep-alive\r\n"
-                        f"\r\n"
-                    ).encode() + body + (
-                        f"GET /cl-boundary/2 HTTP/1.1\r\n"
-                        f"Host: {TEST_DOMAIN}\r\n"
-                        f"Connection: keep-alive\r\n"
-                        f"\r\n"
-                    ).encode()
-                )
+        reader, writer = await async_make_ssl_connection()
+        try:
+            # Send POST + body + immediate GET in one write
+            writer.write(
+                (
+                    f"POST /cl-boundary/1 HTTP/1.1\r\n"
+                    f"Host: {TEST_DOMAIN}\r\n"
+                    f"Content-Length: 5\r\n"
+                    f"Connection: keep-alive\r\n"
+                    f"\r\n"
+                ).encode() + body + (
+                    f"GET /cl-boundary/2 HTTP/1.1\r\n"
+                    f"Host: {TEST_DOMAIN}\r\n"
+                    f"Connection: keep-alive\r\n"
+                    f"\r\n"
+                ).encode()
+            )
+            await writer.drain()
 
-                # POST response
-                status1, _, body1 = read_http_response(ssock)
-                assert status1 == 200
-                data1 = json.loads(body1)
-                assert data1["body_length"] == 5
-                assert data1["method"] == "POST"
+            # POST response
+            status1, _, body1 = await async_read_http_response(reader, writer)
+            assert status1 == 200
+            data1 = json.loads(body1)
+            assert data1["body_length"] == 5
+            assert data1["method"] == "POST"
 
-                # GET response - must be correctly parsed
-                status2, _, body2 = read_http_response(ssock)
-                assert status2 == 200
-                data2 = json.loads(body2)
-                assert data2["path"] == "/cl-boundary/2"
-                assert data2["method"] == "GET"
-                assert "X-Forwarded-For" in data2["headers"]
+            # GET response - must be correctly parsed
+            status2, _, body2 = await async_read_http_response(reader, writer)
+            assert status2 == 200
+            data2 = json.loads(body2)
+            assert data2["path"] == "/cl-boundary/2"
+            assert data2["method"] == "GET"
+            assert "X-Forwarded-For" in data2["headers"]
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_short_body_then_next_request(self, proxy):
         """POST with CL:3 but body 'AB' followed by GET.
         The GET's first byte 'G' should NOT be consumed as the 3rd body byte."""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        reader, writer = await async_make_ssl_connection()
+        try:
+            # First: POST with CL:3, full 3-byte body
+            writer.write(
+                (
+                    f"POST /cl-short/1 HTTP/1.1\r\n"
+                    f"Host: {TEST_DOMAIN}\r\n"
+                    f"Content-Length: 3\r\n"
+                    f"Connection: keep-alive\r\n"
+                    f"\r\n"
+                    f"ABC"
+                    f"GET /cl-short/2 HTTP/1.1\r\n"
+                    f"Host: {TEST_DOMAIN}\r\n"
+                    f"Connection: keep-alive\r\n"
+                    f"\r\n"
+                ).encode()
+            )
+            await writer.drain()
 
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                # First: POST with CL:3, full 3-byte body
-                ssock.sendall(
-                    (
-                        f"POST /cl-short/1 HTTP/1.1\r\n"
-                        f"Host: {TEST_DOMAIN}\r\n"
-                        f"Content-Length: 3\r\n"
-                        f"Connection: keep-alive\r\n"
-                        f"\r\n"
-                        f"ABC"
-                        f"GET /cl-short/2 HTTP/1.1\r\n"
-                        f"Host: {TEST_DOMAIN}\r\n"
-                        f"Connection: keep-alive\r\n"
-                        f"\r\n"
-                    ).encode()
-                )
+            status1, _, body1 = await async_read_http_response(reader, writer)
+            assert status1 == 200
+            data1 = json.loads(body1)
+            assert data1["body_length"] == 3
 
-                status1, _, body1 = read_http_response(ssock)
-                assert status1 == 200
-                data1 = json.loads(body1)
-                assert data1["body_length"] == 3
-
-                status2, _, body2 = read_http_response(ssock)
-                assert status2 == 200
-                data2 = json.loads(body2)
-                assert data2["path"] == "/cl-short/2"
+            status2, _, body2 = await async_read_http_response(reader, writer)
+            assert status2 == 200
+            data2 = json.loads(body2)
+            assert data2["path"] == "/cl-short/2"
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -3343,10 +3573,6 @@ class TestChunkedFinalChunkExtension:
 
     async def test_final_chunk_with_extension_then_get(self, proxy):
         """Chunked body ending with '0;ext=val\\r\\n\\r\\n' followed by GET"""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
         body_data = b"extension-test"
         chunked = (
             f"{len(body_data):x}\r\n".encode() + body_data + b"\r\n"
@@ -3367,20 +3593,27 @@ class TestChunkedFinalChunkExtension:
             f"\r\n"
         ).encode()
 
-        with socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                ssock.sendall(requests)
+        reader, writer = await async_make_ssl_connection()
+        try:
+            writer.write(requests)
+            await writer.drain()
 
-                status1, _, body1 = read_http_response(ssock)
-                assert status1 == 200
-                data1 = json.loads(body1)
-                assert data1["body_length"] == len(body_data)
+            status1, _, body1 = await async_read_http_response(reader, writer)
+            assert status1 == 200
+            data1 = json.loads(body1)
+            assert data1["body_length"] == len(body_data)
 
-                status2, _, body2 = read_http_response(ssock)
-                assert status2 == 200
-                data2 = json.loads(body2)
-                assert data2["path"] == "/chunk-ext-final/2"
-                assert data2["method"] == "GET"
+            status2, _, body2 = await async_read_http_response(reader, writer)
+            assert status2 == 200
+            data2 = json.loads(body2)
+            assert data2["path"] == "/chunk-ext-final/2"
+            assert data2["method"] == "GET"
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -3430,35 +3663,36 @@ class TestConnectionCloseInChunkedBody:
 
     async def test_disconnect_mid_chunk(self, proxy):
         """Client sends partial chunked body then disconnects"""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-        try:
-            sock = socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=5)
-            ssock = ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN)
-
-            # Send headers + partial chunk (declare 1000 bytes, send only 5)
-            ssock.sendall(
-                (
-                    f"POST /mid-chunk HTTP/1.1\r\n"
-                    f"Host: {TEST_DOMAIN}\r\n"
-                    f"Transfer-Encoding: chunked\r\n"
-                    f"\r\n"
-                    f"3e8\r\n"  # 1000 bytes declared
-                    f"hello"    # only 5 bytes sent
-                ).encode()
-            )
-
-            # Force close
+        def _sync_disconnect():
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
             try:
-                ssock.unwrap()
+                sock = socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=5)
+                ssock = ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN)
+
+                # Send headers + partial chunk (declare 1000 bytes, send only 5)
+                ssock.sendall(
+                    (
+                        f"POST /mid-chunk HTTP/1.1\r\n"
+                        f"Host: {TEST_DOMAIN}\r\n"
+                        f"Transfer-Encoding: chunked\r\n"
+                        f"\r\n"
+                        f"3e8\r\n"  # 1000 bytes declared
+                        f"hello"    # only 5 bytes sent
+                    ).encode()
+                )
+
+                # Force close
+                try:
+                    ssock.unwrap()
+                except Exception:
+                    pass
+                sock.close()
             except Exception:
                 pass
-            sock.close()
-        except Exception:
-            pass
 
+        await asyncio.to_thread(_sync_disconnect)
         await asyncio.sleep(0.5)
 
         # Proxy should still be alive
@@ -3468,33 +3702,34 @@ class TestConnectionCloseInChunkedBody:
 
     async def test_disconnect_between_chunks(self, proxy):
         """Client sends one complete chunk then disconnects before next"""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-        try:
-            sock = socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=5)
-            ssock = ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN)
-
-            # Send headers + one complete chunk, then close without final chunk
-            ssock.sendall(
-                (
-                    f"POST /between-chunks HTTP/1.1\r\n"
-                    f"Host: {TEST_DOMAIN}\r\n"
-                    f"Transfer-Encoding: chunked\r\n"
-                    f"\r\n"
-                    f"5\r\nhello\r\n"  # One complete chunk, no final 0\r\n\r\n
-                ).encode()
-            )
-
+        def _sync_disconnect():
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
             try:
-                ssock.unwrap()
+                sock = socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=5)
+                ssock = ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN)
+
+                # Send headers + one complete chunk, then close without final chunk
+                ssock.sendall(
+                    (
+                        f"POST /between-chunks HTTP/1.1\r\n"
+                        f"Host: {TEST_DOMAIN}\r\n"
+                        f"Transfer-Encoding: chunked\r\n"
+                        f"\r\n"
+                        f"5\r\nhello\r\n"  # One complete chunk, no final 0\r\n\r\n
+                    ).encode()
+                )
+
+                try:
+                    ssock.unwrap()
+                except Exception:
+                    pass
+                sock.close()
             except Exception:
                 pass
-            sock.close()
-        except Exception:
-            pass
 
+        await asyncio.to_thread(_sync_disconnect)
         await asyncio.sleep(0.5)
 
         # Proxy should still be alive
@@ -3512,7 +3747,7 @@ class TestBodyContainingHeaderPattern:
 
     async def test_body_with_double_crlf(self, proxy):
         """POST body containing \\r\\n\\r\\n should be forwarded as body, not treated as headers"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             # Body contains \r\n\r\n which looks like header terminator
             body = b"line1\r\n\r\nline2\r\n\r\nline3"
@@ -3523,8 +3758,9 @@ class TestBodyContainingHeaderPattern:
                 f"Content-Type: text/plain\r\n"
                 f"\r\n"
             ).encode() + body
-            ssock.sendall(request)
-            status, _, resp_body = read_http_response(ssock)
+            writer.write(request)
+            await writer.drain()
+            status, _, resp_body = await async_read_http_response(reader, writer)
             assert status == 200
             data = json.loads(resp_body)
             assert data["body_length"] == len(body)
@@ -3536,17 +3772,22 @@ class TestBodyContainingHeaderPattern:
                 f"Host: {TEST_DOMAIN}\r\n"
                 f"\r\n"
             ).encode()
-            ssock.sendall(request2)
-            status2, _, resp_body2 = read_http_response(ssock)
+            writer.write(request2)
+            await writer.drain()
+            status2, _, resp_body2 = await async_read_http_response(reader, writer)
             assert status2 == 200
             data2 = json.loads(resp_body2)
             assert data2["headers"].get("X-Forwarded-Proto") == "https"
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_large_body_with_fake_request_inside(self, proxy):
         """POST body that contains a fake HTTP request should be forwarded as body"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             fake_request = "GET /evil HTTP/1.1\r\nHost: evil.com\r\n\r\n"
             body = f"prefix{fake_request}suffix".encode()
@@ -3556,8 +3797,9 @@ class TestBodyContainingHeaderPattern:
                 f"Content-Length: {len(body)}\r\n"
                 f"\r\n"
             ).encode() + body
-            ssock.sendall(request)
-            status, _, resp_body = read_http_response(ssock)
+            writer.write(request)
+            await writer.drain()
+            status, _, resp_body = await async_read_http_response(reader, writer)
             assert status == 200
             data = json.loads(resp_body)
             assert data["body_length"] == len(body)
@@ -3569,13 +3811,18 @@ class TestBodyContainingHeaderPattern:
                 f"Host: {TEST_DOMAIN}\r\n"
                 f"\r\n"
             ).encode()
-            ssock.sendall(request2)
-            status2, _, resp_body2 = read_http_response(ssock)
+            writer.write(request2)
+            await writer.drain()
+            status2, _, resp_body2 = await async_read_http_response(reader, writer)
             assert status2 == 200
             data2 = json.loads(resp_body2)
             assert data2["path"] == "/after-fake"
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -3587,7 +3834,7 @@ class TestMultipleTransferEncodings:
 
     async def test_gzip_chunked_detected_as_chunked(self, proxy):
         """Transfer-Encoding: gzip, chunked should be treated as chunked"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             body_data = b"hello gzip chunked"
             chunk = f"{len(body_data):x}\r\n".encode() + body_data + b"\r\n0\r\n\r\n"
@@ -3597,8 +3844,9 @@ class TestMultipleTransferEncodings:
                 f"Transfer-Encoding: gzip, chunked\r\n"
                 f"\r\n"
             ).encode() + chunk
-            ssock.sendall(request)
-            status, _, resp_body = read_http_response(ssock)
+            writer.write(request)
+            await writer.drain()
+            status, _, resp_body = await async_read_http_response(reader, writer)
             assert status == 200
             data = json.loads(resp_body)
             assert data["body_length"] == len(body_data)
@@ -3609,13 +3857,18 @@ class TestMultipleTransferEncodings:
                 f"Host: {TEST_DOMAIN}\r\n"
                 f"\r\n"
             ).encode()
-            ssock.sendall(request2)
-            status2, _, resp_body2 = read_http_response(ssock)
+            writer.write(request2)
+            await writer.drain()
+            status2, _, resp_body2 = await async_read_http_response(reader, writer)
             assert status2 == 200
             data2 = json.loads(resp_body2)
             assert data2["headers"].get("X-Forwarded-Proto") == "https"
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -3627,7 +3880,7 @@ class TestKeepAliveStateSwitching:
 
     async def test_cl_then_chunked_then_cl(self, proxy):
         """CL POST → chunked POST → CL POST on same connection"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             # Request 1: Content-Length POST
             body1 = b"body_one"
@@ -3637,8 +3890,9 @@ class TestKeepAliveStateSwitching:
                 f"Content-Length: {len(body1)}\r\n"
                 f"\r\n"
             ).encode() + body1
-            ssock.sendall(req1)
-            s1, _, rb1 = read_http_response(ssock)
+            writer.write(req1)
+            await writer.drain()
+            s1, _, rb1 = await async_read_http_response(reader, writer)
             assert s1 == 200
             d1 = json.loads(rb1)
             assert d1["body_length"] == len(body1)
@@ -3653,8 +3907,9 @@ class TestKeepAliveStateSwitching:
                 f"Transfer-Encoding: chunked\r\n"
                 f"\r\n"
             ).encode() + chunk2
-            ssock.sendall(req2)
-            s2, _, rb2 = read_http_response(ssock)
+            writer.write(req2)
+            await writer.drain()
+            s2, _, rb2 = await async_read_http_response(reader, writer)
             assert s2 == 200
             d2 = json.loads(rb2)
             assert d2["body_length"] == len(body2)
@@ -3668,18 +3923,23 @@ class TestKeepAliveStateSwitching:
                 f"Content-Length: {len(body3)}\r\n"
                 f"\r\n"
             ).encode() + body3
-            ssock.sendall(req3)
-            s3, _, rb3 = read_http_response(ssock)
+            writer.write(req3)
+            await writer.drain()
+            s3, _, rb3 = await async_read_http_response(reader, writer)
             assert s3 == 200
             d3 = json.loads(rb3)
             assert d3["body_length"] == len(body3)
             assert d3["headers"].get("X-Forwarded-Proto") == "https"
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_chunked_then_get_then_chunked(self, proxy):
         """Chunked POST → GET → Chunked POST on same connection"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             # Chunked POST
             body1 = b"chunked_first"
@@ -3690,8 +3950,9 @@ class TestKeepAliveStateSwitching:
                 f"Transfer-Encoding: chunked\r\n"
                 f"\r\n"
             ).encode() + chunk1
-            ssock.sendall(req1)
-            s1, _, rb1 = read_http_response(ssock)
+            writer.write(req1)
+            await writer.drain()
+            s1, _, rb1 = await async_read_http_response(reader, writer)
             assert s1 == 200
 
             # GET
@@ -3700,8 +3961,9 @@ class TestKeepAliveStateSwitching:
                 f"Host: {TEST_DOMAIN}\r\n"
                 f"\r\n"
             ).encode()
-            ssock.sendall(req2)
-            s2, _, rb2 = read_http_response(ssock)
+            writer.write(req2)
+            await writer.drain()
+            s2, _, rb2 = await async_read_http_response(reader, writer)
             assert s2 == 200
 
             # Chunked POST again
@@ -3713,14 +3975,19 @@ class TestKeepAliveStateSwitching:
                 f"Transfer-Encoding: chunked\r\n"
                 f"\r\n"
             ).encode() + chunk3
-            ssock.sendall(req3)
-            s3, _, rb3 = read_http_response(ssock)
+            writer.write(req3)
+            await writer.drain()
+            s3, _, rb3 = await async_read_http_response(reader, writer)
             assert s3 == 200
             d3 = json.loads(rb3)
             assert d3["body_length"] == len(body3)
             assert d3["headers"].get("X-Forwarded-Proto") == "https"
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -3732,11 +3999,7 @@ class TestSlowHeaderDelivery:
 
     async def test_header_byte_by_byte(self, proxy):
         """Headers sent one byte at a time should still be parsed"""
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        sock = socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=15)
-        ssock = ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN)
+        reader, writer = await async_make_ssl_connection()
         try:
             request = (
                 f"GET /slow-header HTTP/1.1\r\n"
@@ -3745,34 +4008,46 @@ class TestSlowHeaderDelivery:
             ).encode()
             # Send in small chunks to simulate slow delivery
             for i in range(0, len(request), 3):
-                ssock.sendall(request[i:i+3])
+                writer.write(request[i:i+3])
+                await writer.drain()
                 await asyncio.sleep(0.01)
 
-            status, _, body = read_http_response(ssock)
+            status, _, body = await async_read_http_response(reader, writer)
             assert status == 200
             data = json.loads(body)
             assert data["headers"].get("X-Forwarded-Proto") == "https"
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_header_split_at_crlf(self, proxy):
         """Headers split exactly at \\r\\n boundary"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             part1 = f"GET /split-crlf HTTP/1.1\r\n".encode()
             part2 = f"Host: {TEST_DOMAIN}\r".encode()
             part3 = b"\n\r\n"
 
-            ssock.sendall(part1)
+            writer.write(part1)
+            await writer.drain()
             await asyncio.sleep(0.05)
-            ssock.sendall(part2)
+            writer.write(part2)
+            await writer.drain()
             await asyncio.sleep(0.05)
-            ssock.sendall(part3)
+            writer.write(part3)
+            await writer.drain()
 
-            status, _, body = read_http_response(ssock)
+            status, _, body = await async_read_http_response(reader, writer)
             assert status == 200
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -3784,7 +4059,7 @@ class TestBackendClosesAfterResponse:
 
     async def test_backend_conn_close_then_new_request(self, proxy):
         """After backend returns Connection: close, next request should still work"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             # First request — normal response
             req1 = (
@@ -3793,8 +4068,9 @@ class TestBackendClosesAfterResponse:
                 f"Connection: keep-alive\r\n"
                 f"\r\n"
             ).encode()
-            ssock.sendall(req1)
-            s1, h1, _ = read_http_response(ssock)
+            writer.write(req1)
+            await writer.drain()
+            s1, h1, _ = await async_read_http_response(reader, writer)
             assert s1 == 200
 
             # Backend may or may not close — the proxy should handle either case.
@@ -3806,13 +4082,18 @@ class TestBackendClosesAfterResponse:
                 f"Host: {TEST_DOMAIN}\r\n"
                 f"\r\n"
             ).encode()
-            ssock.sendall(req2)
-            s2, _, rb2 = read_http_response(ssock)
+            writer.write(req2)
+            await writer.drain()
+            s2, _, rb2 = await async_read_http_response(reader, writer)
             assert s2 == 200
             d2 = json.loads(rb2)
             assert d2["path"] == "/close-test-2"
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -3824,7 +4105,7 @@ class TestContentLengthBoundaryPrecision:
 
     async def test_two_posts_exact_cl_boundaries(self, proxy):
         """Two POSTs with exact CL boundaries pipelined"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             body1 = b"A" * 100
             body2 = b"B" * 200
@@ -3839,27 +4120,32 @@ class TestContentLengthBoundaryPrecision:
                 f"Content-Length: {len(body2)}\r\n"
                 f"\r\n"
             ).encode() + body2
-            ssock.sendall(req)
+            writer.write(req)
+            await writer.drain()
 
-            s1, _, rb1 = read_http_response(ssock)
+            s1, _, rb1 = await async_read_http_response(reader, writer)
             assert s1 == 200
             d1 = json.loads(rb1)
             assert d1["body_length"] == 100
             assert d1["body_hash"] == hashlib.md5(body1).hexdigest()
             assert d1["headers"].get("X-Forwarded-Proto") == "https"
 
-            s2, _, rb2 = read_http_response(ssock)
+            s2, _, rb2 = await async_read_http_response(reader, writer)
             assert s2 == 200
             d2 = json.loads(rb2)
             assert d2["body_length"] == 200
             assert d2["body_hash"] == hashlib.md5(body2).hexdigest()
             assert d2["headers"].get("X-Forwarded-Proto") == "https"
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_post_cl_1_byte_body(self, proxy):
         """POST with Content-Length: 1 followed by GET"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             req = (
                 f"POST /cl-1byte HTTP/1.1\r\n"
@@ -3871,24 +4157,29 @@ class TestContentLengthBoundaryPrecision:
                 f"Host: {TEST_DOMAIN}\r\n"
                 f"\r\n"
             ).encode()
-            ssock.sendall(req)
+            writer.write(req)
+            await writer.drain()
 
-            s1, _, rb1 = read_http_response(ssock)
+            s1, _, rb1 = await async_read_http_response(reader, writer)
             assert s1 == 200
             d1 = json.loads(rb1)
             assert d1["body_length"] == 1
 
-            s2, _, rb2 = read_http_response(ssock)
+            s2, _, rb2 = await async_read_http_response(reader, writer)
             assert s2 == 200
             d2 = json.loads(rb2)
             assert d2["path"] == "/after-1byte"
             assert d2["headers"].get("X-Forwarded-Proto") == "https"
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_multiple_posts_varying_sizes(self, proxy):
         """5 POSTs with different body sizes, all pipelined"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             sizes = [1, 50, 0, 1000, 5]
             full_req = b""
@@ -3900,17 +4191,22 @@ class TestContentLengthBoundaryPrecision:
                     f"Content-Length: {size}\r\n"
                     f"\r\n"
                 ).encode() + body
-            ssock.sendall(full_req)
+            writer.write(full_req)
+            await writer.drain()
 
             for i, size in enumerate(sizes):
-                status, _, rb = read_http_response(ssock)
+                status, _, rb = await async_read_http_response(reader, writer)
                 assert status == 200, f"Request {i} (size={size}): expected 200, got {status}"
                 data = json.loads(rb)
                 assert data["body_length"] == size, f"Request {i}: body length mismatch"
                 assert data["headers"].get("X-Forwarded-Proto") == "https", \
                     f"Request {i}: missing forwarded headers"
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -3945,7 +4241,7 @@ class TestChunkedBodyWithLargeChunkSize:
 
     async def test_single_large_chunk(self, proxy):
         """Single chunk larger than 32KB, split across multiple forward_client_bytes calls"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             body = b"X" * 50000  # 50KB > 32KB buffer
             chunk = f"{len(body):x}\r\n".encode() + body + b"\r\n0\r\n\r\n"
@@ -3955,9 +4251,10 @@ class TestChunkedBodyWithLargeChunkSize:
                 f"Transfer-Encoding: chunked\r\n"
                 f"\r\n"
             ).encode()
-            ssock.sendall(headers + chunk)
+            writer.write(headers + chunk)
+            await writer.drain()
 
-            status, _, resp_body = read_http_response(ssock)
+            status, _, resp_body = await async_read_http_response(reader, writer)
             assert status == 200
             data = json.loads(resp_body)
             assert data["body_length"] == 50000
@@ -3968,17 +4265,22 @@ class TestChunkedBodyWithLargeChunkSize:
                 f"Host: {TEST_DOMAIN}\r\n"
                 f"\r\n"
             ).encode()
-            ssock.sendall(req2)
-            s2, _, rb2 = read_http_response(ssock)
+            writer.write(req2)
+            await writer.drain()
+            s2, _, rb2 = await async_read_http_response(reader, writer)
             assert s2 == 200
             d2 = json.loads(rb2)
             assert d2["headers"].get("X-Forwarded-Proto") == "https"
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_many_medium_chunks_then_get(self, proxy):
         """10 chunks of 4KB each, followed by a GET on same connection"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             chunks = b""
             total = b""
@@ -3994,9 +4296,10 @@ class TestChunkedBodyWithLargeChunkSize:
                 f"Transfer-Encoding: chunked\r\n"
                 f"\r\n"
             ).encode()
-            ssock.sendall(headers + chunks)
+            writer.write(headers + chunks)
+            await writer.drain()
 
-            status, _, resp_body = read_http_response(ssock)
+            status, _, resp_body = await async_read_http_response(reader, writer)
             assert status == 200
             data = json.loads(resp_body)
             assert data["body_length"] == 40960
@@ -4006,13 +4309,18 @@ class TestChunkedBodyWithLargeChunkSize:
                 f"Host: {TEST_DOMAIN}\r\n"
                 f"\r\n"
             ).encode()
-            ssock.sendall(req2)
-            s2, _, rb2 = read_http_response(ssock)
+            writer.write(req2)
+            await writer.drain()
+            s2, _, rb2 = await async_read_http_response(reader, writer)
             assert s2 == 200
             d2 = json.loads(rb2)
             assert d2["headers"].get("X-Forwarded-Proto") == "https"
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -4024,7 +4332,7 @@ class TestRequestSmuggling:
 
     async def test_cl_te_smuggling_attempt(self, proxy):
         """Both CL and TE present — chunked should take precedence"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             # Send request with both CL and TE, where CL says shorter than actual chunked body
             req = (
@@ -4036,8 +4344,9 @@ class TestRequestSmuggling:
                 f"5\r\nhello\r\n"
                 f"0\r\n\r\n"
             ).encode()
-            ssock.sendall(req)
-            s1, _, rb1 = read_http_response(ssock)
+            writer.write(req)
+            await writer.drain()
+            s1, _, rb1 = await async_read_http_response(reader, writer)
             assert s1 == 200
             d1 = json.loads(rb1)
             # Chunked takes precedence: body should be "hello"
@@ -4050,17 +4359,22 @@ class TestRequestSmuggling:
                 f"Host: {TEST_DOMAIN}\r\n"
                 f"\r\n"
             ).encode()
-            ssock.sendall(req2)
-            s2, _, rb2 = read_http_response(ssock)
+            writer.write(req2)
+            await writer.drain()
+            s2, _, rb2 = await async_read_http_response(reader, writer)
             assert s2 == 200
             d2 = json.loads(rb2)
             assert d2["path"] == "/after-smuggle"
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_cl_with_duplicate_te_chunked_and_pipelined_get(self, proxy):
         """Duplicate TE lines + conflicting CL must still use chunked framing and preserve next request boundary."""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             chunked = b"5\r\nhello\r\n0\r\n\r\n"
             pipelined = (
@@ -4082,25 +4396,30 @@ class TestRequestSmuggling:
                 ).encode()
             )
 
-            ssock.sendall(pipelined)
+            writer.write(pipelined)
+            await writer.drain()
 
-            s1, _, rb1 = read_http_response(ssock)
+            s1, _, rb1 = await async_read_http_response(reader, writer)
             assert s1 == 200
             d1 = json.loads(rb1)
             assert d1["path"] == "/smuggle-dup-te"
             assert d1["body_length"] == 5
             assert d1["body_hash"] == hashlib.md5(b"hello").hexdigest()
 
-            s2, _, rb2 = read_http_response(ssock)
+            s2, _, rb2 = await async_read_http_response(reader, writer)
             assert s2 == 200
             d2 = json.loads(rb2)
             assert d2["path"] == "/after-smuggle-dup-te"
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_double_content_length(self, proxy):
         """Duplicate Content-Length headers (even identical) should be rejected."""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             body = b"double_cl"
             req = (
@@ -4110,21 +4429,27 @@ class TestRequestSmuggling:
                 f"Content-Length: {len(body)}\r\n"
                 f"\r\n"
             ).encode() + body
-            ssock.sendall(req)
-            s1, _, _ = read_http_response(ssock)
+            writer.write(req)
+            await writer.drain()
+            s1, _, _ = await async_read_http_response(reader, writer)
             assert s1 == 400
 
             # After malformed CL duplication, connection should not be reusable.
-            with pytest.raises((socket.timeout, ConnectionError, ssl.SSLError, OSError, ValueError)):
+            with pytest.raises((asyncio.TimeoutError, ConnectionError, ssl.SSLError, OSError, ValueError)):
                 req2 = (
                     f"GET /after-double-cl HTTP/1.1\r\n"
                     f"Host: {TEST_DOMAIN}\r\n"
                     f"\r\n"
                 ).encode()
-                ssock.sendall(req2)
-                read_http_response(ssock)
+                writer.write(req2)
+                await writer.drain()
+                await async_read_http_response(reader, writer)
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -4136,7 +4461,7 @@ class TestContentLengthLeadingZeros:
 
     async def test_cl_with_leading_zeros(self, proxy):
         """Content-Length: 005 should be parsed as 5"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             body = b"ABCDE"
             req = (
@@ -4149,21 +4474,26 @@ class TestContentLengthLeadingZeros:
                 f"Host: {TEST_DOMAIN}\r\n"
                 f"\r\n"
             ).encode()
-            ssock.sendall(req)
+            writer.write(req)
+            await writer.drain()
 
-            s1, _, rb1 = read_http_response(ssock)
+            s1, _, rb1 = await async_read_http_response(reader, writer)
             assert s1 == 200
             d1 = json.loads(rb1)
             assert d1["body_length"] == 5
             assert d1["body_hash"] == hashlib.md5(b"ABCDE").hexdigest()
 
-            s2, _, rb2 = read_http_response(ssock)
+            s2, _, rb2 = await async_read_http_response(reader, writer)
             assert s2 == 200
             d2 = json.loads(rb2)
             assert d2["path"] == "/after-leading-zeros"
             assert d2["headers"].get("X-Forwarded-Proto") == "https"
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -4175,7 +4505,7 @@ class TestLargeBodyKeepalive:
 
     async def test_body_32kb_minus_1(self, proxy):
         """POST with body exactly 32767 bytes (buffer - 1) then GET"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             body = b"Z" * 32767
             req1 = (
@@ -4184,8 +4514,9 @@ class TestLargeBodyKeepalive:
                 f"Content-Length: {len(body)}\r\n"
                 f"\r\n"
             ).encode() + body
-            ssock.sendall(req1)
-            s1, _, rb1 = read_http_response(ssock)
+            writer.write(req1)
+            await writer.drain()
+            s1, _, rb1 = await async_read_http_response(reader, writer)
             assert s1 == 200
             d1 = json.loads(rb1)
             assert d1["body_length"] == 32767
@@ -4195,18 +4526,23 @@ class TestLargeBodyKeepalive:
                 f"Host: {TEST_DOMAIN}\r\n"
                 f"\r\n"
             ).encode()
-            ssock.sendall(req2)
-            s2, _, rb2 = read_http_response(ssock)
+            writer.write(req2)
+            await writer.drain()
+            s2, _, rb2 = await async_read_http_response(reader, writer)
             assert s2 == 200
             d2 = json.loads(rb2)
             assert d2["path"] == "/after-32767"
             assert d2["headers"].get("X-Forwarded-Proto") == "https"
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_body_64kb_then_get(self, proxy):
         """POST with 64KB body (2x buffer) then GET"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             body = b"W" * 65536
             req1 = (
@@ -4215,8 +4551,9 @@ class TestLargeBodyKeepalive:
                 f"Content-Length: {len(body)}\r\n"
                 f"\r\n"
             ).encode() + body
-            ssock.sendall(req1)
-            s1, _, rb1 = read_http_response(ssock)
+            writer.write(req1)
+            await writer.drain()
+            s1, _, rb1 = await async_read_http_response(reader, writer)
             assert s1 == 200
             d1 = json.loads(rb1)
             assert d1["body_length"] == 65536
@@ -4226,17 +4563,22 @@ class TestLargeBodyKeepalive:
                 f"Host: {TEST_DOMAIN}\r\n"
                 f"\r\n"
             ).encode()
-            ssock.sendall(req2)
-            s2, _, rb2 = read_http_response(ssock)
+            writer.write(req2)
+            await writer.drain()
+            s2, _, rb2 = await async_read_http_response(reader, writer)
             assert s2 == 200
             d2 = json.loads(rb2)
             assert d2["headers"].get("X-Forwarded-Proto") == "https"
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_three_large_posts_keepalive(self, proxy):
         """Three 50KB POSTs on same connection"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             for i in range(3):
                 body = chr(ord('a') + i).encode() * 50000
@@ -4246,15 +4588,20 @@ class TestLargeBodyKeepalive:
                     f"Content-Length: {len(body)}\r\n"
                     f"\r\n"
                 ).encode() + body
-                ssock.sendall(req)
-                status, _, rb = read_http_response(ssock)
+                writer.write(req)
+                await writer.drain()
+                status, _, rb = await async_read_http_response(reader, writer)
                 assert status == 200, f"Request {i}: expected 200, got {status}"
                 data = json.loads(rb)
                 assert data["body_length"] == 50000
                 assert data["headers"].get("X-Forwarded-Proto") == "https", \
                     f"Request {i}: missing forwarded headers"
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -4288,7 +4635,7 @@ class TestMultipleChunkedPostsWithDifferentSizes:
 
     async def test_alternating_chunk_sizes(self, proxy):
         """Multiple chunked POSTs with alternating single/multi chunk patterns"""
-        ssock = make_ssl_connection()
+        reader, writer = await async_make_ssl_connection()
         try:
             # POST 1: single chunk
             body1 = b"single"
@@ -4299,8 +4646,9 @@ class TestMultipleChunkedPostsWithDifferentSizes:
                 f"Transfer-Encoding: chunked\r\n"
                 f"\r\n"
             ).encode() + chunk1
-            ssock.sendall(req1)
-            s1, _, rb1 = read_http_response(ssock)
+            writer.write(req1)
+            await writer.drain()
+            s1, _, rb1 = await async_read_http_response(reader, writer)
             assert s1 == 200
             assert json.loads(rb1)["body_length"] == len(body1)
 
@@ -4317,8 +4665,9 @@ class TestMultipleChunkedPostsWithDifferentSizes:
                 f"Transfer-Encoding: chunked\r\n"
                 f"\r\n"
             ).encode() + chunks2
-            ssock.sendall(req2)
-            s2, _, rb2 = read_http_response(ssock)
+            writer.write(req2)
+            await writer.drain()
+            s2, _, rb2 = await async_read_http_response(reader, writer)
             assert s2 == 200
             assert json.loads(rb2)["body_length"] == len(data2)
 
@@ -4331,8 +4680,9 @@ class TestMultipleChunkedPostsWithDifferentSizes:
                 f"Transfer-Encoding: chunked\r\n"
                 f"\r\n"
             ).encode() + chunk3
-            ssock.sendall(req3)
-            s3, _, rb3 = read_http_response(ssock)
+            writer.write(req3)
+            await writer.drain()
+            s3, _, rb3 = await async_read_http_response(reader, writer)
             assert s3 == 200
             d3 = json.loads(rb3)
             assert d3["body_length"] == 10000
@@ -4344,11 +4694,16 @@ class TestMultipleChunkedPostsWithDifferentSizes:
                 f"Host: {TEST_DOMAIN}\r\n"
                 f"\r\n"
             ).encode()
-            ssock.sendall(req4)
-            s4, _, rb4 = read_http_response(ssock)
+            writer.write(req4)
+            await writer.drain()
+            s4, _, rb4 = await async_read_http_response(reader, writer)
             assert s4 == 200
         finally:
-            ssock.close()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -4457,15 +4812,19 @@ class TestBackpressureSafety:
                 f"\r\n"
             ).encode()
 
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-
-            with socket.create_connection(("127.0.0.1", https_port), timeout=10) as sock:
-                with ctx.wrap_socket(sock, server_hostname=slow_domain) as ssock:
-                    ssock.settimeout(20.0)
-                    ssock.sendall(headers + payload)
-                    status, _, body = read_http_response(ssock)
+            reader, writer = await async_make_ssl_connection(host=slow_domain, port=https_port)
+            try:
+                writer.write(headers + payload)
+                await writer.drain()
+                status, _, body = await asyncio.wait_for(
+                    async_read_http_response(reader, writer), timeout=20.0
+                )
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
 
             if status == 200:
                 result = json.loads(body)
@@ -4619,19 +4978,23 @@ class TestBackpressureSafety:
                 ).encode()
             )
 
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
+            reader, writer = await async_make_ssl_connection(host=slow_domain, port=https_port)
+            try:
+                writer.write(request)
+                await writer.drain()
 
-            with socket.create_connection(("127.0.0.1", https_port), timeout=10) as sock:
-                with ctx.wrap_socket(sock, server_hostname=slow_domain) as ssock:
-                    ssock.settimeout(20.0)
-                    ssock.sendall(request)
-
-                    s1, _, b1 = read_http_response(ssock)
-                    assert s1 == 200
-                    d1 = json.loads(b1)
-                    assert d1["received"] == len(payload)
+                s1, _, b1 = await asyncio.wait_for(
+                    async_read_http_response(reader, writer), timeout=20.0
+                )
+                assert s1 == 200
+                d1 = json.loads(b1)
+                assert d1["received"] == len(payload)
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
 
             # Backend thread observed both requests with expected boundaries.
             backend_thread.join(timeout=5.0)
