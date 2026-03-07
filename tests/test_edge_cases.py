@@ -107,16 +107,28 @@ class RawSSLClient:
             with socket.create_connection(("127.0.0.1", self.port), timeout=timeout) as sock:
                 with self.context.wrap_socket(sock, server_hostname=self.host) as ssock:
                     ssock.sendall(data)
+                    # Block for the first bytes, then drain with a short idle timeout.
+                    ssock.settimeout(min(timeout, 0.5))
                     response = b""
-                    ssock.settimeout(2.0)
                     try:
-                        while True:
-                            chunk = ssock.recv(8192)
-                            if not chunk:
-                                break
-                            response += chunk
+                        first = ssock.recv(8192)
                     except socket.timeout:
-                        pass
+                        return b""
+                    if not first:
+                        return b""
+                    response += first
+
+                    # Avoid per-request 2s waits on keep-alive sockets.
+                    ssock.settimeout(0.05)
+                    while True:
+                        try:
+                            chunk = ssock.recv(8192)
+                        except socket.timeout:
+                            break
+                        if not chunk:
+                            break
+                        response += chunk
+
                     return response
         except Exception:
             return None
@@ -213,69 +225,6 @@ async def async_request(
     timeout: float = 10.0,
 ) -> tuple[int, dict, bytes]:
     return await client.request(method, path, headers, body, timeout)
-
-
-_SOCKET_RESPONSE_BUFFER = {}
-
-
-def read_http_response(ssock):
-    """Read one HTTP response and preserve extra bytes for subsequent pipelined reads."""
-    sock_id = id(ssock)
-    response = _SOCKET_RESPONSE_BUFFER.pop(sock_id, b"")
-    while b"\r\n\r\n" not in response:
-        chunk = ssock.recv(8192)
-        if not chunk:
-            raise ConnectionError("Connection closed before headers complete")
-        response += chunk
-
-    header_end = response.index(b"\r\n\r\n") + 4
-    headers_raw = response[:header_end].decode()
-    body_data = response[header_end:]
-
-    status_line = headers_raw.split("\r\n")[0]
-    status = int(status_line.split()[1])
-
-    headers = {}
-    for line in headers_raw.split("\r\n")[1:]:
-        if ":" in line:
-            k, v = line.split(":", 1)
-            headers[k.strip()] = v.strip()
-
-    content_length = int(headers.get("Content-Length", 0))
-    while len(body_data) < content_length:
-        chunk = ssock.recv(8192)
-        if not chunk:
-            break
-        body_data += chunk
-
-    if len(body_data) > content_length:
-        _SOCKET_RESPONSE_BUFFER[sock_id] = body_data[content_length:]
-
-    return status, headers, body_data[:content_length]
-
-
-def make_ssl_connection():
-    """Create an SSL connection to the proxy"""
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    sock = socket.create_connection(("127.0.0.1", HTTPS_PORT), timeout=15)
-    ssock = ctx.wrap_socket(sock, server_hostname=TEST_DOMAIN)
-    return ssock
-
-
-def wait_for_tcp_port(port: int, timeout: float = 5.0):
-    """Wait until a local TCP port starts accepting connections."""
-    deadline = time.time() + timeout
-    last_error = None
-    while time.time() < deadline:
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                return
-        except OSError as exc:
-            last_error = exc
-            time.sleep(0.02)
-    raise RuntimeError(f"Port {port} not ready within {timeout}s (last error: {last_error})")
 
 
 async def async_wait_for_tcp_port(port: int, timeout: float = 5.0):
@@ -614,9 +563,9 @@ class WebSocketFragmented101Handler(BaseHTTPRequestHandler):
 
         # Force the status line to arrive in multiple reads at the proxy backend side.
         self.connection.sendall(response[:7])
-        time.sleep(0.03)
+        time.sleep(0.01)
         self.connection.sendall(response[7:19])
-        time.sleep(0.03)
+        time.sleep(0.01)
         self.connection.sendall(response[19:])
 
         try:
@@ -1118,31 +1067,6 @@ def ws_frame(payload: bytes, opcode: int = 0x1, masked: bool = True) -> bytes:
         frame += payload
 
     return frame
-
-
-def read_ws_frame(ssock) -> bytes:
-    """Read a WebSocket frame and return payload"""
-    header = b""
-    while len(header) < 2:
-        header += ssock.recv(2 - len(header))
-
-    payload_len = header[1] & 0x7F
-    if payload_len == 126:
-        ext = b""
-        while len(ext) < 2:
-            ext += ssock.recv(2 - len(ext))
-        payload_len = struct.unpack(">H", ext)[0]
-    elif payload_len == 127:
-        ext = b""
-        while len(ext) < 8:
-            ext += ssock.recv(8 - len(ext))
-        payload_len = struct.unpack(">Q", ext)[0]
-
-    payload = b""
-    while len(payload) < payload_len:
-        payload += ssock.recv(payload_len - len(payload))
-
-    return payload
 
 
 class TestWebSocket:
@@ -2108,7 +2032,7 @@ class TestConnectionEdgeCases:
                 pass
 
         await asyncio.to_thread(_sync_rst)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.1)
 
         # Proxy should still work
         client = ProxyClient(port=HTTPS_PORT)
@@ -3693,7 +3617,7 @@ class TestConnectionCloseInChunkedBody:
                 pass
 
         await asyncio.to_thread(_sync_disconnect)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.1)
 
         # Proxy should still be alive
         client = ProxyClient(port=HTTPS_PORT)
@@ -3730,7 +3654,7 @@ class TestConnectionCloseInChunkedBody:
                 pass
 
         await asyncio.to_thread(_sync_disconnect)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.1)
 
         # Proxy should still be alive
         client = ProxyClient(port=HTTPS_PORT)
@@ -4010,7 +3934,7 @@ class TestSlowHeaderDelivery:
             for i in range(0, len(request), 3):
                 writer.write(request[i:i+3])
                 await writer.drain()
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(0.001)
 
             status, _, body = await async_read_http_response(reader, writer)
             assert status == 200
@@ -4033,10 +3957,10 @@ class TestSlowHeaderDelivery:
 
             writer.write(part1)
             await writer.drain()
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.01)
             writer.write(part2)
             await writer.drain()
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.01)
             writer.write(part3)
             await writer.drain()
 
@@ -4076,7 +4000,7 @@ class TestBackendClosesAfterResponse:
             # Backend may or may not close — the proxy should handle either case.
             # Try a second request. If the proxy creates a new backend connection
             # or keeps using the old one, it should work either way.
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.02)
             req2 = (
                 f"GET /close-test-2 HTTP/1.1\r\n"
                 f"Host: {TEST_DOMAIN}\r\n"
@@ -4758,7 +4682,7 @@ class TestBackpressureSafety:
                         break
 
                 # Intentionally delay reads to create backpressure at proxy/backend boundary.
-                time.sleep(0.4)
+                time.sleep(0.1)
 
                 idle_rounds = 0
                 while len(body) < declared and idle_rounds < 4:
@@ -4800,7 +4724,6 @@ class TestBackpressureSafety:
             json.dump(config, f)
 
         process = await async_start_revpx(config_file, https_port=https_port, http_port=http_port)
-        await asyncio.sleep(1.0)
 
         try:
             payload = b"P" * (2 * 1024 * 1024)
@@ -4874,7 +4797,7 @@ class TestBackpressureSafety:
             body = rest
             while len(body) < cl:
                 # Slow body drain to force proxy-side buffering/backpressure.
-                time.sleep(0.01)
+                time.sleep(0.002)
                 chunk = conn.recv(min(4096, cl - len(body)))
                 if not chunk:
                     break
@@ -4957,7 +4880,6 @@ class TestBackpressureSafety:
             json.dump(config, f)
 
         process = await async_start_revpx(config_file, https_port=https_port, http_port=http_port)
-        await asyncio.sleep(1.0)
 
         try:
             payload = b"Q" * (1024 * 1024)
@@ -5049,7 +4971,6 @@ class TestBackendAddressResolution:
             json.dump(config, f)
 
         process = await async_start_revpx(config_file, https_port=https_port, http_port=http_port)
-        await asyncio.sleep(1)
 
         try:
             assert process.returncode is None, "Proxy exited unexpectedly"

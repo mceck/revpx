@@ -16,12 +16,10 @@ import hashlib
 import json
 import os
 import random
-import socket
 import ssl
 import string
 import struct
 import sys
-import time
 from typing import Optional
 
 import pytest
@@ -88,34 +86,6 @@ class RawClient:
     def __init__(self, host: str = TEST_DOMAIN, port: int = FUZZ_HTTPS_PORT):
         self.host = host
         self.port = port
-        self.context = ssl.create_default_context()
-        self.context.check_hostname = False
-        self.context.verify_mode = ssl.CERT_NONE
-
-    def send_raw(self, data: bytes, timeout: float = 5.0, read_response: bool = True) -> Optional[bytes]:
-        """Send raw bytes and optionally read response"""
-        try:
-            with socket.create_connection(("127.0.0.1", self.port), timeout=timeout) as sock:
-                with self.context.wrap_socket(sock, server_hostname=self.host) as ssock:
-                    ssock.sendall(data)
-
-                    if not read_response:
-                        return None
-
-                    response = b""
-                    ssock.settimeout(2.0)
-                    try:
-                        while True:
-                            chunk = ssock.recv(8192)
-                            if not chunk:
-                                break
-                            response += chunk
-                    except socket.timeout:
-                        pass
-
-                    return response
-        except Exception as e:
-            return None
 
 
 pytestmark = pytest.mark.asyncio
@@ -127,7 +97,48 @@ async def async_send_raw(
     timeout: float = 5.0,
     read_response: bool = True,
 ) -> Optional[bytes]:
-    return await asyncio.to_thread(raw.send_raw, data, timeout, read_response)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    try:
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", raw.port, ssl=ctx, server_hostname=raw.host
+        )
+        try:
+            writer.write(data)
+            await writer.drain()
+
+            if not read_response:
+                return None
+
+            try:
+                first = await asyncio.wait_for(reader.read(8192), timeout=min(timeout, 0.5))
+            except asyncio.TimeoutError:
+                return b""
+
+            if not first:
+                return b""
+
+            response = first
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(reader.read(8192), timeout=0.05)
+                except asyncio.TimeoutError:
+                    break
+                if not chunk:
+                    break
+                response += chunk
+
+            return response
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+    except Exception:
+        return b""
 
 
 async def async_request(
@@ -665,157 +676,169 @@ class TestSecurityBoundaries:
 class TestConnectionState:
     """Test connection state handling"""
 
+    async def _open_ssl(self):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return await asyncio.open_connection(
+            "127.0.0.1", FUZZ_HTTPS_PORT, ssl=ctx, server_hostname=TEST_DOMAIN
+        )
+
+    async def _read_until_idle(self, reader, idle_timeout: float = 0.05, chunk_size: int = 8192) -> bytes:
+        data = b""
+        while True:
+            try:
+                chunk = await asyncio.wait_for(reader.read(chunk_size), timeout=idle_timeout)
+            except asyncio.TimeoutError:
+                break
+            if not chunk:
+                break
+            data += chunk
+        return data
+
+    async def _read_one_http_response(self, reader) -> bytes:
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+            if not chunk:
+                return data
+            data += chunk
+
+        header_end = data.index(b"\r\n\r\n") + 4
+        headers_raw = data[:header_end].decode(errors="replace")
+        body = data[header_end:]
+
+        content_length = 0
+        for line in headers_raw.split("\r\n"):
+            if line.lower().startswith("content-length:"):
+                try:
+                    content_length = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    content_length = 0
+                break
+
+        while len(body) < content_length:
+            chunk = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+            if not chunk:
+                break
+            body += chunk
+
+        return data[:header_end] + body[:content_length]
+
     async def test_connection_reuse_after_error(self, proxy):
         """Test that connection can be reused after error response"""
-        def run_case() -> None:
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
+        reader, writer = await self._open_ssl()
+        try:
+            def custom_404(handler, req):
+                handler._send_response(404, {}, b"not found")
 
-            with socket.create_connection(("127.0.0.1", FUZZ_HTTPS_PORT), timeout=10) as sock:
-                with context.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                    def custom_404(handler, req):
-                        handler._send_response(404, {}, b"not found")
+            BackendHandler.custom_response = custom_404
+            request1 = f"GET /notfound HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\nConnection: keep-alive\r\n\r\n".encode()
+            writer.write(request1)
+            await writer.drain()
 
-                    BackendHandler.custom_response = custom_404
+            response1 = await self._read_one_http_response(reader)
+            assert b"404" in response1
 
-                    request1 = f"GET /notfound HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\nConnection: keep-alive\r\n\r\n".encode()
-                    ssock.sendall(request1)
+            BackendHandler.custom_response = None
+            request2 = f"GET / HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\nConnection: close\r\n\r\n".encode()
+            writer.write(request2)
+            await writer.drain()
 
-                    response1 = b""
-                    while b"\r\n\r\n" not in response1:
-                        response1 += ssock.recv(4096)
-                    assert b"404" in response1
-
-                    BackendHandler.custom_response = None
-                    request2 = f"GET / HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\nConnection: close\r\n\r\n".encode()
-                    ssock.sendall(request2)
-
-                    response2 = b""
-                    try:
-                        while True:
-                            chunk = ssock.recv(4096)
-                            if not chunk:
-                                break
-                            response2 += chunk
-                    except Exception:
-                        pass
-                    assert b"200" in response2
-
-        await asyncio.to_thread(run_case)
+            response2 = await self._read_until_idle(reader)
+            assert b"200" in response2
+        finally:
+            BackendHandler.custom_response = None
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_pipelining(self, proxy):
         """Test HTTP pipelining (multiple requests without waiting)"""
-        def run_case() -> None:
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
+        reader, writer = await self._open_ssl()
+        try:
+            requests = b""
+            for i in range(3):
+                requests += f"GET /pipeline/{i} HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\n\r\n".encode()
+            writer.write(requests)
+            await writer.drain()
 
-            with socket.create_connection(("127.0.0.1", FUZZ_HTTPS_PORT), timeout=10) as sock:
-                with context.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                    requests = b""
-                    for i in range(3):
-                        requests += f"GET /pipeline/{i} HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\n\r\n".encode()
-                    ssock.sendall(requests)
-
-                    responses = b""
-                    ssock.settimeout(5.0)
-                    try:
-                        while True:
-                            chunk = ssock.recv(8192)
-                            if not chunk:
-                                break
-                            responses += chunk
-                    except socket.timeout:
-                        pass
-                    assert responses.count(b"HTTP/1.1 200") >= 1
-
-        await asyncio.to_thread(run_case)
+            responses = await self._read_until_idle(reader)
+            assert responses.count(b"HTTP/1.1 200") >= 1
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_slow_client_headers(self, proxy):
         """Test slow client sending headers byte by byte"""
-        def run_case() -> None:
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
+        reader, writer = await self._open_ssl()
+        try:
             request = f"GET / HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\n\r\n".encode()
+            for b in request:
+                writer.write(bytes([b]))
+                await writer.drain()
+                await asyncio.sleep(0.001)
 
-            with socket.create_connection(("127.0.0.1", FUZZ_HTTPS_PORT), timeout=30) as sock:
-                with context.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                    for b in request:
-                        ssock.send(bytes([b]))
-                        time.sleep(0.01)
-
-                    response = b""
-                    ssock.settimeout(5.0)
-                    try:
-                        while True:
-                            chunk = ssock.recv(4096)
-                            if not chunk:
-                                break
-                            response += chunk
-                    except socket.timeout:
-                        pass
-                    assert b"200" in response
-
-        await asyncio.to_thread(run_case)
+            response = await self._read_until_idle(reader)
+            assert b"200" in response
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_slow_client_body(self, proxy):
         """Test slow client sending body slowly"""
-        def run_case() -> None:
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
+        reader, writer = await self._open_ssl()
+        try:
             body = b"x" * 100
+            headers = (
+                f"POST / HTTP/1.1\r\n"
+                f"Host: {TEST_DOMAIN}\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                f"\r\n"
+            ).encode()
+            writer.write(headers)
+            await writer.drain()
 
-            with socket.create_connection(("127.0.0.1", FUZZ_HTTPS_PORT), timeout=30) as sock:
-                with context.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                    headers = (
-                        f"POST / HTTP/1.1\r\n"
-                        f"Host: {TEST_DOMAIN}\r\n"
-                        f"Content-Length: {len(body)}\r\n"
-                        f"\r\n"
-                    ).encode()
-                    ssock.sendall(headers)
+            for i in range(0, len(body), 10):
+                writer.write(body[i:i + 10])
+                await writer.drain()
+                await asyncio.sleep(0.005)
 
-                    for i in range(0, len(body), 10):
-                        ssock.send(body[i:i + 10])
-                        time.sleep(0.05)
-
-                    response = b""
-                    ssock.settimeout(5.0)
-                    try:
-                        while True:
-                            chunk = ssock.recv(4096)
-                            if not chunk:
-                                break
-                            response += chunk
-                    except socket.timeout:
-                        pass
-                    assert b"200" in response
-
-        await asyncio.to_thread(run_case)
+            response = await self._read_until_idle(reader)
+            assert b"200" in response
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def test_client_disconnect_during_response(self, proxy):
         """Test handling when client disconnects during response"""
         # Set up slow backend response
-        BackendHandler.response_delay = 2.0
+        BackendHandler.response_delay = 1.0
 
-        def trigger_disconnect() -> None:
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-
+        try:
+            reader, writer = await self._open_ssl()
+            writer.write(f"GET / HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\n\r\n".encode())
+            await writer.drain()
+            writer.close()
             try:
-                with socket.create_connection(("127.0.0.1", FUZZ_HTTPS_PORT), timeout=10) as sock:
-                    with context.wrap_socket(sock, server_hostname=TEST_DOMAIN) as ssock:
-                        request = f"GET / HTTP/1.1\r\nHost: {TEST_DOMAIN}\r\n\r\n".encode()
-                        ssock.sendall(request)
+                await writer.wait_closed()
             except Exception:
                 pass
+        except Exception:
+            pass
 
-        await asyncio.to_thread(trigger_disconnect)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.1)
 
         # Proxy should still work for next request
         client = ProxyClient(port=FUZZ_HTTPS_PORT)
