@@ -115,7 +115,9 @@ int parse_config_file(RevPx *revpx, const char *config_file) {
             ret = 1;
             goto cleanup;
         }
-        char domain[256] = {0}, host[256] = {0}, port[16] = {0}, cert_file[512] = {0}, key_file[512] = {0};
+        char domain[256] = {0}, port[16] = {0}, cert_file[512] = {0}, key_file[512] = {0};
+        RpRule rule_buf[RP_MAX_RULES];
+        int rule_count = 0;
         while (jsp_key(&jsp) == 0) {
             if (strcmp(jsp.string, "domain") == 0) {
                 if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) {
@@ -145,10 +147,46 @@ int parse_config_file(RevPx *revpx, const char *config_file) {
                     goto cleanup;
                 }
                 strcpy(key_file, jsp.string);
-            } else if (strcmp(jsp.string, "host") == 0) {
-                if (jsp_value(&jsp) == 0 && jsp.type == JSP_TYPE_STRING) {
-                    strcpy(host, jsp.string);
+            } else if (strcmp(jsp.string, "rules") == 0) {
+                if (jsp_begin_array(&jsp) != 0) {
+                    rp_log_error("Invalid 'rules' value in object %d in config file %s\n", i, config_file);
+                    ret = 1;
+                    goto cleanup;
                 }
+                int rlen = jsp_array_length(&jsp);
+                for (int r = 0; r < rlen && rule_count < RP_MAX_RULES; r++) {
+                    if (jsp_begin_object(&jsp) != 0) { ret = 1; goto cleanup; }
+                    char r_match[512], r_rewrite[512], r_host[256], r_port[16];
+                    r_match[0] = r_rewrite[0] = r_host[0] = r_port[0] = '\0';
+                    bool has_rewrite = false;
+                    while (jsp_key(&jsp) == 0) {
+                        if (strcmp(jsp.string, "match") == 0) {
+                            if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) { ret = 1; goto cleanup; }
+                            strcpy(r_match, jsp.string);
+                        } else if (strcmp(jsp.string, "rewrite") == 0) {
+                            if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) { ret = 1; goto cleanup; }
+                            strcpy(r_rewrite, jsp.string);
+                            has_rewrite = true;
+                        } else if (strcmp(jsp.string, "host") == 0) {
+                            if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) { ret = 1; goto cleanup; }
+                            strcpy(r_host, jsp.string);
+                        } else if (strcmp(jsp.string, "port") == 0) {
+                            if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) { ret = 1; goto cleanup; }
+                            strcpy(r_port, jsp.string);
+                        } else {
+                            if (jsp_skip(&jsp) != 0) { ret = 1; goto cleanup; }
+                        }
+                    }
+                    if (jsp_end_object(&jsp) != 0) { ret = 1; goto cleanup; }
+                    if (r_match[0]) {
+                        rule_buf[rule_count].match = r_match[0] ? strdup(r_match) : NULL;
+                        rule_buf[rule_count].rewrite = has_rewrite ? strdup(r_rewrite) : NULL;
+                        rule_buf[rule_count].host = r_host[0] ? strdup(r_host) : NULL;
+                        rule_buf[rule_count].port = r_port[0] ? strdup(r_port) : NULL;
+                        rule_count++;
+                    }
+                }
+                if (jsp_end_array(&jsp) != 0) { ret = 1; goto cleanup; }
             } else {
                 // Unknown key; skip its value
                 if (jsp_skip(&jsp) != 0) {
@@ -163,7 +201,14 @@ int parse_config_file(RevPx *revpx, const char *config_file) {
             ret = 1;
             goto cleanup;
         }
-        revpx_add_domain(revpx, domain, host, port, cert_file, key_file);
+        RpRules rules = {.entries = rule_buf, .count = rule_count};
+        revpx_add_domain(revpx, domain, rule_count > 0 ? &rules : NULL, port, cert_file, key_file);
+        for (int r = 0; r < rule_count; r++) {
+            free((char *)rule_buf[r].match);
+            free((char *)rule_buf[r].rewrite);
+            free((char *)rule_buf[r].host);
+            free((char *)rule_buf[r].port);
+        }
     }
     jsp_end_array(&jsp);
 cleanup:

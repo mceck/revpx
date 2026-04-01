@@ -34,6 +34,9 @@
 #ifndef RP_MAX_DOMAINS
 #define RP_MAX_DOMAINS 128
 #endif
+#ifndef RP_MAX_RULES
+#define RP_MAX_RULES 32
+#endif
 
 // ==== Logging ====
 enum log_level {
@@ -114,6 +117,12 @@ typedef struct {
     bool read_stalled;      // reading paused because peer's write buffer is full (backpressure)
     bool websocket;         // request contained Upgrade: websocket
 
+    // URL rewriting (backend-side): if the connection was routed through a
+    // rule with a rewrite directive, these point into the domain's rule storage
+    // and are applied to every request on this connection.
+    const char *rewrite_match;    // path prefix to match (NULL = no rewrite)
+    const char *rewrite_replace;  // replacement prefix
+
     // Request boundary tracking (backend-side only, used in forward_client_bytes).
     // Enables keep-alive by knowing where one request ends and the next begins,
     // so forwarded-headers can be injected into each new request.
@@ -132,6 +141,34 @@ typedef struct {
     uint32_t chunk_trailer_window; // sliding window to detect \r\n\r\n end of trailers
 } RpConnection;
 
+/**
+ * Routing rule for path-based proxying within a domain.
+ * Used as input to revpx_add_domain.
+ */
+typedef struct {
+    const char *match;    // path prefix to match (e.g. "/api"), required
+    const char *rewrite;  // replace matched prefix with this (NULL = no rewrite)
+    const char *host;     // backend host override (NULL = domain default "127.0.0.1")
+    const char *port;     // backend port override (NULL = domain default)
+} RpRule;
+
+/**
+ * Collection of routing rules passed to revpx_add_domain.
+ * Rules are evaluated in order; first match wins.
+ * Requests that match no rule fall through to the domain's default backend.
+ */
+typedef struct {
+    const RpRule *entries;
+    int count;
+} RpRules;
+
+typedef struct {
+    char *match;
+    char *rewrite;  // NULL = no rewrite
+    char *host;
+    char *port;
+} RpRouteRule;
+
 typedef struct {
     char *domain;
     char *host;
@@ -139,6 +176,8 @@ typedef struct {
     char *cert;
     char *key;
     SSL_CTX *ctx;
+    int rule_count;
+    RpRouteRule rules[RP_MAX_RULES];
 } RpHostDomain;
 
 typedef struct {
@@ -166,12 +205,12 @@ void revpx_free(RevPx *revpx);
  * Add a domain mapping to the reverse proxy.
  * @param revpx The RevPx instance
  * @param domain The domain name to match (e.g. "example.com")
- * @param host The backend host to forward to (default: "127.0.0.1")
- * @param port The backend port to forward to
+ * @param rules Optional routing rules for path-based routing (NULL = proxy entire domain)
+ * @param port The default backend port to forward to
  * @param cert The path to the SSL certificate file
  * @param key The path to the SSL key file
  */
-bool revpx_add_domain(RevPx *revpx, const char *domain, const char *host, const char *port, const char *cert, const char *key);
+bool revpx_add_domain(RevPx *revpx, const char *domain, const RpRules *rules, const char *port, const char *cert, const char *key);
 /**
  * Start the reverse proxy server.
  * Listens on https_port for HTTPS and redirects HTTP traffic from http_port to HTTPS.
@@ -241,6 +280,8 @@ void revpx_use_simple_log(){
 
 static void fill_peer_ip(int fd, char *out, size_t max);
 static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnection *backend, const unsigned char *data, size_t n);
+static int find_route(RpHostDomain *d, const char *target);
+static int rewrite_request_uri(unsigned char *buf, size_t *len, size_t buf_size, const char *match, const char *rewrite);
 static bool log_ssl_error_queue(int level, const char *prefix);
 
 static void set_nonblock(int fd) {
@@ -1485,6 +1526,13 @@ static ForwardClientHeaderResult forward_client_handle_complete_header(RevPx *re
         backend->off = 0;
     }
 
+    // Apply URL rewriting for keep-alive requests (first request is rewritten
+    // in handle_state_read_header; subsequent requests are rewritten here).
+    if (backend->rewrite_match && backend->rewrite_replace) {
+        rewrite_request_uri(backend->buf, &backend->len, sizeof(backend->buf),
+                            backend->rewrite_match, backend->rewrite_replace);
+    }
+
     int header_end_idx = find_headers_end(backend->buf, backend->len);
     size_t orig_header_end = (size_t)header_end_idx;
 
@@ -1713,6 +1761,67 @@ static bool handle_event_error_or_hup(RevPx *revpx, RpConnection *c, uint32_t ev
     return false;
 }
 
+/**
+ * Find the matching routing rule for a request path within a domain.
+ * Returns the rule index, or -1 if no rule matches (use domain defaults).
+ * Rules are evaluated in order; first prefix match wins.
+ */
+static int find_route(RpHostDomain *d, const char *target) {
+    for (int i = 0; i < d->rule_count; i++) {
+        size_t mlen = strlen(d->rules[i].match);
+        if (strncmp(target, d->rules[i].match, mlen) == 0) {
+            // Exact prefix match: "/api" matches "/api", "/api/", "/api/foo"
+            // but not "/apiary". Require next char to be '\0', '/', or '?',
+            // unless the match itself ends with '/'.
+            if (target[mlen] == '\0' || target[mlen] == '/' || target[mlen] == '?' ||
+                d->rules[i].match[mlen - 1] == '/') {
+                return i;
+            }
+        }
+    }
+    return -1;
+}
+
+/**
+ * Rewrite the request URI in a buffer containing HTTP request data.
+ * Replaces the path prefix `match` with `rewrite` in the request line.
+ * Returns the size change (positive = grew, negative = shrank, 0 = unchanged or no match).
+ */
+static int rewrite_request_uri(unsigned char *buf, size_t *len, size_t buf_size,
+                               const char *match, const char *rewrite) {
+    // Request line: "METHOD SP target SP HTTP/x.y CRLF ..."
+    unsigned char *sp1 = memchr(buf, ' ', *len);
+    if (!sp1) return 0;
+    sp1++; // start of URI
+
+    unsigned char *sp2 = memchr(sp1, ' ', *len - (size_t)(sp1 - buf));
+    if (!sp2) return 0;
+
+    size_t uri_len = (size_t)(sp2 - sp1);
+    size_t match_len = strlen(match);
+    size_t rewrite_len = strlen(rewrite);
+
+    if (uri_len < match_len) return 0;
+    if (memcmp(sp1, match, match_len) != 0) return 0;
+
+    // Don't match partial path segments (same logic as find_route)
+    if (uri_len > match_len && sp1[match_len] != '/' && sp1[match_len] != '?' &&
+        match[match_len - 1] != '/') {
+        return 0;
+    }
+
+    int diff = (int)rewrite_len - (int)match_len;
+    if (diff > 0 && *len + (size_t)diff > buf_size) return 0; // no space
+
+    // Shift everything after the matched prefix
+    size_t tail = *len - (size_t)(sp1 + match_len - buf);
+    memmove(sp1 + rewrite_len, sp1 + match_len, tail);
+    memcpy(sp1, rewrite, rewrite_len);
+    *len = (size_t)((int)*len + diff);
+
+    return diff;
+}
+
 static void handle_state_ssl_handshake(RevPx *revpx, RpConnection *c) {
     int ret = SSL_accept(c->ssl);
     if (ret == 1) {
@@ -1790,11 +1899,29 @@ static void handle_state_read_header(RevPx *revpx, RpConnection *c) {
                 send_error(revpx, c, 421, "Misdirected Request");
                 return;
             }
-            rp_log_debug("HTTPS request: https://%s%s -> %s:%s\n", host, target, d->host, d->port);
 
-            int backend = create_backend(d->host, d->port);
+            // Route matching: find backend host/port and optional rewrite rule
+            const char *backend_host = d->host;
+            const char *backend_port = d->port;
+            const char *rw_match = NULL;
+            const char *rw_replace = NULL;
+            int rule_idx = find_route(d, target);
+            if (rule_idx >= 0) {
+                RpRouteRule *rule = &d->rules[rule_idx];
+                backend_host = rule->host;
+                backend_port = rule->port;
+                if (rule->rewrite) {
+                    rw_match = rule->match;
+                    rw_replace = rule->rewrite;
+                    rewrite_request_uri(c->buf, &c->len, sizeof(c->buf), rw_match, rw_replace);
+                }
+            }
+
+            rp_log_debug("HTTPS request: https://%s%s -> %s:%s\n", host, target, backend_host, backend_port);
+
+            int backend = create_backend(backend_host, backend_port);
             if (backend < 0) {
-                rp_log_error("Failed to create backend connection to %s:%s\n", d->host, d->port);
+                rp_log_error("Failed to create backend connection to %s:%s\n", backend_host, backend_port);
                 send_error(revpx, c, 502, "Bad Gateway");
                 return;
             }
@@ -1804,6 +1931,8 @@ static void handle_state_read_header(RevPx *revpx, RpConnection *c) {
                 send_error(revpx, c, 503, "Service Unavailable");
                 return;
             }
+            b->rewrite_match = rw_match;
+            b->rewrite_replace = rw_replace;
             c->peer = backend;
             b->peer = fd;
             c->state = ST_CONNECTING;
@@ -2144,21 +2273,31 @@ static int create_listener(const char *port) {
     return fd;
 }
 
-bool revpx_add_domain(RevPx *revpx, const char *domain, const char *host, const char *port, const char *cert, const char *key) {
+bool revpx_add_domain(RevPx *revpx, const char *domain, const RpRules *rules, const char *port, const char *cert, const char *key) {
     if (revpx->domain_count >= RP_MAX_DOMAINS) {
         rp_log_error("Maximum number of domains reached\n");
         return false;
     }
     RpHostDomain *d = &revpx->domains[revpx->domain_count++];
     d->domain = strdup(domain);
-    if (host && host[0])
-        d->host = strdup(host);
-    else
-        d->host = strdup(RP_DEFAULT_BACKEND_HOST);
+    d->host = strdup(RP_DEFAULT_BACKEND_HOST);
     d->port = strdup(port);
     d->cert = strdup(cert);
     d->key = strdup(key);
     d->ctx = NULL;
+    d->rule_count = 0;
+    if (rules && rules->entries && rules->count > 0) {
+        int n = rules->count < RP_MAX_RULES ? rules->count : RP_MAX_RULES;
+        for (int i = 0; i < n; i++) {
+            const RpRule *src = &rules->entries[i];
+            if (!src->match) continue;
+            RpRouteRule *dst = &d->rules[d->rule_count++];
+            dst->match = strdup(src->match);
+            dst->rewrite = src->rewrite ? strdup(src->rewrite) : NULL;
+            dst->host = strdup(src->host && src->host[0] ? src->host : RP_DEFAULT_BACKEND_HOST);
+            dst->port = strdup(src->port && src->port[0] ? src->port : port);
+        }
+    }
     return true;
 }
 
@@ -2176,6 +2315,13 @@ void print_proxy_domains(RevPx *revpx) {
     for (int i = 0; i < revpx->domain_count; i++) {
         RpHostDomain *d = &revpx->domains[i];
         printf("https://%-32s -> %s:%s\n", d->domain, strcmp(d->host, RP_DEFAULT_BACKEND_HOST) ? d->host : "", d->port);
+        for (int j = 0; j < d->rule_count; j++) {
+            RpRouteRule *r = &d->rules[j];
+            printf("  %-34s -> %s:%s", r->match,
+                   strcmp(r->host, RP_DEFAULT_BACKEND_HOST) ? r->host : "", r->port);
+            if (r->rewrite) printf("  rewrite -> %s", r->rewrite);
+            printf("\n");
+        }
     }
     printf("\n");
 }
@@ -2353,6 +2499,12 @@ void revpx_free(RevPx *revpx) {
         if (d->cert) free(d->cert);
         if (d->key) free(d->key);
         if (d->host) free(d->host);
+        for (int j = 0; j < d->rule_count; j++) {
+            free(d->rules[j].match);
+            free(d->rules[j].rewrite);
+            free(d->rules[j].host);
+            free(d->rules[j].port);
+        }
     }
     free(revpx);
 }

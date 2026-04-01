@@ -2,6 +2,20 @@ use std::os::raw::c_void;
 
 type CRevPx = c_void;
 
+#[repr(C)]
+struct CRpRule {
+    match_path: *const u8,
+    rewrite: *const u8,
+    host: *const u8,
+    port: *const u8,
+}
+
+#[repr(C)]
+struct CRpRules {
+    entries: *const CRpRule,
+    count: i32,
+}
+
 unsafe extern "C" {
     fn revpx_set_log_level(level: i32);
     fn revpx_use_colored_log();
@@ -9,7 +23,7 @@ unsafe extern "C" {
     fn revpx_add_domain(
         revpx: *mut CRevPx,
         domain: *const u8,
-        host: *const u8,
+        rules: *const CRpRules,
         port: *const u8,
         cert: *const u8,
         key: *const u8,
@@ -19,13 +33,27 @@ unsafe extern "C" {
     fn revpx_free(revpx: *mut CRevPx);
 }
 
+/// A single routing rule for path-based proxying.
+#[derive(Debug, Clone, Default)]
+pub struct RouteRule {
+    /// Path prefix to match (e.g. "/api")
+    pub match_path: String,
+    /// Replace matched prefix with this (None = no rewrite)
+    pub rewrite: Option<String>,
+    /// Backend host override (None = default "127.0.0.1")
+    pub host: Option<String>,
+    /// Backend port override (None = use domain default)
+    pub port: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DomainConfig {
     pub domain: String,
-    pub host: Option<String>,
     pub port: String,
     pub cert: String,
     pub key: String,
+    /// Optional routing rules. If empty, the entire domain is proxied.
+    pub rules: Vec<RouteRule>,
 }
 
 pub struct RevPx {
@@ -73,17 +101,61 @@ impl RevPx {
         let port = std::ffi::CString::new(config.port).unwrap();
         let cert = std::ffi::CString::new(config.cert).unwrap();
         let key = std::ffi::CString::new(config.key).unwrap();
-        let host = std::ffi::CString::new(config.host.unwrap_or_default()).unwrap();
 
-        unsafe {
-            revpx_add_domain(
-                self.ptr,
-                domain.as_ptr().cast(),
-                host.as_ptr().cast(),
-                port.as_ptr().cast(),
-                cert.as_ptr().cast(),
-                key.as_ptr().cast(),
-            );
+        if config.rules.is_empty() {
+            unsafe {
+                revpx_add_domain(
+                    self.ptr,
+                    domain.as_ptr().cast(),
+                    std::ptr::null(),
+                    port.as_ptr().cast(),
+                    cert.as_ptr().cast(),
+                    key.as_ptr().cast(),
+                );
+            }
+        } else {
+            // Build C rule structs. Keep CStrings alive until after the call.
+            let mut c_strings: Vec<(
+                std::ffi::CString,
+                Option<std::ffi::CString>,
+                Option<std::ffi::CString>,
+                Option<std::ffi::CString>,
+            )> = Vec::with_capacity(config.rules.len());
+
+            for r in &config.rules {
+                c_strings.push((
+                    std::ffi::CString::new(r.match_path.as_str()).unwrap(),
+                    r.rewrite.as_ref().map(|s| std::ffi::CString::new(s.as_str()).unwrap()),
+                    r.host.as_ref().map(|s| std::ffi::CString::new(s.as_str()).unwrap()),
+                    r.port.as_ref().map(|s| std::ffi::CString::new(s.as_str()).unwrap()),
+                ));
+            }
+
+            let c_rules: Vec<CRpRule> = c_strings
+                .iter()
+                .map(|(m, rw, h, p)| CRpRule {
+                    match_path: m.as_ptr().cast(),
+                    rewrite: rw.as_ref().map_or(std::ptr::null(), |s| s.as_ptr().cast()),
+                    host: h.as_ref().map_or(std::ptr::null(), |s| s.as_ptr().cast()),
+                    port: p.as_ref().map_or(std::ptr::null(), |s| s.as_ptr().cast()),
+                })
+                .collect();
+
+            let rules = CRpRules {
+                entries: c_rules.as_ptr(),
+                count: c_rules.len() as i32,
+            };
+
+            unsafe {
+                revpx_add_domain(
+                    self.ptr,
+                    domain.as_ptr().cast(),
+                    &rules,
+                    port.as_ptr().cast(),
+                    cert.as_ptr().cast(),
+                    key.as_ptr().cast(),
+                );
+            }
         }
     }
 
