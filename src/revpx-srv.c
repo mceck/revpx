@@ -86,6 +86,63 @@ cleanup:
     return new_items;
 }
 
+/**
+ * Parse a backend object from JSON:
+ *   {"port": "8080", "host": "...", "match": "/api" or ["/api","/gql"], "rewrite": "/v1"}
+ */
+static int parse_backend(Jsp *jsp, RevPx *revpx) {
+    if (jsp_begin_object(jsp) != 0) return 1;
+    char b_port[16] = {0}, b_host[256] = {0}, b_rewrite[512] = {0};
+    bool has_rewrite = false;
+    char match_buf[RP_MAX_RULES][512];
+    const char *match_ptrs[RP_MAX_RULES];
+    int match_count = 0;
+
+    while (jsp_key(jsp) == 0) {
+        if (strcmp(jsp->string, "port") == 0) {
+            if (jsp_value(jsp) != 0 || jsp->type != JSP_TYPE_STRING) return 1;
+            strcpy(b_port, jsp->string);
+        } else if (strcmp(jsp->string, "host") == 0) {
+            if (jsp_value(jsp) != 0 || jsp->type != JSP_TYPE_STRING) return 1;
+            strcpy(b_host, jsp->string);
+        } else if (strcmp(jsp->string, "rewrite") == 0) {
+            if (jsp_value(jsp) != 0 || jsp->type != JSP_TYPE_STRING) return 1;
+            strcpy(b_rewrite, jsp->string);
+            has_rewrite = true;
+        } else if (strcmp(jsp->string, "match") == 0) {
+            // match can be a string or an array of strings
+            if (jsp->off < jsp->length && jsp->buffer[jsp->off] == '[') {
+                if (jsp_begin_array(jsp) != 0) return 1;
+                int alen = jsp_array_length(jsp);
+                for (int a = 0; a < alen && match_count < RP_MAX_RULES; a++) {
+                    if (jsp_value(jsp) != 0 || jsp->type != JSP_TYPE_STRING) return 1;
+                    strcpy(match_buf[match_count], jsp->string);
+                    match_ptrs[match_count] = match_buf[match_count];
+                    match_count++;
+                }
+                if (jsp_end_array(jsp) != 0) return 1;
+            } else {
+                if (jsp_value(jsp) != 0 || jsp->type != JSP_TYPE_STRING) return 1;
+                strcpy(match_buf[match_count], jsp->string);
+                match_ptrs[match_count] = match_buf[match_count];
+                match_count++;
+            }
+        } else {
+            if (jsp_skip(jsp) != 0) return 1;
+        }
+    }
+    if (jsp_end_object(jsp) != 0) return 1;
+    if (!b_port[0]) return 1; // port is required
+
+    revpx_add_backend(revpx,
+                       b_host[0] ? b_host : NULL,
+                       b_port,
+                       match_count > 0 ? match_ptrs : NULL,
+                       match_count,
+                       has_rewrite ? b_rewrite : NULL);
+    return 0;
+}
+
 int parse_config_file(RevPx *revpx, const char *config_file) {
     Jsp jsp = {0};
     size_t size = 0;
@@ -116,99 +173,79 @@ int parse_config_file(RevPx *revpx, const char *config_file) {
             goto cleanup;
         }
         char domain[256] = {0}, port[16] = {0}, cert_file[512] = {0}, key_file[512] = {0};
-        RpRule rule_buf[RP_MAX_RULES];
-        int rule_count = 0;
+        bool has_backends = false;
+        // First pass: collect domain-level fields. Backends are parsed inline.
+        // We need domain/cert/key before parsing backends, so we defer backends.
+        // Strategy: save the jsp position if we encounter "backends" and parse after.
+        // Simpler: just collect all keys, then emit begin/add/end.
+        //
+        // Actually, we parse in order. If we see "backends", we'll have already
+        // called begin_domain (we call it when we first see it, or at end of object).
+        bool domain_begun = false;
+
         while (jsp_key(&jsp) == 0) {
             if (strcmp(jsp.string, "domain") == 0) {
                 if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) {
-                    rp_log_error("Invalid 'domain' value in object %d in config file %s\n", i, config_file);
-                    ret = 1;
-                    goto cleanup;
+                    rp_log_error("Invalid 'domain' in object %d\n", i);
+                    ret = 1; goto cleanup;
                 }
                 strcpy(domain, jsp.string);
             } else if (strcmp(jsp.string, "port") == 0) {
                 if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) {
-                    rp_log_error("Invalid 'port' value in object %d in config file %s\n", i, config_file);
-                    ret = 1;
-                    goto cleanup;
+                    rp_log_error("Invalid 'port' in object %d\n", i);
+                    ret = 1; goto cleanup;
                 }
                 strcpy(port, jsp.string);
             } else if (strcmp(jsp.string, "cert_file") == 0) {
                 if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) {
-                    rp_log_error("Invalid 'cert_file' value in object %d in config file %s\n", i, config_file);
-                    ret = 1;
-                    goto cleanup;
+                    rp_log_error("Invalid 'cert_file' in object %d\n", i);
+                    ret = 1; goto cleanup;
                 }
                 strcpy(cert_file, jsp.string);
             } else if (strcmp(jsp.string, "key_file") == 0) {
                 if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) {
-                    rp_log_error("Invalid 'key_file' value in object %d in config file %s\n", i, config_file);
-                    ret = 1;
-                    goto cleanup;
+                    rp_log_error("Invalid 'key_file' in object %d\n", i);
+                    ret = 1; goto cleanup;
                 }
                 strcpy(key_file, jsp.string);
-            } else if (strcmp(jsp.string, "rules") == 0) {
-                if (jsp_begin_array(&jsp) != 0) {
-                    rp_log_error("Invalid 'rules' value in object %d in config file %s\n", i, config_file);
-                    ret = 1;
-                    goto cleanup;
+            } else if (strcmp(jsp.string, "backends") == 0) {
+                // Must have domain/cert/key by now
+                if (!domain[0] || !cert_file[0] || !key_file[0]) {
+                    rp_log_error("'backends' must come after domain/cert_file/key_file in object %d\n", i);
+                    ret = 1; goto cleanup;
                 }
-                int rlen = jsp_array_length(&jsp);
-                for (int r = 0; r < rlen && rule_count < RP_MAX_RULES; r++) {
-                    if (jsp_begin_object(&jsp) != 0) { ret = 1; goto cleanup; }
-                    char r_match[512], r_rewrite[512], r_host[256], r_port[16];
-                    r_match[0] = r_rewrite[0] = r_host[0] = r_port[0] = '\0';
-                    bool has_rewrite = false;
-                    while (jsp_key(&jsp) == 0) {
-                        if (strcmp(jsp.string, "match") == 0) {
-                            if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) { ret = 1; goto cleanup; }
-                            strcpy(r_match, jsp.string);
-                        } else if (strcmp(jsp.string, "rewrite") == 0) {
-                            if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) { ret = 1; goto cleanup; }
-                            strcpy(r_rewrite, jsp.string);
-                            has_rewrite = true;
-                        } else if (strcmp(jsp.string, "host") == 0) {
-                            if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) { ret = 1; goto cleanup; }
-                            strcpy(r_host, jsp.string);
-                        } else if (strcmp(jsp.string, "port") == 0) {
-                            if (jsp_value(&jsp) != 0 || jsp.type != JSP_TYPE_STRING) { ret = 1; goto cleanup; }
-                            strcpy(r_port, jsp.string);
-                        } else {
-                            if (jsp_skip(&jsp) != 0) { ret = 1; goto cleanup; }
-                        }
-                    }
-                    if (jsp_end_object(&jsp) != 0) { ret = 1; goto cleanup; }
-                    if (r_match[0]) {
-                        rule_buf[rule_count].match = r_match[0] ? strdup(r_match) : NULL;
-                        rule_buf[rule_count].rewrite = has_rewrite ? strdup(r_rewrite) : NULL;
-                        rule_buf[rule_count].host = r_host[0] ? strdup(r_host) : NULL;
-                        rule_buf[rule_count].port = r_port[0] ? strdup(r_port) : NULL;
-                        rule_count++;
+                revpx_begin_domain(revpx, domain, cert_file, key_file);
+                domain_begun = true;
+                has_backends = true;
+
+                if (jsp_begin_array(&jsp) != 0) { ret = 1; goto cleanup; }
+                int blen = jsp_array_length(&jsp);
+                for (int b = 0; b < blen; b++) {
+                    if (parse_backend(&jsp, revpx) != 0) {
+                        rp_log_error("Failed to parse backend %d in object %d\n", b, i);
+                        ret = 1; goto cleanup;
                     }
                 }
                 if (jsp_end_array(&jsp) != 0) { ret = 1; goto cleanup; }
             } else {
-                // Unknown key; skip its value
                 if (jsp_skip(&jsp) != 0) {
-                    rp_log_error("Failed to skip unknown key '%s' in object %d in config file %s\n", jsp.string, i, config_file);
-                    ret = 1;
-                    goto cleanup;
+                    rp_log_error("Failed to skip key '%s' in object %d\n", jsp.string, i);
+                    ret = 1; goto cleanup;
                 }
             }
         }
         if (jsp_end_object(&jsp) != 0) {
             rp_log_error("Failed to end object %d in config file %s\n", i, config_file);
-            ret = 1;
-            goto cleanup;
+            ret = 1; goto cleanup;
         }
-        RpRules rules = {.entries = rule_buf, .count = rule_count};
-        revpx_add_domain(revpx, domain, rule_count > 0 ? &rules : NULL, port, cert_file, key_file);
-        for (int r = 0; r < rule_count; r++) {
-            free((char *)rule_buf[r].match);
-            free((char *)rule_buf[r].rewrite);
-            free((char *)rule_buf[r].host);
-            free((char *)rule_buf[r].port);
+
+        if (!has_backends && port[0]) {
+            // Legacy format: domain-level port = catch-all backend
+            revpx_begin_domain(revpx, domain, cert_file, key_file);
+            revpx_add_backend(revpx, NULL, port, NULL, 0, NULL);
+            domain_begun = true;
         }
+        if (domain_begun) revpx_end_domain(revpx);
     }
     jsp_end_array(&jsp);
 cleanup:
@@ -301,7 +338,9 @@ int parse_monade_yaml(RevPx *revpx, const char *yaml_file) {
                         snprintf(key_path, sizeof(key_path),
                                  "%s/.config/monade/stacks/%s/certs/key.pem",
                                  home, project_name);
-                        revpx_add_domain(revpx, domains[k], NULL, port, cert_path, key_path);
+                        revpx_begin_domain(revpx, domains[k], cert_path, key_path);
+                        revpx_add_backend(revpx, NULL, port, NULL, 0, NULL);
+                        revpx_end_domain(revpx);
                     }
                 }
                 in_service_map = 0;
@@ -328,7 +367,9 @@ int parse_args(RevPx *revpx, int argc, const char **argv) {
         if (positional_arg(&args)) {
             buf[idx++] = args.value;
             if (idx == 4) {
-                revpx_add_domain(revpx, buf[0], NULL, buf[1], buf[2], buf[3]);
+                revpx_begin_domain(revpx, buf[0], buf[2], buf[3]);
+                revpx_add_backend(revpx, NULL, buf[1], NULL, 0, NULL);
+                revpx_end_domain(revpx);
                 idx = 0;
             }
         }

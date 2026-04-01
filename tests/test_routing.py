@@ -221,10 +221,9 @@ async def routing_proxy(backends):
     """Proxy with path-based routing rules."""
     config = [{
         "domain": TEST_DOMAIN,
-        "port": str(ROUTE_BACKEND_DEFAULT_PORT),
         "cert_file": CERT_FILE,
         "key_file": KEY_FILE,
-        "rules": [
+        "backends": [
             {
                 "match": "/api",
                 "port": str(ROUTE_BACKEND_API_PORT),
@@ -232,6 +231,9 @@ async def routing_proxy(backends):
             {
                 "match": "/static",
                 "port": str(ROUTE_BACKEND_STATIC_PORT),
+            },
+            {
+                "port": str(ROUTE_BACKEND_DEFAULT_PORT),
             },
         ],
     }]
@@ -246,10 +248,9 @@ async def rewrite_proxy(backends):
     """Proxy with URL rewriting rules."""
     config = [{
         "domain": TEST_DOMAIN,
-        "port": str(ROUTE_BACKEND_DEFAULT_PORT),
         "cert_file": CERT_FILE,
         "key_file": KEY_FILE,
-        "rules": [
+        "backends": [
             {
                 "match": "/api/v2",
                 "rewrite": "/v2",
@@ -269,6 +270,9 @@ async def rewrite_proxy(backends):
                 "match": "/strip",
                 "rewrite": "",
                 "port": str(ROUTE_BACKEND_API_PORT),
+            },
+            {
+                "port": str(ROUTE_BACKEND_DEFAULT_PORT),
             },
         ],
     }]

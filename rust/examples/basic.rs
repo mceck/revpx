@@ -3,10 +3,12 @@ fn main() {
     revpx::RevPx::use_colored_log();
     revpx.add_domains(vec![revpx::DomainConfig {
         domain: "test.localhost".to_string(),
-        port: "8080".to_string(),
         cert: "test.localhost.pem".to_string(),
         key: "test.localhost-key.pem".to_string(),
-        rules: vec![],
+        backends: vec![revpx::Backend {
+            port: "8080".to_string(),
+            ..Default::default()
+        }],
     }]);
     revpx.run_server();
 }

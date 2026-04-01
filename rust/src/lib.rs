@@ -2,58 +2,51 @@ use std::os::raw::c_void;
 
 type CRevPx = c_void;
 
-#[repr(C)]
-struct CRpRule {
-    match_path: *const u8,
-    rewrite: *const u8,
-    host: *const u8,
-    port: *const u8,
-}
-
-#[repr(C)]
-struct CRpRules {
-    entries: *const CRpRule,
-    count: i32,
-}
-
 unsafe extern "C" {
     fn revpx_set_log_level(level: i32);
     fn revpx_use_colored_log();
     fn revpx_use_simple_log();
-    fn revpx_add_domain(
+    fn revpx_create(http_port: *const u8, https_port: *const u8) -> *mut CRevPx;
+    fn revpx_free(revpx: *mut CRevPx);
+    fn revpx_begin_domain(
         revpx: *mut CRevPx,
         domain: *const u8,
-        rules: *const CRpRules,
-        port: *const u8,
         cert: *const u8,
         key: *const u8,
     );
+    fn revpx_add_backend(
+        revpx: *mut CRevPx,
+        host: *const u8,
+        port: *const u8,
+        matches: *const *const u8,
+        match_count: i32,
+        rewrite: *const u8,
+    );
+    fn revpx_end_domain(revpx: *mut CRevPx) -> bool;
     fn revpx_run_server(revpx: *mut CRevPx) -> i32;
-    fn revpx_create(http_port: *const u8, https_port: *const u8) -> *mut CRevPx;
-    fn revpx_free(revpx: *mut CRevPx);
 }
 
-/// A single routing rule for path-based proxying.
+/// A backend routing rule. Multiple match patterns are OR'd.
 #[derive(Debug, Clone, Default)]
-pub struct RouteRule {
-    /// Path prefix to match (e.g. "/api")
-    pub match_path: String,
+pub struct Backend {
+    /// Backend host (None = "127.0.0.1")
+    pub host: Option<String>,
+    /// Backend port
+    pub port: String,
+    /// Glob patterns to match (empty = catch-all).
+    /// Supports `*` (any non-slash) and `**` (any including slash).
+    pub matches: Vec<String>,
     /// Replace matched prefix with this (None = no rewrite)
     pub rewrite: Option<String>,
-    /// Backend host override (None = default "127.0.0.1")
-    pub host: Option<String>,
-    /// Backend port override (None = use domain default)
-    pub port: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct DomainConfig {
     pub domain: String,
-    pub port: String,
     pub cert: String,
     pub key: String,
-    /// Optional routing rules. If empty, the entire domain is proxied.
-    pub rules: Vec<RouteRule>,
+    /// Backend routing rules. If empty or single catch-all, entire domain is proxied.
+    pub backends: Vec<Backend>,
 }
 
 pub struct RevPx {
@@ -75,21 +68,15 @@ impl RevPx {
     }
 
     pub fn set_log_level(level: i32) {
-        unsafe {
-            revpx_set_log_level(level);
-        }
+        unsafe { revpx_set_log_level(level); }
     }
 
     pub fn use_colored_log() {
-        unsafe {
-            revpx_use_colored_log();
-        }
+        unsafe { revpx_use_colored_log(); }
     }
 
     pub fn use_simple_log() {
-        unsafe {
-            revpx_use_simple_log();
-        }
+        unsafe { revpx_use_simple_log(); }
     }
 
     pub fn as_ptr(&self) -> *mut CRevPx {
@@ -98,64 +85,46 @@ impl RevPx {
 
     pub fn add_domain(&self, config: DomainConfig) {
         let domain = std::ffi::CString::new(config.domain).unwrap();
-        let port = std::ffi::CString::new(config.port).unwrap();
         let cert = std::ffi::CString::new(config.cert).unwrap();
         let key = std::ffi::CString::new(config.key).unwrap();
 
-        if config.rules.is_empty() {
-            unsafe {
-                revpx_add_domain(
-                    self.ptr,
-                    domain.as_ptr().cast(),
-                    std::ptr::null(),
-                    port.as_ptr().cast(),
-                    cert.as_ptr().cast(),
-                    key.as_ptr().cast(),
-                );
-            }
-        } else {
-            // Build C rule structs. Keep CStrings alive until after the call.
-            let mut c_strings: Vec<(
-                std::ffi::CString,
-                Option<std::ffi::CString>,
-                Option<std::ffi::CString>,
-                Option<std::ffi::CString>,
-            )> = Vec::with_capacity(config.rules.len());
+        unsafe {
+            revpx_begin_domain(
+                self.ptr,
+                domain.as_ptr().cast(),
+                cert.as_ptr().cast(),
+                key.as_ptr().cast(),
+            );
+        }
 
-            for r in &config.rules {
-                c_strings.push((
-                    std::ffi::CString::new(r.match_path.as_str()).unwrap(),
-                    r.rewrite.as_ref().map(|s| std::ffi::CString::new(s.as_str()).unwrap()),
-                    r.host.as_ref().map(|s| std::ffi::CString::new(s.as_str()).unwrap()),
-                    r.port.as_ref().map(|s| std::ffi::CString::new(s.as_str()).unwrap()),
-                ));
-            }
+        for b in &config.backends {
+            let host_c = b.host.as_ref()
+                .map(|s| std::ffi::CString::new(s.as_str()).unwrap());
+            let port_c = std::ffi::CString::new(b.port.as_str()).unwrap();
+            let rewrite_c = b.rewrite.as_ref()
+                .map(|s| std::ffi::CString::new(s.as_str()).unwrap());
 
-            let c_rules: Vec<CRpRule> = c_strings
-                .iter()
-                .map(|(m, rw, h, p)| CRpRule {
-                    match_path: m.as_ptr().cast(),
-                    rewrite: rw.as_ref().map_or(std::ptr::null(), |s| s.as_ptr().cast()),
-                    host: h.as_ref().map_or(std::ptr::null(), |s| s.as_ptr().cast()),
-                    port: p.as_ref().map_or(std::ptr::null(), |s| s.as_ptr().cast()),
-                })
+            let match_cstrings: Vec<std::ffi::CString> = b.matches.iter()
+                .map(|s| std::ffi::CString::new(s.as_str()).unwrap())
+                .collect();
+            let match_ptrs: Vec<*const u8> = match_cstrings.iter()
+                .map(|s| s.as_ptr().cast())
                 .collect();
 
-            let rules = CRpRules {
-                entries: c_rules.as_ptr(),
-                count: c_rules.len() as i32,
-            };
-
             unsafe {
-                revpx_add_domain(
+                revpx_add_backend(
                     self.ptr,
-                    domain.as_ptr().cast(),
-                    &rules,
-                    port.as_ptr().cast(),
-                    cert.as_ptr().cast(),
-                    key.as_ptr().cast(),
+                    host_c.as_ref().map_or(std::ptr::null(), |s| s.as_ptr().cast()),
+                    port_c.as_ptr().cast(),
+                    if match_ptrs.is_empty() { std::ptr::null() } else { match_ptrs.as_ptr() },
+                    match_ptrs.len() as i32,
+                    rewrite_c.as_ref().map_or(std::ptr::null(), |s| s.as_ptr().cast()),
                 );
             }
+        }
+
+        unsafe {
+            revpx_end_domain(self.ptr);
         }
     }
 
@@ -166,18 +135,14 @@ impl RevPx {
     }
 
     pub fn run_server(&self) -> i32 {
-        unsafe {
-            return revpx_run_server(self.ptr);
-        }
+        unsafe { revpx_run_server(self.ptr) }
     }
 }
 
 impl Drop for RevPx {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            unsafe {
-                revpx_free(self.ptr);
-            }
+            unsafe { revpx_free(self.ptr); }
             self.ptr = std::ptr::null_mut();
         }
     }
