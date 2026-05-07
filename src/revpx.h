@@ -1520,6 +1520,16 @@ static ForwardClientHeaderResult forward_client_handle_complete_header(RevPx *re
     if (saved_body_len > 0) {
         flush_buffer(revpx, backend);
         if (!revpx->conns[backend->fd]) return FWD_HDR_FATAL;
+        if (backend->len > 0) {
+            // Partial flush: kernel send buffer to backend is full and the
+            // modified request headers couldn't all be written. backend_reset_buffer
+            // would then silently discard the unsent header bytes, after which the
+            // body bytes would land glued to a truncated header — producing exactly
+            // the malformed-request / "EmptyContentError" the user observed.
+            // Fail explicitly so the client sees a 502 rather than corruption.
+            if (!forward_client_fail(revpx, client, backend, 502, "Bad Gateway")) return FWD_HDR_FATAL;
+            return FWD_HDR_FATAL;
+        }
         backend_reset_buffer(backend);
         if (backend->req_body_left == 0 && !backend->req_chunked) {
             backend->req_need_header = true;
@@ -1639,6 +1649,16 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
                 backend->req_body_left = 0;
                 backend->req_need_header = true;
                 backend->req_parsing_header = false;
+                if (n > 0) {
+                    // Body fully consumed but more bytes remain: they belong to the
+                    // next request. We must NOT fall through to the next iteration —
+                    // backend->buf still holds just-copied body bytes (not yet
+                    // flushed), and find_headers_end() in iter B would scan them and
+                    // match CRLFCRLF inside the body (any multipart body has CRLFCRLF
+                    // between part-headers and part-data). Use the same flush+replay
+                    // pattern as the chunked branch so body bytes are flushed alone.
+                    return forward_client_replay_leftover(revpx, client, backend, data, n);
+                }
             }
         } else {
             ssize_t consumed = advance_chunked(backend, dst_pos, to_copy);
