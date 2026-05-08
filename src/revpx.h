@@ -729,7 +729,18 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
 
             // CRITICAL: prevent out-of-order writes. If dst has unsent buffered data,
             // any new do_write() would leapfrog the buffer. Stall src until dst drains.
-            if (dst->len > 0) {
+            //
+            // EXCEPT when dst is the backend AND it is currently accumulating an
+            // incomplete request header (req_parsing_header=true, no \r\n\r\n yet).
+            // Those bytes MUST NOT be flushed: forward_client_handle_complete_header()
+            // hasn't run yet, so X-Forwarded-* injection hasn't happened. Flushing
+            // them now would deliver an un-injected header prefix, and the rest of
+            // the request (when it arrives) would be parsed by the proxy as if it
+            // were a new request — re-running inject on what is in fact a header
+            // continuation, mis-parsing Content-Length (since the original CL line
+            // already left the buffer), and ultimately injecting X-Forwarded-* into
+            // the request body at every CRLFCRLF (the multipart bug).
+            if (dst->len > 0 && !(dst->type == CT_BACKEND && dst->req_parsing_header)) {
                 compact_buffer(dst);
                 if (dst->len > 0) {
                     src->read_stalled = true;
@@ -1282,15 +1293,6 @@ static bool inject_forwarded_headers(RpConnection *conn, int source_fd) {
     int headers_end = find_headers_end(p, conn->len);
     if (headers_end <= 0) return false;
 
-    // DEBUG: dump first line of the "headers" we're injecting into so we can see
-    // when this function is being called on body bytes (the user-reported bug).
-    {
-        size_t line_len = 0;
-        while (line_len < conn->len && line_len < 128 && p[line_len] != '\r' && p[line_len] != '\n') line_len++;
-        rp_log_warn("INJECT cfd=%d backend->len=%zu first_line=\"%.*s\" header_end=%d\n",
-                    source_fd, conn->len, (int)line_len, (const char *)p, headers_end);
-    }
-
     size_t header_len = (size_t)headers_end;
 
     if (!append_header(extra_headers, sizeof(extra_headers), &extra_len, "\r\nX-Forwarded-For: %s", injected_ip)) return false;
@@ -1612,12 +1614,6 @@ static ForwardClientHeaderResult forward_client_handle_complete_header(RevPx *re
  * Returns false if connection was closed/errored (caller should stop processing).
  */
 static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnection *backend, const unsigned char *data, size_t n) {
-    rp_log_warn("FCB ENTER backend_fd=%d n=%zu state(parsing=%d need=%d body_left=%zu chunked=%d) buf_len=%zu first6=\"%c%c%c%c%c%c\"\n",
-                backend->fd, n,
-                backend->req_parsing_header, backend->req_need_header,
-                backend->req_body_left, backend->req_chunked,
-                backend->len,
-                n>0?data[0]:'?', n>1?data[1]:'?', n>2?data[2]:'?', n>3?data[3]:'?', n>4?data[4]:'?', n>5?data[5]:'?');
     while (n > 0) {
         backend_maybe_resume_header_parse(backend);
         if (backend->req_parsing_header) compact_buffer(backend);
@@ -1666,10 +1662,12 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
                 backend->req_parsing_header = false;
                 if (n > 0) {
                     // Body fully consumed but more bytes remain: they belong to the
-                    // next request.
-                    rp_log_warn("MYFIX_REPLAY backend_fd=%d consumed_to=%zu n_remaining=%zu first_remain=%c%c%c%c\n",
-                                backend->fd, to_copy, n,
-                                n>0?data[0]:'?', n>1?data[1]:'?', n>2?data[2]:'?', n>3?data[3]:'?');
+                    // next request. We must NOT fall through to the next iteration —
+                    // backend->buf still holds just-copied body bytes (not yet
+                    // flushed), and find_headers_end() in iter B would scan them and
+                    // match CRLFCRLF inside the body (any multipart body has CRLFCRLF
+                    // between part-headers and part-data). Use the same flush+replay
+                    // pattern as the chunked branch so body bytes are flushed alone.
                     return forward_client_replay_leftover(revpx, client, backend, data, n);
                 }
             }
