@@ -123,25 +123,37 @@ async def open_tls(host: str = TEST_DOMAIN, port: int = HTTPS_PORT):
 
 
 async def read_one_response(reader: asyncio.StreamReader, leftover: bytes = b""):
-    """Read exactly one HTTP/1.1 response. Returns (status, headers, body, leftover)."""
+    """Read exactly one HTTP/1.1 response. Returns (status, headers, body, leftover).
+
+    Interim 1xx responses (e.g. 100 Continue) are skipped — they are valid HTTP
+    informational responses that precede the final response.
+    """
     response = leftover
-    while b"\r\n\r\n" not in response:
-        chunk = await reader.read(8192)
-        if not chunk:
-            raise ConnectionError(
-                f"connection closed before response headers; got {len(response)} bytes: {response[:200]!r}"
-            )
-        response += chunk
+    while True:
+        while b"\r\n\r\n" not in response:
+            chunk = await reader.read(8192)
+            if not chunk:
+                raise ConnectionError(
+                    f"connection closed before response headers; got {len(response)} bytes: {response[:200]!r}"
+                )
+            response += chunk
 
-    head_end = response.index(b"\r\n\r\n") + 4
-    head_raw = response[:head_end].decode(errors="replace")
+        head_end = response.index(b"\r\n\r\n") + 4
+        head_raw = response[:head_end].decode(errors="replace")
+        status_line = head_raw.split("\r\n", 1)[0]
+        parts = status_line.split()
+        if len(parts) < 2 or not parts[1].isdigit():
+            raise ValueError(f"malformed status line: {status_line!r}")
+        status = int(parts[1])
+
+        # 1xx interim (except 101 which switches protocols and isn't a normal response):
+        # skip and read the next one. The interim response has no body.
+        if 100 <= status < 200 and status != 101:
+            response = response[head_end:]
+            continue
+        break
+
     body = response[head_end:]
-
-    status_line = head_raw.split("\r\n", 1)[0]
-    parts = status_line.split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        raise ValueError(f"malformed status line: {status_line!r}")
-    status = int(parts[1])
 
     headers = {}
     for line in head_raw.split("\r\n")[1:]:
@@ -1060,6 +1072,947 @@ class TestMultipartStress:
                     await writer.wait_closed()
                 except Exception:
                     pass
+
+
+# ============================================================================
+# 9. TestPipelinedDeepChain — 3+ pipelined multipart requests
+# ============================================================================
+
+class TestPipelinedDeepChain:
+    """Multiple multipart requests pipelined in a single TLS write.
+
+    Each one has CRLFCRLF inside its body (multipart). After Bug A fix,
+    forward_client_replay_leftover gets called once per request boundary,
+    chaining recursively. Verifies the chain works for 3, 5, 8 requests.
+    """
+
+    @pytest.mark.parametrize("count", [3, 5, 8])
+    async def test_chain_pipelined_multiparts(self, proxy, count):
+        bodies = []
+        pipelined = b""
+        for i in range(count):
+            boundary = f"----chain{i}"
+            body = build_multipart(boundary, {
+                "purchasedAt": f"2026-{(i % 12) + 1:02d}-15T00:00:00.000Z",
+                "sync_image_processing": "true",
+                "n": str(i),
+            })
+            bodies.append(body)
+            pipelined += http_request(
+                "PUT",
+                f"/v1/chain/{i}",
+                body,
+                content_type=f"multipart/form-data; boundary={boundary}",
+                keep_alive=(i < count - 1),
+            )
+
+        reader, writer = await open_tls()
+        try:
+            writer.write(pipelined)
+            await writer.drain()
+
+            leftover = b""
+            for i in range(count):
+                status, _, resp_body, leftover = await asyncio.wait_for(
+                    read_one_response(reader, leftover), timeout=15
+                )
+                assert status == 200, (
+                    f"chain[{i}]: status={status}, body={resp_body[:300]!r}; "
+                    f"chain depth {count}"
+                )
+                d = json.loads(resp_body)
+                assert d["path"] == f"/v1/chain/{i}", f"chain[{i}]: wrong path"
+                assert d["body_hash"] == hashlib.md5(bodies[i]).hexdigest(), (
+                    f"chain[{i}]: body corrupted at depth {count}"
+                )
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+
+# ============================================================================
+# 10. TestPipelinedMixedEncoding — CL + chunked mixed in pipelining
+# ============================================================================
+
+class TestPipelinedMixedEncoding:
+    """Pipeline a Content-Length multipart with a chunked multipart and vice versa.
+
+    The proxy uses different code paths for CL vs chunked. Mixing them in
+    pipelining tests both paths' replay_leftover handling.
+    """
+
+    async def test_cl_multipart_then_chunked_request(self, proxy):
+        b1 = "----mixedA"
+        body1 = build_multipart(b1, {"a": "first", "b": "second"})
+
+        # Chunked second request: chunked body equivalent of "hello-chunked"
+        chunk_data = b"hello-chunked"
+        chunked_body = f"{len(chunk_data):x}\r\n".encode() + chunk_data + b"\r\n0\r\n\r\n"
+        req2 = (
+            f"POST /chunked-after HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"Transfer-Encoding: chunked\r\n"
+            f"Connection: close\r\n"
+            f"\r\n"
+        ).encode() + chunked_body
+
+        pipelined = http_request(
+            "PUT", "/cl-multipart", body1,
+            content_type=f"multipart/form-data; boundary={b1}",
+        ) + req2
+
+        reader, writer = await open_tls()
+        try:
+            writer.write(pipelined)
+            await writer.drain()
+
+            s1, _, rb1, leftover = await asyncio.wait_for(read_one_response(reader), timeout=10)
+            assert s1 == 200, f"CL multipart: status={s1}, body={rb1[:300]!r}"
+            d1 = json.loads(rb1)
+            assert d1["body_hash"] == hashlib.md5(body1).hexdigest()
+
+            s2, _, rb2, _ = await asyncio.wait_for(read_one_response(reader, leftover), timeout=10)
+            assert s2 == 200, f"chunked after multipart: status={s2}, body={rb2[:300]!r}"
+            d2 = json.loads(rb2)
+            assert d2["path"] == "/chunked-after"
+            assert d2["body_length"] == len(chunk_data)
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def test_chunked_multipart_then_cl_request(self, proxy):
+        """Chunked multipart first, then a CL-based request after."""
+        b1 = "----mixedB"
+        body1 = build_multipart(b1, {"x": "value-x"})
+        # Wrap multipart body in a single chunk
+        chunked = f"{len(body1):x}\r\n".encode() + body1 + b"\r\n0\r\n\r\n"
+
+        req1 = (
+            f"PUT /chunked-multipart HTTP/1.1\r\n"
+            f"Host: {TEST_DOMAIN}\r\n"
+            f"Content-Type: multipart/form-data; boundary={b1}\r\n"
+            f"Transfer-Encoding: chunked\r\n"
+            f"Connection: keep-alive\r\n"
+            f"\r\n"
+        ).encode() + chunked
+
+        body2 = b"plain-body-after"
+        req2 = http_request(
+            "POST", "/cl-after-chunked", body2,
+            content_type="text/plain",
+            keep_alive=False,
+        )
+
+        reader, writer = await open_tls()
+        try:
+            writer.write(req1 + req2)
+            await writer.drain()
+
+            s1, _, rb1, leftover = await asyncio.wait_for(read_one_response(reader), timeout=10)
+            assert s1 == 200, f"chunked multipart: status={s1}, body={rb1[:300]!r}"
+            d1 = json.loads(rb1)
+            assert d1["body_hash"] == hashlib.md5(body1).hexdigest(), (
+                "chunked multipart body got corrupted"
+            )
+
+            s2, _, rb2, _ = await asyncio.wait_for(read_one_response(reader, leftover), timeout=10)
+            assert s2 == 200, f"CL after chunked: status={s2}, body={rb2[:300]!r}"
+            d2 = json.loads(rb2)
+            assert d2["path"] == "/cl-after-chunked"
+            assert d2["body_hash"] == hashlib.md5(body2).hexdigest()
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+
+# ============================================================================
+# 11. TestPipelinedDifferentMethods — HEAD/OPTIONS/DELETE after multipart
+# ============================================================================
+
+class TestPipelinedDifferentMethods:
+    """Pipeline multipart with no-body methods following.
+
+    HEAD/OPTIONS/DELETE typically have no body, so the request boundary is
+    just the headers. Tests that the proxy correctly handles the transition
+    after a multipart body.
+    """
+
+    @pytest.mark.parametrize("method", ["HEAD", "OPTIONS", "DELETE", "GET"])
+    async def test_multipart_then_no_body_method(self, proxy, method):
+        boundary = f"----{method.lower()}-after"
+        body = build_multipart(boundary, {"k": "value-with-some-content"})
+
+        pipelined = http_request(
+            "PUT", "/upload-then-other", body,
+            content_type=f"multipart/form-data; boundary={boundary}",
+        ) + http_request(method, "/follow", b"", keep_alive=False)
+
+        reader, writer = await open_tls()
+        try:
+            writer.write(pipelined)
+            await writer.drain()
+
+            s1, _, rb1, leftover = await asyncio.wait_for(read_one_response(reader), timeout=10)
+            assert s1 == 200, f"multipart: status={s1}, body={rb1[:300]!r}"
+            d1 = json.loads(rb1)
+            assert d1["body_hash"] == hashlib.md5(body).hexdigest()
+
+            s2, _, rb2, _ = await asyncio.wait_for(read_one_response(reader, leftover), timeout=10)
+            assert s2 == 200, f"{method} after multipart: status={s2}, body={rb2[:300]!r}"
+            # HEAD and OPTIONS have empty bodies in our test BackendHandler;
+            # only assert on the JSON echo for methods that produce one.
+            if method not in ("HEAD", "OPTIONS"):
+                d2 = json.loads(rb2)
+                assert d2["method"] == method, f"backend saw method={d2['method']}, expected {method}"
+                assert d2["path"] == "/follow"
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+
+# ============================================================================
+# 12. TestPipelinedCl0First — empty body request before multipart
+# ============================================================================
+
+class TestPipelinedCl0First:
+    """A POST/PUT with Content-Length: 0, pipelined before a multipart.
+
+    Probes the CL=0 boundary handling: req_body_left starts at 0, the
+    "body forwarding" loop should not consume bytes that belong to
+    the next request.
+    """
+
+    async def test_cl_zero_post_then_multipart(self, proxy):
+        boundary = "----cl0after"
+        body = build_multipart(boundary, {"after": "cl-zero"})
+
+        pipelined = (
+            (
+                f"POST /cl-zero HTTP/1.1\r\n"
+                f"Host: {TEST_DOMAIN}\r\n"
+                f"Content-Length: 0\r\n"
+                f"Connection: keep-alive\r\n"
+                f"\r\n"
+            ).encode()
+            + http_request(
+                "PUT", "/multi-after-cl0", body,
+                content_type=f"multipart/form-data; boundary={boundary}",
+                keep_alive=False,
+            )
+        )
+
+        reader, writer = await open_tls()
+        try:
+            writer.write(pipelined)
+            await writer.drain()
+
+            s1, _, rb1, leftover = await asyncio.wait_for(read_one_response(reader), timeout=10)
+            assert s1 == 200, f"CL=0 POST: status={s1}, body={rb1[:300]!r}"
+            d1 = json.loads(rb1)
+            assert d1["body_length"] == 0, f"CL=0 must have empty body, got {d1['body_length']}"
+            assert d1["path"] == "/cl-zero"
+
+            s2, _, rb2, _ = await asyncio.wait_for(read_one_response(reader, leftover), timeout=10)
+            assert s2 == 200, f"multipart after CL=0: status={s2}, body={rb2[:300]!r}"
+            d2 = json.loads(rb2)
+            assert d2["path"] == "/multi-after-cl0"
+            assert d2["body_hash"] == hashlib.md5(body).hexdigest(), (
+                "multipart body corrupted after CL=0 request"
+            )
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+
+# ============================================================================
+# 13. TestMultipartChunkedTransferEncoding — multipart over chunked
+# ============================================================================
+
+class TestMultipartChunkedTransferEncoding:
+    """Multipart body sent with Transfer-Encoding: chunked instead of CL."""
+
+    async def test_chunked_multipart_basic(self, client):
+        boundary = "----chmp"
+        body = build_multipart(boundary, {
+            "purchasedAt": "2026-03-29T00:00:00.000Z",
+            "sync_image_processing": "true",
+        })
+        # Single chunk wrap
+        chunked = f"{len(body):x}\r\n".encode() + body + b"\r\n0\r\n\r\n"
+
+        # Custom request because we need TE: chunked instead of CL
+        ctx = make_ssl_ctx()
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", HTTPS_PORT, ssl=ctx, server_hostname=TEST_DOMAIN
+        )
+        try:
+            req = (
+                f"PUT /chunked-mp HTTP/1.1\r\n"
+                f"Host: {TEST_DOMAIN}\r\n"
+                f"Content-Type: multipart/form-data; boundary={boundary}\r\n"
+                f"Transfer-Encoding: chunked\r\n"
+                f"Connection: close\r\n"
+                f"\r\n"
+            ).encode() + chunked
+            writer.write(req)
+            await writer.drain()
+
+            status, _, resp_body, _ = await asyncio.wait_for(
+                read_one_response(reader), timeout=10
+            )
+            assert status == 200, f"chunked multipart: status={status}, body={resp_body[:300]!r}"
+            d = json.loads(resp_body)
+            assert d["body_hash"] == hashlib.md5(body).hexdigest()
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def test_chunked_multipart_many_small_chunks(self, proxy):
+        """Send the multipart body broken into many small chunks (each < 64 bytes).
+
+        Probes advance_chunked() while bytes inside chunks contain CRLFCRLF.
+        """
+        boundary = "----chmpsplit"
+        body = build_multipart(boundary, {
+            "field1": "v" * 200,
+            "field2": "w" * 200,
+            "field3": "x" * 200,
+        })
+        chunked = b""
+        i = 0
+        while i < len(body):
+            n = min(64, len(body) - i)
+            chunked += f"{n:x}\r\n".encode() + body[i:i + n] + b"\r\n"
+            i += n
+        chunked += b"0\r\n\r\n"
+
+        ctx = make_ssl_ctx()
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", HTTPS_PORT, ssl=ctx, server_hostname=TEST_DOMAIN
+        )
+        try:
+            req = (
+                f"PUT /chunked-mp-many HTTP/1.1\r\n"
+                f"Host: {TEST_DOMAIN}\r\n"
+                f"Content-Type: multipart/form-data; boundary={boundary}\r\n"
+                f"Transfer-Encoding: chunked\r\n"
+                f"Connection: close\r\n"
+                f"\r\n"
+            ).encode() + chunked
+            writer.write(req)
+            await writer.drain()
+
+            status, _, resp_body, _ = await asyncio.wait_for(
+                read_one_response(reader), timeout=10
+            )
+            assert status == 200, f"many-chunks multipart: status={status}, body={resp_body[:300]!r}"
+            d = json.loads(resp_body)
+            assert d["body_hash"] == hashlib.md5(body).hexdigest()
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+
+# ============================================================================
+# 14. TestMultipartSpecialBodyContent — bodies with HTTP-looking bytes
+# ============================================================================
+
+class TestMultipartSpecialBodyContent:
+    """Multipart bodies whose content includes bytes that LOOK like HTTP.
+
+    A robust proxy must not be confused by the *content* of the body,
+    no matter what bytes it carries. These tests use legitimate clients
+    that nonetheless place HTTP-request-looking bytes inside multipart
+    parts (e.g., uploading a .http file, or text containing CRLF + headers).
+    """
+
+    async def test_body_contains_http_request_line(self, client):
+        boundary = "----httpinside"
+        sneaky_field_value = (
+            b"GET /admin HTTP/1.1\r\n"
+            b"Host: backend.internal\r\n"
+            b"X-Smuggled: yes\r\n"
+            b"\r\n"
+            b"this is field value content"
+        )
+        body = build_multipart(boundary, {
+            "metadata": "ok",
+            "sneaky": sneaky_field_value,
+        })
+        status, _, resp_body = await client.request(
+            "PUT", "/sneaky",
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            body=body,
+        )
+        assert status == 200, f"status={status}, body={resp_body[:300]!r}"
+        d = json.loads(resp_body)
+        assert d["body_hash"] == hashlib.md5(body).hexdigest()
+        # Verify the backend really received the full body and only one request
+        assert d["path"] == "/sneaky", (
+            f"backend saw path={d['path']!r}; the embedded GET line must NOT be "
+            "treated as a separate request"
+        )
+
+    async def test_body_contains_all_byte_values(self, client):
+        boundary = "----allbytes"
+        all_bytes = bytes(range(256))
+        body = build_multipart(boundary, {
+            "metadata": "x",
+            "blob": all_bytes * 100,  # 25.6KB of every byte value
+        })
+        status, _, resp_body = await client.request(
+            "POST", "/allbytes",
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            body=body,
+            timeout=15,
+        )
+        assert status == 200, f"status={status}, body={resp_body[:300]!r}"
+        d = json.loads(resp_body)
+        assert d["body_hash"] == hashlib.md5(body).hexdigest()
+
+    async def test_body_with_http_inside_pipelined(self, proxy):
+        """Body has HTTP-request-looking bytes AND request is pipelined."""
+        boundary = "----httpinsidepl"
+        body = build_multipart(boundary, {
+            "log": (
+                b"PUT /v1/admin HTTP/1.1\r\n"
+                b"Host: evil.example.com\r\n"
+                b"Content-Length: 999\r\n"
+                b"\r\n"
+                b"injected body"
+            ),
+        })
+        pipelined = http_request(
+            "POST", "/inject", body,
+            content_type=f"multipart/form-data; boundary={boundary}",
+        ) + http_request("GET", "/legit-after", b"", keep_alive=False)
+
+        reader, writer = await open_tls()
+        try:
+            writer.write(pipelined)
+            await writer.drain()
+
+            s1, _, rb1, leftover = await asyncio.wait_for(read_one_response(reader), timeout=10)
+            assert s1 == 200, f"sneaky multipart: status={s1}, body={rb1[:300]!r}"
+            d1 = json.loads(rb1)
+            assert d1["path"] == "/inject", (
+                f"backend saw path={d1['path']!r}; embedded PUT must not be parsed"
+            )
+            assert d1["body_hash"] == hashlib.md5(body).hexdigest()
+
+            s2, _, rb2, _ = await asyncio.wait_for(read_one_response(reader, leftover), timeout=10)
+            assert s2 == 200, f"legit GET: status={s2}, body={rb2[:300]!r}"
+            d2 = json.loads(rb2)
+            assert d2["path"] == "/legit-after"
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+
+# ============================================================================
+# 15. TestMultipartLongBoundary — very long boundary strings
+# ============================================================================
+
+class TestMultipartLongBoundary:
+    """RFC allows boundary values up to 70 chars. Some clients use long
+    randomized boundaries. The proxy should pass them through without issue."""
+
+    async def test_70_char_boundary(self, client):
+        boundary = "a" * 70
+        body = build_multipart(boundary, {"k": "v"})
+        status, _, resp_body = await client.request(
+            "PUT", "/longbound",
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            body=body,
+        )
+        assert status == 200
+        d = json.loads(resp_body)
+        assert d["body_hash"] == hashlib.md5(body).hexdigest()
+
+
+# ============================================================================
+# 16. TestMultipartExpect100Continue — Expect: 100-continue
+# ============================================================================
+
+class TestMultipartExpect100Continue:
+    """Some HTTP clients send `Expect: 100-continue` for large uploads.
+
+    The proxy must forward the headers, the backend may respond 100 Continue,
+    that interim 1xx must reach the client, and the body that follows must
+    flow through correctly. Python's HTTPServer in our test fixture does
+    NOT itself emit a 100 Continue, so the body is sent regardless. The
+    test verifies the proxy doesn't misframe the request when the
+    Expect header is present.
+    """
+
+    async def test_expect_100_with_body_sent_immediately(self, proxy):
+        boundary = "----expect100"
+        body = build_multipart(boundary, {
+            "purchasedAt": "2026-03-29T00:00:00.000Z",
+            "sync_image_processing": "true",
+        })
+        # Use custom path because ProxyClient doesn't skip interim 1xx responses,
+        # and the test BackendHandler auto-emits "100 Continue" before the body.
+        req = http_request(
+            "PUT", "/expect100", body,
+            content_type=f"multipart/form-data; boundary={boundary}",
+            extra_headers={"Expect": "100-continue"},
+            keep_alive=False,
+        )
+        reader, writer = await open_tls()
+        try:
+            writer.write(req)
+            await writer.drain()
+            status, _, resp_body, _ = await asyncio.wait_for(
+                read_one_response(reader), timeout=10
+            )
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+        assert status == 200, f"Expect:100 multipart: status={status}, body={resp_body[:300]!r}"
+        d = json.loads(resp_body)
+        assert d["body_hash"] == hashlib.md5(body).hexdigest()
+        # Header forwarded to the backend?
+        assert d["headers"].get("Expect") == "100-continue"
+
+
+# ============================================================================
+# 17. TestMultipartBodyAtBufferEdge — body sizes at buffer boundary
+# ============================================================================
+
+class TestMultipartBodyAtBufferEdge:
+    """Body sizes that align exactly with the proxy's RP_BUF_SIZE (32KB)."""
+
+    @pytest.mark.parametrize("body_size", [
+        32 * 1024 - 100,   # body ends just before buffer fill
+        32 * 1024,         # body exactly fills buffer
+        32 * 1024 + 100,   # body forces second read
+    ])
+    async def test_multipart_body_around_buffer(self, client, body_size):
+        boundary = "----bufedge"
+        # Generate body that ends up close to body_size after multipart wrapping
+        random.seed(body_size)
+        # We don't aim for exact size, just close enough to stress the boundary.
+        blob_size = max(0, body_size - 500)
+        blob = bytes(random.randrange(256) for _ in range(blob_size))
+        body = build_multipart(boundary, {"name": "x", "blob": blob})
+        status, _, resp_body = await client.request(
+            "PUT", "/bufedge",
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            body=body,
+            timeout=15,
+        )
+        assert status == 200, f"body_size~{body_size}: status={status}, body={resp_body[:300]!r}"
+        d = json.loads(resp_body)
+        assert d["body_length"] == len(body), (
+            f"body_size~{body_size}: backend received {d['body_length']} != client sent {len(body)}"
+        )
+        assert d["body_hash"] == hashlib.md5(body).hexdigest()
+
+    async def test_pipelined_body_at_buffer_edge(self, proxy):
+        """Body size + headers sized so Req2 falls right at the buffer boundary."""
+        boundary = "----edgepipe"
+        # Aim for: headers (~600) + body fills near 31KB so Req2 starts late
+        blob = b"X" * (30 * 1024)
+        body = build_multipart(boundary, {"blob": blob, "name": "x"})
+
+        pipelined = http_request(
+            "PUT", "/edge", body,
+            content_type=f"multipart/form-data; boundary={boundary}",
+        ) + http_request("GET", "/edge-after", b"", keep_alive=False)
+
+        reader, writer = await open_tls()
+        try:
+            writer.write(pipelined)
+            await writer.drain()
+
+            s1, _, rb1, leftover = await asyncio.wait_for(read_one_response(reader), timeout=15)
+            assert s1 == 200, f"edge multipart: status={s1}, body={rb1[:300]!r}"
+            d1 = json.loads(rb1)
+            assert d1["body_hash"] == hashlib.md5(body).hexdigest()
+
+            s2, _, rb2, _ = await asyncio.wait_for(read_one_response(reader, leftover), timeout=10)
+            assert s2 == 200, f"edge GET after: status={s2}, body={rb2[:300]!r}"
+            d2 = json.loads(rb2)
+            assert d2["path"] == "/edge-after"
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+
+# ============================================================================
+# 18. TestMultipartConnectionClose — Connection: close behavior
+# ============================================================================
+
+class TestMultipartConnectionClose:
+    """Multipart with Connection: close header. The connection must terminate
+    cleanly without losing the body or response."""
+
+    async def test_multipart_connection_close(self, proxy):
+        boundary = "----connclose"
+        body = build_multipart(boundary, {
+            "purchasedAt": "2026-03-29T00:00:00.000Z",
+            "sync_image_processing": "true",
+        })
+        ctx = make_ssl_ctx()
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", HTTPS_PORT, ssl=ctx, server_hostname=TEST_DOMAIN
+        )
+        try:
+            req = http_request(
+                "PUT", "/conn-close", body,
+                content_type=f"multipart/form-data; boundary={boundary}",
+                keep_alive=False,
+            )
+            writer.write(req)
+            await writer.drain()
+
+            status, _, resp_body, _ = await asyncio.wait_for(
+                read_one_response(reader), timeout=10
+            )
+            assert status == 200, f"connection close multipart: status={status}, body={resp_body[:300]!r}"
+            d = json.loads(resp_body)
+            assert d["body_hash"] == hashlib.md5(body).hexdigest()
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+
+# ============================================================================
+# 19. TestPcapScenario — exact reproduction of the user-reported bug
+# ============================================================================
+
+class TestPcapScenario:
+    """Reproduces the scenario captured in /tmp/revpx.pcap from a real
+    Dart-based mobile client.
+
+    Sequence over a single keep-alive TLS connection:
+      1) several GETs and a JSON PUT (warm-up)
+      2) a multipart PUT with:
+          - very long Authorization Bearer JWT (~1.3KB)
+          - boundary string from the actual capture
+          - body 374 bytes with CRLFCRLF between part-headers and part-data
+
+    The captured bug: the proxy injected X-Forwarded-* headers TWO MORE
+    TIMES inside the multipart body — one per part — at exactly the
+    CRLFCRLF positions. The captured proxy was a stale binary built
+    BEFORE the Bug A fix. With the fix in place, this test must produce
+    a clean request to the backend and a 200 response.
+    """
+
+    async def test_long_auth_then_multipart(self, proxy):
+        # Long opaque JWT-like string (~1.3KB) similar to the captured one.
+        big_jwt = (
+            "eyJ" + "A" * 256 + "." + "B" * 700 + "." + "C" * 300
+        )
+        boundary = "dart-http-boundary-A3D_5XQnWSQSZ.Q+GCiKomLp+Ql17JXvTPozNCYUrJY8VxDs.6L"
+        body = build_multipart(boundary, {
+            "purchasedAt": "2026-03-29T00:00:00.000Z",
+            "sync_image_processing": "true",
+        })
+
+        reader, writer = await open_tls()
+        try:
+            leftover = b""
+
+            # 1) warm-up: a few GETs + JSON PUT (mirrors the pcap timeline)
+            warmup_reqs = [
+                ("GET", "/v1/app_user_helmets/182/health_profiles", b"", None),
+                ("GET", "/v1/sellers?filter%5Bvisible_in_app%5D=true&page%5Bsize%5D=all", b"", None),
+                ("PUT", "/v1/app_user_helmets/182",
+                 b'{"purchaseType":"ecommerce"}', "application/json"),
+                ("GET", "/v1/sellers?page%5Bsize%5D=all", b"", None),
+            ]
+            for method, path, body_bytes, ctype in warmup_reqs:
+                req = http_request(
+                    method, path, body_bytes,
+                    content_type=ctype,
+                    keep_alive=True,
+                    extra_headers={
+                        "user-agent": "Dart/3.11 (dart:io)",
+                        "authorization": f"Bearer {big_jwt}",
+                        "accept-encoding": "gzip",
+                    },
+                )
+                writer.write(req)
+                await writer.drain()
+                status, _, _, leftover = await asyncio.wait_for(
+                    read_one_response(reader, leftover), timeout=10
+                )
+                assert status == 200, f"warm-up {method} {path}: status={status}"
+
+            # 2) the failing request from the pcap
+            req = http_request(
+                "PUT", "/v1/app_user_helmets/182", body,
+                content_type=f"multipart/form-data; boundary={boundary}",
+                keep_alive=False,
+                extra_headers={
+                    "user-agent": "Dart/3.11 (dart:io)",
+                    "authorization": f"Bearer {big_jwt}",
+                    "accept-encoding": "gzip",
+                },
+            )
+            writer.write(req)
+            await writer.drain()
+
+            status, _, resp_body, _ = await asyncio.wait_for(
+                read_one_response(reader, leftover), timeout=15
+            )
+            assert status == 200, (
+                f"multipart PUT after long-auth warmup got status={status}; "
+                f"this would be the regression of the user-reported bug. "
+                f"body={resp_body[:300]!r}"
+            )
+            d = json.loads(resp_body)
+            assert d["path"] == "/v1/app_user_helmets/182"
+            assert d["body_hash"] == hashlib.md5(body).hexdigest(), (
+                "backend body bytes differ — proxy mangled the multipart body. "
+                "This is the exact symptom that caused Rack::Multipart::EmptyContentError."
+            )
+            # Sanity: the auth header reached the backend whole (case-insensitive
+            # because the Dart client sends "authorization", lowercase).
+            auth = next(
+                (v for k, v in d["headers"].items() if k.lower() == "authorization"),
+                "",
+            )
+            assert auth.startswith("Bearer eyJ"), (
+                f"Authorization header was truncated/lost during forwarding; got {auth[:80]!r}"
+            )
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def test_long_auth_multipart_split_send(self, proxy):
+        """Same scenario but write the request in many small chunks so the
+        proxy receives it across multiple SSL_read boundaries. Mirrors how
+        a TLS implementation can fragment a single large request."""
+        big_jwt = (
+            "eyJ" + "A" * 256 + "." + "B" * 700 + "." + "C" * 300
+        )
+        boundary = "dart-http-boundary-Q+GCiKomLp+Ql17JXvTPozNCYUrJY8VxDs"
+        body = build_multipart(boundary, {
+            "purchasedAt": "2026-03-29T00:00:00.000Z",
+            "sync_image_processing": "true",
+        })
+        req = http_request(
+            "PUT", "/v1/app_user_helmets/182", body,
+            content_type=f"multipart/form-data; boundary={boundary}",
+            keep_alive=False,
+            extra_headers={
+                "user-agent": "Dart/3.11 (dart:io)",
+                "authorization": f"Bearer {big_jwt}",
+            },
+        )
+
+        reader, writer = await open_tls()
+        try:
+            # Chunk sizes mimic the proxy's pcap pattern: 422 / 1124 / 295 / 331 / 82.
+            chunk_sizes = [422, 1124, 295, 331, 82]
+            cursor = 0
+            for size in chunk_sizes:
+                end = min(cursor + size, len(req))
+                writer.write(req[cursor:end])
+                await writer.drain()
+                await asyncio.sleep(0.001)
+                cursor = end
+                if cursor >= len(req):
+                    break
+            if cursor < len(req):
+                writer.write(req[cursor:])
+                await writer.drain()
+
+            status, _, resp_body, _ = await asyncio.wait_for(
+                read_one_response(reader), timeout=15
+            )
+            assert status == 200, (
+                f"split-send multipart: status={status}, body={resp_body[:300]!r}"
+            )
+            d = json.loads(resp_body)
+            assert d["body_hash"] == hashlib.md5(body).hexdigest()
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+
+# ============================================================================
+# 20. TestPartialHeaderEpolloutFlush — Bug C
+# ============================================================================
+
+class TestPartialHeaderEpolloutFlush:
+    """Bug C: when a multipart request's headers split across multiple TLS
+    records such that the first SSL_read returns the request line + initial
+    headers WITHOUT the terminating CRLFCRLF yet, the proxy used to:
+      1) Buffer those bytes in backend->buf (no flush, since
+         req_parsing_header=true).
+      2) Return from forward_client_bytes.
+      3) proxy_data's loop then saw `dst->len > 0` and registered EPOLLOUT,
+         which fired and FLUSHED the partial headers to the backend WITHOUT
+         X-Forwarded-* injection.
+      4) The next SSL_read brought the rest of headers — but with
+         backend->buf empty, the proxy treated those bytes as a complete
+         "request" of their own. parse_content_length_headers found no
+         Content-Length there (it was in the already-flushed first chunk),
+         so req_body_left=0, req_need_header=true.
+      5) Multipart body bytes arriving next were treated as a fresh request,
+         and every CRLFCRLF inside the multipart body (between part-headers
+         and part-data) triggered another inject_forwarded_headers call.
+
+    Reproduces with the dart client; this test confirms the proxy now keeps
+    header bytes buffered until \\r\\n\\r\\n arrives instead of flushing them
+    via EPOLLOUT when partial.
+    """
+
+    async def test_headers_split_in_two_records_then_body(self, proxy):
+        # Build a request large enough that the test's chunk size (~422 bytes)
+        # is meaningfully partial — needs an Authorization header big enough
+        # to push the request past several records' worth.
+        big_jwt = (
+            "eyJ" + "A" * 256 + "." + "B" * 700 + "." + "C" * 300
+        )
+        boundary = "dart-http-boundary-mCOFupO5Ow9-XTJ22NHdFmK0GFCDDLdkzqePbrehX6RBa1Ia2UW"
+        body = build_multipart(boundary, {
+            "purchasedAt": "2026-03-29T00:00:00.000Z",
+            "sync_image_processing": "true",
+        })
+        req = http_request(
+            "PUT", "/v1/app_user_helmets/182", body,
+            content_type=f"multipart/form-data; boundary={boundary}",
+            keep_alive=False,
+            extra_headers={
+                "user-agent": "Dart/3.11 (dart:io)",
+                "authorization": f"Bearer {big_jwt}",
+            },
+        )
+
+        # Find the offset of \r\n\r\n (end of headers) and split the headers
+        # at a point BEFORE that, so the first write has no header terminator.
+        header_end = req.index(b"\r\n\r\n") + 4
+        # Pick a split mid-way through the long Authorization JWT so the first
+        # chunk lacks any \r\n at the very end.
+        split_at = 422
+        assert split_at < header_end - 200, "test invariant: split must be inside headers"
+
+        reader, writer = await open_tls()
+        try:
+            # Chunk 1: partial headers, NO \r\n\r\n yet.
+            writer.write(req[:split_at])
+            await writer.drain()
+            # Tiny pause to encourage the kernel to deliver this as its own TLS
+            # record + give the proxy event loop a chance to schedule EPOLLOUT
+            # on the backend (the moment the pre-fix bug bites).
+            await asyncio.sleep(0.05)
+            # Chunk 2: rest of the request (headers tail + body).
+            writer.write(req[split_at:])
+            await writer.drain()
+
+            status, _, resp_body, _ = await asyncio.wait_for(
+                read_one_response(reader), timeout=15
+            )
+            assert status == 200, (
+                f"partial-header-then-body: status={status}, body={resp_body[:300]!r}"
+            )
+            d = json.loads(resp_body)
+            assert d["path"] == "/v1/app_user_helmets/182"
+            assert d["body_hash"] == hashlib.md5(body).hexdigest(), (
+                "body corrupted — proxy emitted X-Forwarded-* into the multipart body "
+                "(Bug C: partial header was flushed via EPOLLOUT before injection)"
+            )
+            ct = next(
+                (v for k, v in d["headers"].items() if k.lower() == "content-type"),
+                "",
+            )
+            assert ct.startswith("multipart/form-data"), (
+                f"backend saw unexpected content-type: {ct!r}"
+            )
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    @pytest.mark.parametrize("split_at", [50, 100, 200, 300, 422, 600, 900, 1200])
+    async def test_split_at_various_offsets(self, proxy, split_at):
+        """Same scenario across several header-split offsets."""
+        big_jwt = "eyJ" + "A" * 256 + "." + "B" * 700 + "." + "C" * 300
+        boundary = "----varied"
+        body = build_multipart(boundary, {"k": "v" * 50})
+        req = http_request(
+            "PUT", "/v1/x", body,
+            content_type=f"multipart/form-data; boundary={boundary}",
+            keep_alive=False,
+            extra_headers={
+                "user-agent": "Dart/3.11 (dart:io)",
+                "authorization": f"Bearer {big_jwt}",
+            },
+        )
+        header_end = req.index(b"\r\n\r\n") + 4
+        if split_at >= header_end:
+            pytest.skip(f"split_at={split_at} is past header end ({header_end})")
+
+        reader, writer = await open_tls()
+        try:
+            writer.write(req[:split_at])
+            await writer.drain()
+            await asyncio.sleep(0.03)
+            writer.write(req[split_at:])
+            await writer.drain()
+
+            status, _, resp_body, _ = await asyncio.wait_for(
+                read_one_response(reader), timeout=15
+            )
+            assert status == 200, (
+                f"split_at={split_at}: status={status}, body={resp_body[:200]!r}"
+            )
+            d = json.loads(resp_body)
+            assert d["body_hash"] == hashlib.md5(body).hexdigest(), (
+                f"split_at={split_at}: body corrupted"
+            )
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

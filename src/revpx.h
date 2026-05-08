@@ -729,7 +729,18 @@ static void proxy_data(RevPx *revpx, RpConnection *src, uint32_t events) {
 
             // CRITICAL: prevent out-of-order writes. If dst has unsent buffered data,
             // any new do_write() would leapfrog the buffer. Stall src until dst drains.
-            if (dst->len > 0) {
+            //
+            // EXCEPT when dst is the backend AND it is currently accumulating an
+            // incomplete request header (req_parsing_header=true, no \r\n\r\n yet).
+            // Those bytes MUST NOT be flushed: forward_client_handle_complete_header()
+            // hasn't run yet, so X-Forwarded-* injection hasn't happened. Flushing
+            // them now would deliver an un-injected header prefix, and the rest of
+            // the request (when it arrives) would be parsed by the proxy as if it
+            // were a new request — re-running inject on what is in fact a header
+            // continuation, mis-parsing Content-Length (since the original CL line
+            // already left the buffer), and ultimately injecting X-Forwarded-* into
+            // the request body at every CRLFCRLF (the multipart bug).
+            if (dst->len > 0 && !(dst->type == CT_BACKEND && dst->req_parsing_header)) {
                 compact_buffer(dst);
                 if (dst->len > 0) {
                     src->read_stalled = true;
