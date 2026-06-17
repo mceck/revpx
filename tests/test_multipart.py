@@ -2015,5 +2015,99 @@ class TestPartialHeaderEpolloutFlush:
                 pass
 
 
+# ============================================================================
+# 21. TestBugCNoRegressionOnBody — make sure Bug C fix doesn't break body
+# ============================================================================
+
+class TestBugCNoRegressionOnBody:
+    """The Bug C fix bypasses the proxy_data 'dst->len > 0' stall ONLY when
+    the buffer is accumulating partial request headers
+    (req_parsing_header=true). For body forwarding (req_parsing_header=false)
+    the stall MUST still trigger so we don't read past a backend that hasn't
+    drained — the original 'out-of-order writes' invariant.
+
+    This test pumps a large multipart body through the proxy and checks the
+    backend receives every byte intact, confirming the body-forwarding
+    backpressure path still works.
+    """
+
+    async def test_large_multipart_body_arrives_intact(self, client):
+        # 1 MB random body so partial flushes are likely under any reasonable
+        # kernel send buffer.
+        boundary = "----nobackpressureregression"
+        random.seed(0xC0DECAFE)
+        big_blob = bytes(random.randrange(256) for _ in range(1024 * 1024))
+        body = build_multipart(boundary, {
+            "field": "x" * 1000,
+            "blob": big_blob,
+        })
+        status, _, resp_body = await client.request(
+            "PUT", "/no-regression",
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            body=body,
+            timeout=60,
+        )
+        assert status == 200
+        d = json.loads(resp_body)
+        assert d["body_length"] == len(body)
+        assert d["body_hash"] == hashlib.md5(body).hexdigest(), (
+            "1 MB multipart body corrupted — Bug C fix may have weakened "
+            "out-of-order-write protection for body forwarding"
+        )
+
+    async def test_partial_headers_then_large_body_split(self, proxy):
+        """End-to-end: partial headers + body delivered in many chunks.
+        Combines the Bug C fix path (partial-header bypass) with the body
+        forwarding backpressure path."""
+        big_jwt = "eyJ" + "A" * 256 + "." + "B" * 700 + "." + "C" * 300
+        boundary = "----combo"
+        random.seed(0xBABE)
+        big_blob = bytes(random.randrange(256) for _ in range(80 * 1024))
+        body = build_multipart(boundary, {"blob": big_blob, "name": "x"})
+
+        req = http_request(
+            "PUT", "/combo", body,
+            content_type=f"multipart/form-data; boundary={boundary}",
+            keep_alive=False,
+            extra_headers={
+                "user-agent": "Dart/3.11 (dart:io)",
+                "authorization": f"Bearer {big_jwt}",
+            },
+        )
+
+        reader, writer = await open_tls()
+        try:
+            # Send headers in 2 chunks (split mid-JWT, so first chunk has no
+            # \r\n\r\n yet) — exercises Bug C fix.
+            header_end = req.index(b"\r\n\r\n") + 4
+            split_at = 400
+            assert split_at < header_end - 200
+            writer.write(req[:split_at])
+            await writer.drain()
+            await asyncio.sleep(0.03)
+            # Send the rest in many small chunks — exercises body backpressure.
+            cursor = split_at
+            chunk_size = 4096
+            while cursor < len(req):
+                writer.write(req[cursor:cursor + chunk_size])
+                await writer.drain()
+                cursor += chunk_size
+                await asyncio.sleep(0.001)
+
+            status, _, resp_body, _ = await asyncio.wait_for(
+                read_one_response(reader), timeout=30
+            )
+            assert status == 200
+            d = json.loads(resp_body)
+            assert d["body_length"] == len(body)
+            assert d["body_hash"] == hashlib.md5(body).hexdigest()
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "--tb=short"]))
