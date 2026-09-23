@@ -129,7 +129,10 @@ typedef struct {
     bool chunk_expect_crlf;     // expecting CRLF after chunk data
     bool chunk_in_trailer;      // inside trailer section after final 0-size chunk
     bool chunk_in_ext;          // inside chunk extensions (after ';')
-    uint32_t chunk_trailer_window; // sliding window to detect \r\n\r\n end of trailers
+    bool chunk_in_bws;          // whitespace after chunk size, only ';' may follow
+    bool chunk_saw_cr;          // CR seen on a size/trailer line, LF must follow
+    bool chunk_trailer_in_value; // current trailer line is past its ':'
+    size_t chunk_trailer_line_len; // bytes on the current trailer line (0 = empty line)
 } RpConnection;
 
 typedef struct {
@@ -412,6 +415,56 @@ static int find_headers_end(const unsigned char *buf, size_t len) {
         }
     }
     return -1;
+}
+
+static bool is_tchar(unsigned char c) {
+    if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) return true;
+    return c != '\0' && strchr("!#$%&'*+-.^_`|~", c) != NULL;
+}
+
+// A LF without a preceding CR. Lenient backends treat it as a line end while
+// revpx only ends a header block at CRLFCRLF, so it must never be forwarded.
+static bool has_bare_lf(const unsigned char *buf, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        if (buf[i] == '\n' && (i == 0 || buf[i - 1] != '\r')) return true;
+    }
+    return false;
+}
+
+/**
+ * Strict RFC 9112 validation of a complete request head buf[0 .. header_len),
+ * header_len as returned by find_headers_end. Rejects bare LF / CR, obs-fold,
+ * whitespace before ':', non-token field names and NUL in field values, so that
+ * revpx and the backend always agree on where header fields and requests end.
+ */
+static bool validate_request_head(const unsigned char *buf, size_t header_len) {
+    if (header_len < 4) return false;
+    size_t line_start = 0;
+    bool request_line = true;
+
+    for (size_t i = 0; i < header_len; i++) {
+        if (buf[i] == '\n') return false; // LF not consumed as part of CRLF
+        if (buf[i] != '\r') continue;
+        if (i + 1 >= header_len || buf[i + 1] != '\n') return false;
+
+        const unsigned char *line = buf + line_start;
+        size_t line_len = i - line_start;
+        line_start = i + 2;
+        i++;
+
+        if (request_line) {
+            if (line_len == 0) return false;
+            request_line = false;
+            continue;
+        }
+        if (line_len == 0) return line_start == header_len;
+
+        size_t name_len = 0;
+        while (name_len < line_len && is_tchar(line[name_len])) name_len++;
+        if (name_len == 0 || name_len == line_len || line[name_len] != ':') return false;
+        if (memchr(line + name_len, '\0', line_len - name_len)) return false;
+    }
+    return false;
 }
 
 static void extract_host(const unsigned char *buf, size_t len, char *out, size_t max) {
@@ -1080,7 +1133,10 @@ static void reset_chunk_parser_state(RpConnection *conn) {
     conn->chunk_expect_crlf = false;
     conn->chunk_in_trailer = false;
     conn->chunk_in_ext = false;
-    conn->chunk_trailer_window = 0;
+    conn->chunk_in_bws = false;
+    conn->chunk_saw_cr = false;
+    conn->chunk_trailer_in_value = false;
+    conn->chunk_trailer_line_len = 0;
 }
 
 static void backend_reset_buffer(RpConnection *backend) {
@@ -1135,7 +1191,12 @@ static bool log_ssl_error_queue(int level, const char *prefix) {
  * Chunked transfer-encoding state machine. Parses chunk framing to track
  * request boundaries without modifying the data.
  *
- * Chunk format:  <hex-size>[;ext]\r\n <data>\r\n ... 0\r\n [trailers]\r\n\r\n
+ * Chunk format:  <hex-size>[BWS;ext]\r\n <data>\r\n ... 0\r\n [trailers]\r\n
+ *
+ * Size lines and trailer lines must end with exactly CRLF: a bare LF or a CR
+ * not followed by LF is a parse error. Lenient backends accept those as line
+ * ends, so letting them through would make revpx and the backend disagree on
+ * where the request ends (request smuggling past the forwarded-header strip).
  *
  * Returns number of bytes consumed, or -1 on parse error.
  * When the final chunk (size 0) and trailers are fully consumed, resets
@@ -1168,37 +1229,67 @@ static ssize_t advance_chunked(RpConnection *backend, const unsigned char *data,
             continue;
         }
 
-        if (backend->chunk_in_trailer) {
-            backend->chunk_trailer_window = (backend->chunk_trailer_window << 8) | data[i];
-            backend->chunk_trailer_window &= 0xffffffffu;
-            i++;
-            if (backend->chunk_trailer_window == 0x0d0a0d0a) {
-                backend->req_chunked = false;
-                backend->req_need_header = true;
-                reset_chunk_parser_state(backend);
-                return (ssize_t)i;
-            }
-            continue;
-        }
-
         unsigned char ch = data[i++];
-        if (ch == '\r') continue;
-        if (ch == '\n') {
+
+        if (backend->chunk_saw_cr) {
+            if (ch != '\n') return -1;
+            backend->chunk_saw_cr = false;
+
+            if (backend->chunk_in_trailer) {
+                if (backend->chunk_trailer_line_len == 0) {
+                    backend->req_chunked = false;
+                    backend->req_need_header = true;
+                    reset_chunk_parser_state(backend);
+                    return (ssize_t)i;
+                }
+                if (!backend->chunk_trailer_in_value) return -1; // trailer field without ':'
+                backend->chunk_trailer_line_len = 0;
+                backend->chunk_trailer_in_value = false;
+                continue;
+            }
+
+            if (backend->chunk_line_len == 0) return -1; // missing chunk size
             backend->chunk_left = backend->chunk_size_acc;
             backend->chunk_size_acc = 0;
             backend->chunk_line_len = 0;
             backend->chunk_in_ext = false;
-            if (backend->chunk_left == 0) {
-                backend->chunk_in_trailer = true;
-                backend->chunk_trailer_window = 0x0d0a; // pre-seed with CRLF from chunk-size line
-            }
+            backend->chunk_in_bws = false;
+            if (backend->chunk_left == 0) backend->chunk_in_trailer = true;
             continue;
         }
-        if (ch == ';' || ch == ' ' || ch == '\t') {
+        if (ch == '\r') {
+            backend->chunk_saw_cr = true;
+            continue;
+        }
+        if (ch == '\n') return -1; // bare LF
+
+        if (backend->chunk_in_trailer) {
+            // Trailer field-line: token name, ':', value. No obs-fold.
+            if (!backend->chunk_trailer_in_value) {
+                if (ch == ':' && backend->chunk_trailer_line_len > 0) {
+                    backend->chunk_trailer_in_value = true;
+                } else if (!is_tchar(ch)) {
+                    return -1;
+                }
+            } else if (ch == '\0') {
+                return -1;
+            }
+            backend->chunk_trailer_line_len++;
+            continue;
+        }
+
+        if (backend->chunk_in_ext) continue;
+        if (ch == ';') {
+            if (backend->chunk_line_len == 0) return -1;
             backend->chunk_in_ext = true;
             continue;
         }
-        if (backend->chunk_in_ext) continue;
+        if (ch == ' ' || ch == '\t') {
+            if (backend->chunk_line_len == 0) return -1;
+            backend->chunk_in_bws = true;
+            continue;
+        }
+        if (backend->chunk_in_bws) return -1; // only ';' may follow whitespace
         if (backend->chunk_line_len >= 16) return -1;
         int hv = hex_value(ch);
         if (hv < 0) return -1;
@@ -1508,7 +1599,10 @@ static ForwardClientHeaderResult forward_client_handle_complete_header(RevPx *re
     }
 
     // Parse headers before injection (need original headers for CL/TE).
-    if (!forward_client_parse_body_mode(backend, orig_header_end)) {
+    // Ambiguous framing is rejected so the backend can't see a different
+    // request boundary than the one forwarded headers are injected at.
+    if (!validate_request_head(backend->buf, orig_header_end) ||
+        !forward_client_parse_body_mode(backend, orig_header_end)) {
         if (!forward_client_fail(revpx, client, backend, 400, "Bad Request")) return FWD_HDR_FATAL;
     }
 
@@ -1652,6 +1746,8 @@ static bool forward_client_bytes(RevPx *revpx, RpConnection *client, RpConnectio
                     // input burst. Keep iterating instead of returning early.
                     continue;
                 }
+            } else if (has_bare_lf(backend->buf + backend->off, backend->len)) {
+                return forward_client_fail(revpx, client, backend, 400, "Bad Request");
             }
         } else if (!backend->req_chunked) {
             if (backend->req_body_left > to_copy) {
@@ -1781,6 +1877,10 @@ static void handle_state_read_header(RevPx *revpx, RpConnection *c) {
         rp_log_debug("Read %d bytes, total header buffer: %zu bytes for fd=%d\n", n, c->len, fd);
 
         int end = find_headers_end(c->buf, c->len);
+        if (end > 0 ? !validate_request_head(c->buf, (size_t)end) : has_bare_lf(c->buf, c->len)) {
+            send_error(revpx, c, 400, "Bad Request");
+            return;
+        }
         if (end > 0) {
             char host[512], target[1024] = "/";
             extract_host(c->buf, end, host, sizeof(host));

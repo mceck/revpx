@@ -19,7 +19,7 @@ if ! python -c "import pytest" >/dev/null 2>&1; then
 fi
 
 REVPX_TESTS=(tests/test_revpx.py)
-EDGE_TESTS=(tests/test_edge_cases.py)
+EDGE_TESTS=(tests/test_edge_cases.py tests/test_framing.py)
 FUZZ_TESTS=(tests/test_fuzz.py)
 MIXED_TESTS=(tests/test_mixed_ws_http.py)
 MULTIPART_TESTS=(tests/test_multipart.py)
