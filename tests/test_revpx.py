@@ -195,6 +195,12 @@ class BackendHandler(BaseHTTPRequestHandler):
         self._send_response(200, headers, b"")
 
 
+class BackendHTTPServer(HTTPServer):
+    # Default listen backlog is 5: on Linux, bursts of concurrent connects from
+    # the proxy overflow it, trigger SYN cookies and get reset by the kernel.
+    request_queue_size = 128
+
+
 class BackendServer:
     """Threaded backend server manager"""
 
@@ -205,7 +211,7 @@ class BackendServer:
 
     def start(self):
         """Start the backend server in a thread"""
-        self.server = HTTPServer(("127.0.0.1", self.port), BackendHandler)
+        self.server = BackendHTTPServer(("127.0.0.1", self.port), BackendHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         # Wait for server to be ready
